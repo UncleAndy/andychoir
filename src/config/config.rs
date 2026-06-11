@@ -14,6 +14,8 @@ pub type ToolConfig = serde_json::Value;
 #[derive(Deserialize)]
 pub struct Config {
     #[allow(dead_code)]
+    pub models: Vec<ModelConfig>,
+    #[allow(dead_code)]
     config_loader: ConfigLoader,
     #[allow(dead_code)]
     frontends: Vec<FrontendConfig>,
@@ -23,4 +25,13 @@ pub struct Config {
     agents: Vec<AgentConfig>,
     #[allow(dead_code)]
     tools: Vec<ToolConfig>,
+}
+
+#[derive(Deserialize)]
+pub struct ModelConfig {
+    pub name: String, // Model config name (using for model selection from agent)
+    pub provider: String,
+    pub model_name: String,
+    pub api_key: Option<String>,
+    pub custom_url: Option<String>,
 }
