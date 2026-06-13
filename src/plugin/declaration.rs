@@ -2,7 +2,7 @@ use abi_stable::StableAbi;
 use abi_stable::std_types::RString;
 use crate::plugin::interface::PluginInterface;
 
-#[derive(StableAbi)]
+#[derive(StableAbi, Clone)]
 #[repr(C)]
 pub struct PluginDeclaration {
     pub api_version: u32,

@@ -9,7 +9,7 @@ pub struct PluginInitContext {
     pub plugin_config_json: RString, // Кастомный кусок JSON из общего конфига для этого плагина (PluginConfig.config)
 }
 
-#[derive(StableAbi)]
+#[derive(StableAbi, Clone)]
 #[repr(C)]
 pub struct PluginInterface {
     // Изменено: Хост передает структуру контекста с индивидуальным конфигом
