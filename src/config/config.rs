@@ -9,8 +9,6 @@ pub struct Config {
     #[allow(dead_code)]
     pub models: Vec<ModelConfig>,
     #[allow(dead_code)]
-    pub config_loader: PluginConfig,
-    #[allow(dead_code)]
     pub frontends: Vec<PluginConfig>,
     #[allow(dead_code)]
     pub orchestrator: PluginConfig,
