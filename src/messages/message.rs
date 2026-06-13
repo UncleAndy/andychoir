@@ -1,4 +1,10 @@
-use abi_stable::{std_types::RString, StableAbi};
+use abi_stable::{
+    std_types::{
+        RString,
+        RVec,
+    },
+    StableAbi,
+};
 
 #[derive(StableAbi)]
 #[repr(C)]
@@ -11,6 +17,17 @@ pub struct MessageFFI {
     pub topic: RString,          // "call" или "response"
     pub payload: RString,        // JSON с аргументами или текстом
     pub is_final: bool,          // Флаг для фронтенда, что цепочка завершена
+
+    pub trace: RVec<MessageTracePoint>,    // Путь прохождения вызова
+}
+
+#[derive(StableAbi)]
+#[repr(C)]
+#[derive(Clone)]
+pub struct MessageTracePoint {
+    from: RString,
+    to: RString,
+    topic: RString,
 }
 
 pub type MessageCallback = extern "C" fn(message: MessageFFI);
