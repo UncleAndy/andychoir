@@ -1,5 +1,4 @@
-use abi_stable::{std_types::RString, StableAbi, sabi_trait};
-use abi_stable::std_types::RBox;
+use abi_stable::{std_types::RString, StableAbi};
 
 #[derive(StableAbi)]
 #[repr(C)]
@@ -14,9 +13,4 @@ pub struct MessageFFI {
     pub is_final: bool,          // Флаг для фронтенда, что цепочка завершена
 }
 
-#[sabi_trait]
-pub trait MessageReceiver {
-    fn call(&self, message: MessageFFI);
-}
-
-pub type MessageCallbackBox = MessageReceiver_TO<'static, RBox<()>>;
+pub type MessageCallback = extern "C" fn(message: MessageFFI);
