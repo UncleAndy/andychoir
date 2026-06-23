@@ -1,0 +1,23 @@
+package ai:host;
+
+interface types {
+  record event {
+    topic: string,
+    payload: string,
+  }
+}
+
+interface event-bus {
+  use types.{event};
+  publish-event: func(ev: event);
+}
+
+world host-plugin {
+  use types.{event};
+
+  import event-bus;
+
+  // Теперь метод возвращает список шаблонов топиков для подписки
+  export init: func(config-json: string) -> list<string>;
+  export handle-event: func(ev: event);
+}
