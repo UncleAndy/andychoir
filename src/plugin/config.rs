@@ -1,4 +1,3 @@
-use abi_stable::StableAbi;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
