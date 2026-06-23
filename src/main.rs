@@ -20,12 +20,17 @@ use crate::config::Config as AppConfig;
 use crate::plugin::config::{PluginAccess, PluginConfig};
 
 use crate::exports::ai::host::plugin_lifecycle::Guest;
-use crate::ai::host::event_bus::{Host as EventBusGuest, HostWithStore};
 
 // Стейт хоста, который привязывается к каждому плагину
 struct ChoirHostState {
     wasi: WasiCtx,
     table: ResourceTable,
+}
+
+impl ai::host::event_bus::Host for ChoirHostState {
+    fn publish_event(&mut self, event: ai::host::types::Event) {
+        println!("[Host] Плагин опубликовал событие: topic={}, payload={}", event.topic, event.payload);
+    }
 }
 
 // Реализация обязательного трейта для работы WASI Preview 2
@@ -35,6 +40,10 @@ impl WasiView for ChoirHostState {
             ctx: &mut self.wasi,
             table: &mut self.table }
     }
+}
+
+impl HasData for ChoirHostState {
+    type Data<'a> = &'a mut ChoirHostState;
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -59,12 +68,9 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     // Подключаем стандартные системные функции WASI 0.2 к линкеру
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
 
-    // Передаем замыкание, которое создает EventDispatcher.
-    // Это позволяет Wasmtime связать вызов функции с состоянием ChoirHostState.
-    ai::host::event_bus::add_to_linker(
-        &mut linker,
-        |_state| { EventDispatcher }
-    )?;
+    // Подключаем наш интерфейс event-bus.
+    // Теперь мы используем ChoirHostState напрямую, так как он реализует трейт Host.
+    ai::host::event_bus::add_to_linker::<ChoirHostState, ChoirHostState>(&mut linker, |state| state)?;
 
     // Теперь хост полностью готов загружать ваши .wasm файлы, собранные через Makefile!
     println!("Модули рантайма Wasmtime успешно инициализированы.");
@@ -191,17 +197,4 @@ async fn load_and_init_plugin(
     // Возвращаем список топиков. (В реальном оркестраторе вы также сохраните
     // объект `plugin` и `store` в структуру супервизора плагина)
     Ok((subscriptions, lifecycle, plugin, store))
-}
-
-struct EventDispatcher;
-
-impl EventBusGuest for EventDispatcher {
-    fn publish_event(&mut self, event: ai::host::types::Event) {
-        println!("[Host] Плагин опубликовал событие: topic={}, payload={}", event.topic, event.payload);
-        // Здесь реализуйте логику пересылки события другим плагинам
-    }
-}
-
-impl HasData for EventDispatcher {
-    type Data<'a> = &'a EventDispatcher;
 }
