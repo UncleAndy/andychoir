@@ -11,14 +11,16 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use wasmtime::{Config, Engine, Store};
-use wasmtime::component::{Component, Linker, ResourceTable};
+use wasmtime::component::{Component, HasData, Linker, ResourceTable};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use clap::Parser;
 use wasmtime_wasi::sockets::SocketAddrUse;
 use crate::config::Config as AppConfig;
-use crate::exports::ai::host::plugin_lifecycle::Guest;
 use crate::plugin::config::{PluginAccess, PluginConfig};
+
+use crate::exports::ai::host::plugin_lifecycle::Guest;
+use crate::ai::host::event_bus::{Host as EventBusGuest, HostWithStore};
 
 // Стейт хоста, который привязывается к каждому плагину
 struct ChoirHostState {
@@ -57,6 +59,13 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     // Подключаем стандартные системные функции WASI 0.2 к линкеру
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
 
+    // Передаем замыкание, которое создает EventDispatcher.
+    // Это позволяет Wasmtime связать вызов функции с состоянием ChoirHostState.
+    ai::host::event_bus::add_to_linker(
+        &mut linker,
+        |_state| { EventDispatcher }
+    )?;
+
     // Теперь хост полностью готов загружать ваши .wasm файлы, собранные через Makefile!
     println!("Модули рантайма Wasmtime успешно инициализированы.");
 
@@ -68,6 +77,7 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
         #[allow(unused)]
         let (subscriptions, lifecycle, plugin, store) =
             load_and_init_plugin(&engine, &linker, plugin).await?;
+
     }
 
     Ok(())
@@ -181,4 +191,17 @@ async fn load_and_init_plugin(
     // Возвращаем список топиков. (В реальном оркестраторе вы также сохраните
     // объект `plugin` и `store` в структуру супервизора плагина)
     Ok((subscriptions, lifecycle, plugin, store))
+}
+
+struct EventDispatcher;
+
+impl EventBusGuest for EventDispatcher {
+    fn publish_event(&mut self, event: ai::host::types::Event) {
+        println!("[Host] Плагин опубликовал событие: topic={}, payload={}", event.topic, event.payload);
+        // Здесь реализуйте логику пересылки события другим плагинам
+    }
+}
+
+impl HasData for EventDispatcher {
+    type Data<'a> = &'a EventDispatcher;
 }
