@@ -2,7 +2,11 @@ package ai:host;
 
 interface types {
   record event {
-    topic: string,
+    request-id: string, // Сквозной ID пользовательской сессии
+    session-id: string, // Сквозной ID пользовательского запроса
+    source: string,     // Отправитель (напр., "agent_manager")
+    target: string,     // Получатель (напр., "tool:calculator" или "agent:coder")
+    topic: string,      // "call"/"response"/"info"/"error"
     payload: string,
   }
 }
@@ -12,12 +16,14 @@ interface event-bus {
   publish-event: func(ev: event);
 }
 
-world host-plugin {
+interface plugin-lifecycle {
   use types.{event};
 
-  import event-bus;
+  init: func(config-json: string) -> list<string>;
+  handle-event: func(ev: event);
+}
 
-  // Теперь метод возвращает список шаблонов топиков для подписки
-  export init: func(config-json: string) -> list<string>;
-  export handle-event: func(ev: event);
+world host-plugin {
+  import event-bus;
+  export plugin-lifecycle;
 }
