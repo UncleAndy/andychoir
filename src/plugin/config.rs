@@ -1,28 +1,26 @@
 use serde::Deserialize;
 
 #[derive(Deserialize)]
-pub enum PluginClass {
-    #[serde(rename = "frontend")]
-    Frontend,
-    #[serde(rename = "orchestrator")]
-    Orchestrator,
-    #[serde(rename = "agent")]
-    Agent,
-    #[serde(rename = "tool")]
-    Tool,
-    #[serde(rename = "internal")]
-    Internal,
+pub enum PluginAccess {
+    #[serde(rename = "console")]
+    Console(String),
+    #[serde(rename = "filesystem")]
+    Filesystem(String, String, String), // path, dir_perms, file_perms ("ro", "rw")
+    #[serde(rename = "network")]
+    Network(Vec<(String, u16)>),
 }
 
 #[derive(Deserialize)]
 #[allow(unused)]
 pub struct PluginConfig {
     #[allow(unused)]
-    file: String,
+    pub file: String,
     #[allow(unused)]
-    name: String,
+    pub name: String,
     #[allow(unused)]
-    class: PluginClass,
+    pub class: String,
     #[allow(unused)]
-    config: serde_json::Value, // Параметры инициализации плагина
+    pub access: Vec<PluginAccess>,
+    #[allow(unused)]
+    pub config: serde_json::Value, // Параметры инициализации плагина
 }
