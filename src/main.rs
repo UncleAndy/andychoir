@@ -22,7 +22,7 @@ use crate::plugin::config::{PluginAccess, PluginConfig};
 use ai::host::types::Event;
 use exports::ai::host::plugin_lifecycle::Guest;
 
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use std::sync::Arc;
 
 pub struct PluginInstance {
@@ -81,7 +81,7 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
 
     let config = AppConfig::new_from_file(args.config).await?;
 
-    let plugins = Arc::new(Mutex::new(HashMap::<String, PluginInstance>::new()));
+    let plugins = Arc::new(RwLock::new(HashMap::<String, PluginInstance>::new()));
     let (tx, mut rx) = mpsc::channel::<Event>(100);
 
     for plugin in config.plugins.iter() {
@@ -96,14 +96,14 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
             store: store.clone(),
         };
 
-        let mut lock = plugins.lock().await;
+        let mut lock = plugins.write().await;
         lock.insert(plugin.name.clone(), plugin_instance);
     }
 
     let dispatcher_plugins = Arc::new(plugins);
 
     // Хранилище пула Store. Ключ: (<плагин>, <сессия>)
-    let stores = Arc::new(Mutex::new(HashMap::<(String, String), Arc<Mutex<Store<ChoirHostState>>>>::new()));
+    let stores = Arc::new(RwLock::new(HashMap::<(String, String), Arc<Mutex<Store<ChoirHostState>>>>::new()));
 
     let dispatcher_plugins_loop = dispatcher_plugins.clone();
     let stores_loop = stores.clone();
@@ -113,13 +113,13 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
             for target_pattern in targets {
                 let matched_plugins: Vec<String> = if target_pattern.contains('*') {
                     let pattern = target_pattern.replace("*", "");
-                    let lock = dispatcher_plugins_loop.lock().await;
+                    let lock = dispatcher_plugins_loop.read().await;
                     lock.keys()
                         .filter(|name| name.starts_with(&pattern))
                         .cloned()
                         .collect()
                 } else {
-                    let lock = dispatcher_plugins_loop.lock().await;
+                    let lock = dispatcher_plugins_loop.read().await;
                     if lock.contains_key(target_pattern) {
                         vec![target_pattern.to_string()]
                     } else {
@@ -130,45 +130,44 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
                 for plugin_name in matched_plugins {
                     // Добавляем в plugin_name идентификатор сессии из сообщения
                     // Проверяем существование плагина для данной сессии
-                    let store_option = {
-                        let store_lock = stores_loop.lock().await;
-                        store_lock.get(&(plugin_name.clone(), event.session_id.clone())).cloned()
-                    };
+                    let current_store = {
+                        let mut store_lock = stores_loop.write().await;
+                        let store_option = store_lock.get(&(plugin_name.clone(), event.session_id.clone())).cloned();
 
-                    let current_store = match store_option {
-                        None => {
-                            // Ищем плагин для создания нового store
-                            let plugin_config_opt = {
-                                let lock = dispatcher_plugins_loop.lock().await;
-                                lock.get(&plugin_name).map(|p| p.config.clone())
-                            };
+                        match store_option {
+                            None => {
+                                // Ищем плагин для создания нового store
+                                let plugin_config_opt = {
+                                    let lock = dispatcher_plugins_loop.read().await;
+                                    lock.get(&plugin_name).map(|p| p.config.clone())
+                                };
 
-                            if let Some(config) = plugin_config_opt {
-                                let tx_clone = tx.clone();
-                                let engine_ref = engine.clone(); // Engine в Wasmtime реализует Arc внутри
+                                if let Some(config) = plugin_config_opt {
+                                    let tx_clone = tx.clone();
+                                    let engine_ref = engine.clone(); // Engine в Wasmtime реализует Arc внутри
 
-                                match new_plugin_store(&engine_ref, &config, tx_clone).await {
-                                    Ok(store) => {
-                                        let store_arc = Arc::new(Mutex::new(store));
-                                        let mut store_lock = stores_loop.lock().await;
-                                        store_lock.insert((plugin_name.clone(), event.session_id.clone()), store_arc.clone());
-                                        store_arc
-                                    },
-                                    Err(err) => {
-                                        println!("Error creating plugin store: {} (plugin: {}).", err, plugin_name);
-                                        continue;
+                                    match new_plugin_store(&engine_ref, &config, tx_clone).await {
+                                        Ok(store) => {
+                                            let store_arc = Arc::new(Mutex::new(store));
+                                            store_lock.insert((plugin_name.clone(), event.session_id.clone()), store_arc.clone());
+                                            store_arc
+                                        },
+                                        Err(err) => {
+                                            println!("Error creating plugin store: {} (plugin: {}).", err, plugin_name);
+                                            continue;
+                                        }
                                     }
+                                } else {
+                                    println!("Cannot find plugin: {}", plugin_name);
+                                    continue;
                                 }
-                            } else {
-                                println!("Cannot find plugin: {}", plugin_name);
-                                continue;
-                            }
-                        },
-                        Some(existing_store) => existing_store,
+                            },
+                            Some(existing_store) => existing_store,
+                        }
                     };
 
                     let plugin_res = {
-                        let lock = dispatcher_plugins_loop.lock().await;
+                        let lock = dispatcher_plugins_loop.read().await;
                         lock.get(&plugin_name).map(|p| p.lifecycle.clone())
                     };
 
@@ -176,7 +175,7 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
                         let store = current_store;
                         let ev = event.clone();
                         let plugin_name_log = plugin_name.clone();
-                        tokio::spawn(async move {
+                        tokio::task::spawn(async move {
                             let res = {
                                 let mut store_guard = store.lock().await;
                                 lifecycle.call_handle_event(&mut *store_guard, &ev)
