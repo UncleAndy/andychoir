@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub enum PluginAccess {
     #[serde(rename = "console")]
     Console(String),
@@ -10,7 +10,7 @@ pub enum PluginAccess {
     Network(Vec<(String, u16)>),
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[allow(unused)]
 pub struct PluginConfig {
     #[allow(unused)]

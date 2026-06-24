@@ -5,6 +5,7 @@ pub mod host;   // Скорее всего, вам понадобятся и о�
 pub mod messages;
 pub mod plugin;
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::future::ready;
 use std::net::IpAddr;
@@ -78,13 +79,28 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     // Читаем главный конфиг
     let config = AppConfig::new_from_file(args.config).await?;
 
+    let mut plugins = HashMap::<String, PluginInstance>::new();
+
     // Инициализируем плагины
     for plugin in config.plugins.iter() {
         #[allow(unused)]
-        let (subscriptions, lifecycle, plugin, store) =
+        let (subscriptions, lifecycle, host, store) =
             load_and_init_plugin(&engine, &linker, plugin).await?;
 
+        plugins.insert(
+            plugin.name.clone(),
+            PluginInstance {
+                config: plugin.clone(),
+                topics: subscriptions,
+                lifecycle,
+                host,
+                store,
+            },
+        );
     }
+
+    // Дальше делаем рабочий цикл диспетчера сообщений
+
 
     Ok(())
 }
@@ -197,4 +213,12 @@ async fn load_and_init_plugin(
     // Возвращаем список топиков. (В реальном оркестраторе вы также сохраните
     // объект `plugin` и `store` в структуру супервизора плагина)
     Ok((subscriptions, lifecycle, plugin, store))
+}
+
+struct PluginInstance {
+    config: PluginConfig,
+    topics: Vec<String>,
+    lifecycle: Guest,
+    host: HostPlugin,
+    store: Store<ChoirHostState>,
 }
