@@ -1,7 +1,4 @@
-wasmtime::component::bindgen!({
-    world: "host-plugin",
-    path: "./wit",
-});
+wasmtime::component::bindgen!("host-plugin");
 
 pub mod config;
 pub mod host;
@@ -25,9 +22,15 @@ use crate::plugin::config::{PluginAccess, PluginConfig};
 use ai::host::types::Event;
 use exports::ai::host::plugin_lifecycle::Guest;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+
+pub struct PluginInstance {
+    pub config: PluginConfig,
+    pub topics: Vec<String>,
+    pub lifecycle: Guest,
+    pub store: Arc<Mutex<Store<ChoirHostState>>>,
+}
 
 pub struct ChoirHostState {
     wasi: WasiCtx,
@@ -67,8 +70,8 @@ pub struct AppArgs {
 async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     let args = AppArgs::parse();
 
-    let config = Config::new();
-    let engine = Engine::new(&config)?;
+    let engine_config = Config::new();
+    let engine = Engine::new(&engine_config)?;
 
     let mut linker = Linker::<ChoirHostState>::new(&engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
@@ -78,7 +81,7 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
 
     let config = AppConfig::new_from_file(args.config).await?;
 
-    let mut plugins = HashMap::<String, PluginInstance>::new();
+    let plugins = Arc::new(Mutex::new(HashMap::<String, PluginInstance>::new()));
     let (tx, mut rx) = mpsc::channel::<Event>(100);
 
     for plugin in config.plugins.iter() {
@@ -93,24 +96,31 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
             store: store.clone(),
         };
 
-        plugins.insert(plugin.name.clone(), plugin_instance);
+        let mut lock = plugins.lock().await;
+        lock.insert(plugin.name.clone(), plugin_instance);
     }
 
     let dispatcher_plugins = Arc::new(plugins);
-    
+
+    // Хранилище пула Store. Ключ: (<плагин>, <сессия>)
+    let stores = Arc::new(Mutex::new(HashMap::<(String, String), Arc<Mutex<Store<ChoirHostState>>>>::new()));
+
     let dispatcher_plugins_loop = dispatcher_plugins.clone();
+    let stores_loop = stores.clone();
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
             let targets = event.target.split_whitespace().collect::<Vec<_>>();
             for target_pattern in targets {
                 let matched_plugins: Vec<String> = if target_pattern.contains('*') {
                     let pattern = target_pattern.replace("*", "");
-                    dispatcher_plugins_loop.keys()
+                    let lock = dispatcher_plugins_loop.lock().await;
+                    lock.keys()
                         .filter(|name| name.starts_with(&pattern))
                         .cloned()
                         .collect()
                 } else {
-                    if dispatcher_plugins_loop.contains_key(target_pattern) {
+                    let lock = dispatcher_plugins_loop.lock().await;
+                    if lock.contains_key(target_pattern) {
                         vec![target_pattern.to_string()]
                     } else {
                         vec![]
@@ -118,13 +128,62 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
                 };
 
                 for plugin_name in matched_plugins {
-                    if let Some(plugin) = dispatcher_plugins_loop.get(&plugin_name) {
-                        let lifecycle = plugin.lifecycle.clone();
-                        let store = plugin.store.clone();
+                    // Добавляем в plugin_name идентификатор сессии из сообщения
+                    // Проверяем существование плагина для данной сессии
+                    let store_option = {
+                        let store_lock = stores_loop.lock().await;
+                        store_lock.get(&(plugin_name.clone(), event.session_id.clone())).cloned()
+                    };
+
+                    let current_store = match store_option {
+                        None => {
+                            // Ищем плагин для создания нового store
+                            let plugin_config_opt = {
+                                let lock = dispatcher_plugins_loop.lock().await;
+                                lock.get(&plugin_name).map(|p| p.config.clone())
+                            };
+
+                            if let Some(config) = plugin_config_opt {
+                                let tx_clone = tx.clone();
+                                let engine_ref = engine.clone(); // Engine в Wasmtime реализует Arc внутри
+
+                                match new_plugin_store(&engine_ref, &config, tx_clone).await {
+                                    Ok(store) => {
+                                        let store_arc = Arc::new(Mutex::new(store));
+                                        let mut store_lock = stores_loop.lock().await;
+                                        store_lock.insert((plugin_name.clone(), event.session_id.clone()), store_arc.clone());
+                                        store_arc
+                                    },
+                                    Err(err) => {
+                                        println!("Error creating plugin store: {} (plugin: {}).", err, plugin_name);
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                println!("Cannot find plugin: {}", plugin_name);
+                                continue;
+                            }
+                        },
+                        Some(existing_store) => existing_store,
+                    };
+
+                    let plugin_res = {
+                        let lock = dispatcher_plugins_loop.lock().await;
+                        lock.get(&plugin_name).map(|p| p.lifecycle.clone())
+                    };
+
+                    if let Some(lifecycle) = plugin_res {
+                        let store = current_store;
                         let ev = event.clone();
+                        let plugin_name_log = plugin_name.clone();
                         tokio::spawn(async move {
-                            let mut store = store.lock().await;
-                            let _ = lifecycle.call_handle_event(&mut *store, &ev);
+                            let res = {
+                                let mut store_guard = store.lock().await;
+                                lifecycle.call_handle_event(&mut *store_guard, &ev)
+                            };
+                            if let Err(e) = res {
+                                println!("[Хост] Ошибка при выполнении плагина {}: {:?}", plugin_name_log, e);
+                            }
                         });
                     }
                 }
@@ -233,9 +292,84 @@ async fn load_and_init_plugin(
     Ok((subscriptions, lifecycle, store))
 }
 
-pub struct PluginInstance {
-    pub config: PluginConfig,
-    pub topics: Vec<String>,
-    pub lifecycle: Guest,
-    pub store: Arc<Mutex<Store<ChoirHostState>>>,
+async fn new_plugin_store(
+    engine: &Engine,
+    plugin_config: &PluginConfig,
+    event_sender: mpsc::Sender<Event>,
+) -> anyhow::Result<Store<ChoirHostState>> {
+
+    let mut wasi_builder = WasiCtxBuilder::new();
+
+    for access in plugin_config.access.iter() {
+        match access {
+            PluginAccess::Console(_) => {
+                wasi_builder.inherit_stdin();
+                wasi_builder.inherit_stdout();
+                wasi_builder.inherit_stderr();
+            }
+            PluginAccess::Filesystem(path, dir_perms, files_perms) => {
+                let dir_perms = match dir_perms.to_lowercase().as_str() {
+                    "ro" => DirPerms::READ,
+                    "rw" => DirPerms::MUTATE | DirPerms::READ,
+                    _ => DirPerms::READ,
+                };
+
+                let files_perms = match files_perms.to_lowercase().as_str() {
+                    "ro" => FilePerms::READ,
+                    "rw" => FilePerms::WRITE | FilePerms::READ,
+                    _ => FilePerms::READ,
+                };
+
+                wasi_builder.preopened_dir(
+                    Path::new(path.as_str()),
+                    "/mnt",
+                    dir_perms,
+                    files_perms,
+                )?;
+            }
+            PluginAccess::Network(listens) => {
+                wasi_builder
+                    .allow_udp(true)
+                    .allow_tcp(true)
+                    .allow_ip_name_lookup(true);
+
+                let allowed_list = listens.clone();
+
+                wasi_builder.socket_addr_check(move |socket_addr, socket_ctx| {
+                    let allowed_list = allowed_list.clone();
+                    Box::pin(async move {
+                        let good_proto = match socket_ctx {
+                            SocketAddrUse::TcpBind => false,
+                            SocketAddrUse::UdpBind => false,
+                            _ => true,
+                        };
+                        if good_proto {
+                            return true
+                        }
+
+                        let port = socket_addr.port();
+                        let ip = socket_addr.ip();
+
+                        for (good_host, good_port) in allowed_list {
+                            let good_ip = IpAddr::from_str(good_host.as_str()).ok();
+
+                            if port == good_port && (good_ip.map_or(false, |gi| ip == gi) || good_host == "0.0.0.0") {
+                                return true
+                            }
+                        }
+                        false
+                    })
+                });
+            }
+        }
+    }
+
+    let host_state = ChoirHostState {
+        wasi: wasi_builder.build(),
+        table: Default::default(),
+        event_sender,
+    };
+    let store = Store::new(engine, host_state);
+
+    Ok(store)
 }
