@@ -10,6 +10,11 @@ use crate::plugin::config::PluginConfig;
 pub struct Config {
     #[allow(dead_code)]
     pub plugins: Vec<PluginConfig>,
+
+    #[allow(dead_code)]
+    pub(crate) session_timeout: u64,
+    #[allow(dead_code)]
+    pub(crate) session_check_period: u64,
 }
 
 impl Config {

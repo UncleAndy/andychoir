@@ -66,6 +66,11 @@ pub struct AppArgs {
     pub config: PathBuf,
 }
 
+struct SessionSlot {
+    store: Arc<Mutex<Store<ChoirHostState>>>,
+    last_used: std::time::Instant,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     let args = AppArgs::parse();
@@ -103,7 +108,22 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     let dispatcher_plugins = Arc::new(plugins);
 
     // Хранилище пула Store. Ключ: (<плагин>, <сессия>)
-    let stores = Arc::new(RwLock::new(HashMap::<(String, String), Arc<Mutex<Store<ChoirHostState>>>>::new()));
+    let stores = Arc::new(dashmap::DashMap::<(String, String), SessionSlot>::new());
+
+    // Внутренний процесс очистки неактивных сессий
+    let stores_cleanup = stores.clone();
+    tokio::spawn(async move {
+        let timeout = std::time::Duration::from_secs(config.session_timeout);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(config.session_check_period)).await;
+
+            let now = std::time::Instant::now();
+            // retain удаляет элементы, для которых предикат вернул false
+            stores_cleanup.retain(|_, slot| {
+                now.duration_since(slot.last_used) < timeout
+            });
+        }
+    });
 
     let dispatcher_plugins_loop = dispatcher_plugins.clone();
     let stores_loop = stores.clone();
@@ -130,9 +150,8 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
                 for plugin_name in matched_plugins {
                     // Добавляем в plugin_name идентификатор сессии из сообщения
                     // Проверяем существование плагина для данной сессии
-                    let current_store = {
-                        let mut store_lock = stores_loop.write().await;
-                        let store_option = store_lock.get(&(plugin_name.clone(), event.session_id.clone())).cloned();
+                    let current_store_key = {
+                        let store_option = stores_loop.get(&(plugin_name.clone(), event.session_id.clone()));
 
                         match store_option {
                             None => {
@@ -148,9 +167,12 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
 
                                     match new_plugin_store(&engine_ref, &config, tx_clone).await {
                                         Ok(store) => {
-                                            let store_arc = Arc::new(Mutex::new(store));
-                                            store_lock.insert((plugin_name.clone(), event.session_id.clone()), store_arc.clone());
-                                            store_arc
+                                            let key = (plugin_name.clone(), event.session_id.clone());
+                                            stores_loop.insert(key.clone(), SessionSlot {
+                                                store: Arc::new(Mutex::new(store)),
+                                                last_used: std::time::Instant::now(),
+                                            });
+                                            key
                                         },
                                         Err(err) => {
                                             println!("Error creating plugin store: {} (plugin: {}).", err, plugin_name);
@@ -162,7 +184,7 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
                                     continue;
                                 }
                             },
-                            Some(existing_store) => existing_store,
+                            Some(_) => (plugin_name.clone(), event.session_id.clone()),
                         }
                     };
 
@@ -172,17 +194,23 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
                     };
 
                     if let Some(lifecycle) = plugin_res {
-                        let store = current_store;
+                        let store_key = current_store_key.clone();
                         let ev = event.clone();
                         let plugin_name_log = plugin_name.clone();
+                        let stores_loop = stores.clone();
                         tokio::task::spawn(async move {
-                            let res = {
-                                let mut store_guard = store.lock().await;
-                                lifecycle.call_handle_event(&mut *store_guard, &ev)
+                            if let Some(mut slot) = stores_loop.get_mut(&store_key) {
+                                slot.last_used = std::time::Instant::now();
+                                let store_arc = slot.store.clone();
+                                drop(slot); // Снимаем замок с карты как можно быстрее!
+
+                                let mut store_guard = store_arc.lock().await;
+                                if let Err(e) = lifecycle.call_handle_event(&mut *store_guard, &ev) {
+                                    println!("[Хост] Ошибка при выполнении плагина {}: {:?}", plugin_name_log, e);
+                                }
+                            } else {
+                                println!("[Хост] Сессия не найдена для ключа {:?}", store_key);
                             };
-                            if let Err(e) = res {
-                                println!("[Хост] Ошибка при выполнении плагина {}: {:?}", plugin_name_log, e);
-                            }
                         });
                     }
                 }
