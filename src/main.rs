@@ -1,5 +1,7 @@
 wasmtime::component::bindgen!("host-plugin");
 
+// TODO: Сделать инструменты: работа с консолью, работа с файлами, работа с сетью.
+
 pub mod config;
 pub mod host;
 pub mod messages;
