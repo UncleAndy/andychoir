@@ -75,7 +75,20 @@ struct SessionSlot {
 async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     let args = AppArgs::parse();
 
-    let engine_config = Config::new();
+    let config = AppConfig::new_from_file(args.config).await?;
+
+    let mut engine_config = Config::new();
+
+    // Устанавливаем максимальный размер памяти для любого инстанса.
+    // Значение задается в байтах.
+    // Например, 256 МБ = 256 * 1024 * 1024
+    engine_config.memory_reservation_for_growth(config.max_plugin_memory);
+
+    // Дополнительно: чтобы предотвратить бесконечные циклы (CPU DoS),
+    // можно включить "топливо" (fuel), но это потребует вызова
+    // store.set_fuel() при каждом запуске.
+    engine_config.consume_fuel(true);
+
     let engine = Engine::new(&engine_config)?;
 
     let mut linker = Linker::<ChoirHostState>::new(&engine);
@@ -83,8 +96,6 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     ai::host::event_bus::add_to_linker::<ChoirHostState, ChoirHostState>(&mut linker, |state| state)?;
 
     println!("Модули рантайма Wasmtime успешно инициализированы.");
-
-    let config = AppConfig::new_from_file(args.config).await?;
 
     let plugins = Arc::new(RwLock::new(HashMap::<String, PluginInstance>::new()));
     let (tx, mut rx) = mpsc::channel::<Event>(100);
@@ -205,6 +216,11 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
                                 drop(slot); // Снимаем замок с карты как можно быстрее!
 
                                 let mut store_guard = store_arc.lock().await;
+
+                                // --- ВАЖНО: Заправляем Store перед КАЖДЫМ вызовом ---
+                                // Теперь каждый отдельный event может потратить до 1 млн инструкций.
+                                let _ = store_guard.set_fuel(config.max_fuel_for_call);
+
                                 if let Err(e) = lifecycle.call_handle_event(&mut *store_guard, &ev) {
                                     println!("[Хост] Ошибка при выполнении плагина {}: {:?}", plugin_name_log, e);
                                 }
@@ -304,6 +320,7 @@ async fn load_and_init_plugin(
         event_sender,
     };
     let mut store = Store::new(engine, host_state);
+    let _ = store.set_fuel(1_000_000_000);
 
     println!("[Хост] Загрузка файла: {:?}", plugin_config.file.clone());
     let component = Component::from_file(engine, plugin_config.file.clone())?;
@@ -396,7 +413,8 @@ async fn new_plugin_store(
         table: Default::default(),
         event_sender,
     };
-    let store = Store::new(engine, host_state);
+    let mut store = Store::new(engine, host_state);
+    let _ = store.set_fuel(1_000_000_000);
 
     Ok(store)
 }

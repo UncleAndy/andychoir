@@ -12,9 +12,33 @@ pub struct Config {
     pub plugins: Vec<PluginConfig>,
 
     #[allow(dead_code)]
+    #[serde(default = "default_session_timeout")]
     pub(crate) session_timeout: u64,
     #[allow(dead_code)]
+    #[serde(default = "default_session_check_period")]
     pub(crate) session_check_period: u64,
+    #[allow(dead_code)]
+    #[serde(default = "default_max_fuel_for_call")]
+    pub(crate) max_fuel_for_call: u64,
+    #[allow(dead_code)]
+    #[serde(default = "default_max_plugin_memory")]
+    pub(crate) max_plugin_memory: u64,
+}
+
+fn default_max_fuel_for_call() -> u64 {
+    1_000_000
+}
+
+fn default_session_check_period() -> u64 {
+    600
+}
+
+fn default_session_timeout() -> u64 {
+    24 * 3600
+}
+
+fn default_max_plugin_memory() -> u64 {
+    512 * 1024 * 1024
 }
 
 impl Config {
