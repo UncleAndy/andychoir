@@ -69,6 +69,21 @@ impl crate::ai::host::event_bus::Host for ChoirHostState {
     }
 }
 
+impl crate::ai::host::console::Host for ChoirHostState {
+    fn print_line(&mut self, line: String) -> () {
+        crate::host::console::print_line(format_args!("{}", line));
+    }
+}
+
+impl crate::ai::host::console::HostWithStore<ChoirHostState> for ChoirHostState {
+    async fn read_line(
+        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        prompt: String,
+    ) -> Option<String> {
+        crate::host::console::read_prompted_line(prompt).await
+    }
+}
+
 impl WasiView for ChoirHostState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
@@ -98,6 +113,10 @@ pub fn create_linker(engine: &Engine) -> anyhow::Result<Linker<ChoirHostState>> 
     let mut linker = Linker::<ChoirHostState>::new(engine);
     wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
     crate::ai::host::event_bus::add_to_linker::<ChoirHostState, ChoirHostState>(
+        &mut linker,
+        |state| state,
+    )?;
+    crate::ai::host::console::add_to_linker::<ChoirHostState, ChoirHostState>(
         &mut linker,
         |state| state,
     )?;
@@ -169,7 +188,10 @@ fn run_plugin_in_background(
                 plugin_name, err
             );
         } else {
-            println!("[Хост] Фоновый процесс плагина {} запустился успешно", plugin_name);
+            println!(
+                "[Хост] Фоновый процесс плагина {} запустился успешно",
+                plugin_name
+            );
         }
     });
 
@@ -202,7 +224,7 @@ pub async fn load_and_init_plugin(
         .run_concurrent(async |accessor| lifecycle.call_init(accessor, config_str).await)
         .await;
     let subscriptions = subscriptions_res.and_then(|res| res).unwrap_or_else(|err| {
-        eprintln!("[Хост] Ошибка при вызове метода init: {:?}", err);
+        println!("[Хост] Ошибка при вызове метода init: {:?}", err);
         Vec::<String>::new()
     });
 

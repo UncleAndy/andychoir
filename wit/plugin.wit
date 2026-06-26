@@ -16,6 +16,11 @@ interface event-bus {
   publish-event: func(ev: event);
 }
 
+interface console {
+  print-line: func(line: string);
+  read-line: async func(prompt: string) -> option<string>;
+}
+
 interface plugin-lifecycle {
   use types.{event};
 
@@ -26,5 +31,6 @@ interface plugin-lifecycle {
 
 world host-plugin {
   import event-bus;
+  import console;
   export plugin-lifecycle;
 }

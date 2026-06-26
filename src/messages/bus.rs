@@ -4,8 +4,8 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use wasmtime::component::{Component, Linker};
 use wasmtime::Engine;
+use wasmtime::component::{Component, Linker};
 
 use crate::HostPlugin;
 use crate::ai::host::types::Event;
@@ -192,16 +192,17 @@ async fn process_event_job(
     metrics: Arc<Metrics>,
     max_fuel_for_call: u64,
 ) {
-    println!("[Хост] Worker {} получил Job для отправки в плагин ивента: {:?}", worker_id, job.event);
+    println!(
+        "[Хост] Worker {} получил Job для отправки в плагин ивента: {:?}",
+        worker_id, job.event
+    );
 
     let mut store_guard = job.store.lock().await;
     let _ = store_guard.set_fuel(max_fuel_for_call);
 
     let started_at = std::time::Instant::now();
     let handle_event_res = store_guard
-        .run_concurrent(async |accessor| {
-            job.lifecycle.call_handle_event(accessor, job.event).await
-        })
+        .run_concurrent(async |accessor| job.lifecycle.call_handle_event(accessor, job.event).await)
         .await;
     metrics.observe_processing_time(&job.plugin_name, started_at.elapsed());
 
@@ -226,7 +227,10 @@ async fn dispatch_event(
     let targets = event.target.split_whitespace().collect::<Vec<_>>();
     for target_pattern in targets {
         let matched_plugins = match_plugins(plugins, target_pattern).await;
-        println!("[Хост] Найдены плагины для получения сообщения: {:?}", matched_plugins);
+        println!(
+            "[Хост] Найдены плагины для получения сообщения: {:?}",
+            matched_plugins
+        );
 
         for plugin_name in matched_plugins {
             println!("[Хост] Исполнение плагина {} ({:?})", plugin_name, event);
@@ -240,9 +244,14 @@ async fn dispatch_event(
                 &event.session_id,
                 metrics,
             )
-            .await else {
+            .await
+            else {
                 let plugins_lock = plugins.read().await;
-                println!("[Хост] Не удалось получить хранилище и жизненный цикл плагина {} ({:?})", plugin_name, plugins_lock.keys());
+                println!(
+                    "[Хост] Не удалось получить хранилище и жизненный цикл плагина {} ({:?})",
+                    plugin_name,
+                    plugins_lock.keys()
+                );
                 continue;
             };
 
@@ -305,13 +314,8 @@ async fn store_for_event(
 ) -> Option<(Arc<Mutex<wasmtime::Store<ChoirHostState>>>, Guest)> {
     let plugin_instance_opt = {
         let lock = plugins.read().await;
-        lock.get(plugin_name).map(|p| {
-            (
-                p.config.clone(),
-                p.store.clone(),
-                p.lifecycle.clone(),
-            )
-        })
+        lock.get(plugin_name)
+            .map(|p| (p.config.clone(), p.store.clone(), p.lifecycle.clone()))
     };
 
     let Some((config, plugin_store, plugin_lifecycle)) = plugin_instance_opt else {

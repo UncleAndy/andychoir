@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
             interval.tick().await;
-            println!("{}", metrics_console.render_console());
+            andychoir::host_println!("{}", metrics_console.render_console());
         }
     });
      */
@@ -47,7 +47,7 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
         },
     );
 
-    println!("Модули рантайма Wasmtime успешно инициализированы.");
+    andychoir::println!("Модули рантайма Wasmtime успешно инициализированы.");
 
     let (tx, rx) = mpsc::channel::<Event>(config.event_queue_size);
     let (plugins, background_plugins) = load_plugins(&config, &engine, &linker, tx.clone()).await?;
@@ -68,9 +68,9 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
         },
     );
 
-    println!("Хост запущен. Нажмите Ctrl+C для выхода.");
+    andychoir::println!("Хост запущен. Нажмите Ctrl+C для выхода.");
     tokio::signal::ctrl_c().await?;
-    println!("Завершение работы...");
+    andychoir::println!("Завершение работы...");
 
     drop(tx);
     for background_plugin in background_plugins {
@@ -78,6 +78,6 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     }
     event_bus.shutdown().await;
 
-    println!("[Хост] Выход из процесса.");
+    andychoir::println!("[Хост] Выход из процесса.");
     std::process::exit(0);
 }
