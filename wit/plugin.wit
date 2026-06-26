@@ -19,8 +19,8 @@ interface event-bus {
 interface plugin-lifecycle {
   use types.{event};
 
-  init: func(config-json: string) -> list<string>;
-  handle-event: func(ev: event);
+  init: async func(config-json: string) -> list<string>;
+  handle-event: async func(ev: event);
 }
 
 world host-plugin {

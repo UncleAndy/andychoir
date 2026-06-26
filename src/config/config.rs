@@ -1,7 +1,7 @@
+use crate::plugin::config::PluginConfig;
+use serde::Deserialize;
 use std::error::Error;
 use std::path::PathBuf;
-use serde::Deserialize;
-use crate::plugin::config::PluginConfig;
 
 /// Main config for host
 /// Include parameters for frontends, orchestrator, agents, tools
