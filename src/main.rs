@@ -331,7 +331,15 @@ async fn load_and_init_plugin(
     let lifecycle = plugin.ai_host_plugin_lifecycle().clone();
 
     println!("[Хост] Вызов метода init...");
-    let subscriptions = lifecycle.call_init(&mut store, plugin_config.config.as_str().unwrap())?;
+
+    let config_str = plugin_config.config.to_string();
+    println!("[Хост] Конфигурация плагина: {:?}", config_str);
+
+    let subscriptions_res = lifecycle.call_init(&mut store, config_str.as_str());
+    let subscriptions = subscriptions_res.unwrap_or_else(|err| {
+        eprintln!("[Хост] Ошибка при вызове метода init: {:?}", err);
+        Vec::<String>::new()
+    });
 
     println!("[Хост] Плагин успешно загружен. Его подписки: {:?}", subscriptions);
 

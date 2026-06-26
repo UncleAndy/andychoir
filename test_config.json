@@ -1,0 +1,14 @@
+{
+  "plugins": [
+    {
+      "file": "./target/wasm32-wasip2/debug/front_console_plugin.wasm",
+      "name": "console",
+      "class": "front",
+      "access": ["console"],
+      "config": {
+        "subscriptions": ["system:info", "system:error"],
+        "targets": ["system:info"]
+      }
+    }
+  ]
+}

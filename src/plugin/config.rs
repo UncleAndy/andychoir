@@ -2,11 +2,11 @@ use serde::Deserialize;
 
 #[derive(Deserialize, Clone)]
 pub enum PluginAccess {
-    #[serde(rename = "console")]
+    #[serde(rename = "console", untagged)]
     Console(String),
-    #[serde(rename = "filesystem")]
+    #[serde(rename = "filesystem", untagged)]
     Filesystem(String, String, String), // path, dir_perms, file_perms ("ro", "rw")
-    #[serde(rename = "network")]
+    #[serde(rename = "network", untagged)]
     Network(Vec<(String, u16)>),
 }
 
