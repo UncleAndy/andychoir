@@ -4,8 +4,10 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use tokio::sync::{Mutex, RwLock, mpsc, watch};
 use tokio::task::JoinHandle;
+use wasmtime::component::{Component, Linker};
 use wasmtime::Engine;
 
+use crate::HostPlugin;
 use crate::ai::host::types::Event;
 use crate::exports::ai::host::plugin_lifecycle::Guest;
 use crate::metrics::Metrics;
@@ -31,12 +33,13 @@ pub struct EventBusHandle {
 
 struct SessionSlot {
     store: Arc<Mutex<wasmtime::Store<ChoirHostState>>>,
+    lifecycle: Guest,
     last_used: std::time::Instant,
 }
 
 struct EventJob {
     plugin_name: String,
-    store_key: (String, String),
+    store: Arc<Mutex<wasmtime::Store<ChoirHostState>>>,
     lifecycle: Guest,
     event: Event,
 }
@@ -46,6 +49,7 @@ pub fn start_event_bus(
     mut rx: mpsc::Receiver<Event>,
     tx: mpsc::Sender<Event>,
     engine: Engine,
+    linker: Linker<ChoirHostState>,
     config: EventBusConfig,
 ) -> EventBusHandle {
     let stores = Arc::new(DashMap::<(String, String), SessionSlot>::new());
@@ -63,7 +67,6 @@ pub fn start_event_bus(
     let mut worker_handles = Vec::with_capacity(worker_count);
     for worker_id in 0..worker_count {
         let worker_rx = worker_rx.clone();
-        let stores_worker = stores.clone();
         let metrics_worker = config.metrics.clone();
         let worker_queue_size = config.event_queue_size;
         let max_fuel_for_call = config.max_fuel_for_call;
@@ -80,30 +83,22 @@ pub fn start_event_bus(
                 metrics_worker
                     .set_worker_queue_fill(worker_rx.lock().await.len(), worker_queue_size);
 
-                if let Some(mut slot) = stores_worker.get_mut(&job.store_key) {
-                    slot.last_used = std::time::Instant::now();
-                    let store_arc = slot.store.clone();
-                    drop(slot);
+                let mut store_guard = job.store.lock().await;
+                let _ = store_guard.set_fuel(max_fuel_for_call);
 
-                    let mut store_guard = store_arc.lock().await;
-                    let _ = store_guard.set_fuel(max_fuel_for_call);
+                let started_at = std::time::Instant::now();
+                let handle_event_res = store_guard
+                    .run_concurrent(async |accessor| {
+                        job.lifecycle.call_handle_event(accessor, job.event).await
+                    })
+                    .await;
+                metrics_worker.observe_processing_time(&job.plugin_name, started_at.elapsed());
 
-                    let started_at = std::time::Instant::now();
-                    let handle_event_res = store_guard
-                        .run_concurrent(async |accessor| {
-                            job.lifecycle.call_handle_event(accessor, job.event).await
-                        })
-                        .await;
-                    metrics_worker.observe_processing_time(&job.plugin_name, started_at.elapsed());
-
-                    if let Err(e) = handle_event_res {
-                        println!(
-                            "[Хост] Ошибка при выполнении плагина {}: {:?}",
-                            job.plugin_name, e
-                        );
-                    }
-                } else {
-                    println!("[Хост] Сессия не найдена для ключа {:?}", job.store_key);
+                if let Err(e) = handle_event_res {
+                    println!(
+                        "[Хост] Ошибка при выполнении плагина {}: {:?}",
+                        job.plugin_name, e
+                    );
                 }
             }
 
@@ -150,6 +145,7 @@ pub fn start_event_bus(
                 &plugins,
                 &stores,
                 &engine,
+                &linker,
                 &tx,
                 &worker_tx_loop,
                 &metrics_loop,
@@ -190,6 +186,7 @@ async fn dispatch_event(
     plugins: &PluginRegistry,
     stores: &Arc<DashMap<(String, String), SessionSlot>>,
     engine: &Engine,
+    linker: &Linker<ChoirHostState>,
     tx: &mpsc::Sender<Event>,
     worker_tx: &mpsc::Sender<EventJob>,
     metrics: &Arc<Metrics>,
@@ -199,48 +196,38 @@ async fn dispatch_event(
         let matched_plugins = match_plugins(plugins, target_pattern).await;
 
         for plugin_name in matched_plugins {
-            let current_store_key = match store_key_for_event(
+            let Some((store, lifecycle)) = store_for_event(
                 plugins,
                 stores,
                 engine,
+                linker,
                 tx,
                 &plugin_name,
                 &event.session_id,
                 metrics,
             )
-            .await
-            {
-                Some(key) => key,
-                None => continue,
+            .await else {
+                continue;
             };
 
-            let plugin_res = {
-                let lock = plugins.read().await;
-                lock.get(&plugin_name).map(|p| p.lifecycle.clone())
+            let job = EventJob {
+                plugin_name: plugin_name.clone(),
+                store,
+                lifecycle,
+                event: event.clone(),
             };
 
-            if let Some(lifecycle) = plugin_res {
-                let job = EventJob {
-                    plugin_name: plugin_name.clone(),
-                    store_key: current_store_key,
-                    lifecycle,
-                    event: event.clone(),
-                };
-
-                if let Err(err) = worker_tx.try_send(job) {
-                    metrics.inc_rejected_event(&plugin_name);
-                    println!(
-                        "[Хост] Очередь пула исполнителей переполнена или закрыта, событие для плагина {} отклонено: {}",
-                        plugin_name, err
-                    );
-                }
-                metrics.set_worker_queue_fill(
-                    worker_tx.max_capacity() - worker_tx.capacity(),
-                    worker_tx.max_capacity(),
+            if let Err(err) = worker_tx.try_send(job) {
+                metrics.inc_rejected_event(&plugin_name);
+                println!(
+                    "[Хост] Очередь пула исполнителей переполнена или закрыта, событие для плагина {} отклонено: {}",
+                    plugin_name, err
                 );
-            } else {
-                println!("[Хост] Не найден lifecycle плагина {}", plugin_name);
             }
+            metrics.set_worker_queue_fill(
+                worker_tx.max_capacity() - worker_tx.capacity(),
+                worker_tx.max_capacity(),
+            );
         }
     }
 }
@@ -263,41 +250,79 @@ async fn match_plugins(plugins: &PluginRegistry, target_pattern: &str) -> Vec<St
     }
 }
 
-async fn store_key_for_event(
+async fn store_for_event(
     plugins: &PluginRegistry,
     stores: &Arc<DashMap<(String, String), SessionSlot>>,
     engine: &Engine,
+    linker: &Linker<ChoirHostState>,
     tx: &mpsc::Sender<Event>,
     plugin_name: &str,
     session_id: &str,
     metrics: &Arc<Metrics>,
-) -> Option<(String, String)> {
-    let key = (plugin_name.to_string(), session_id.to_string());
-    if stores.contains_key(&key) {
-        return Some(key);
-    }
-
-    let plugin_config_opt = {
+) -> Option<(Arc<Mutex<wasmtime::Store<ChoirHostState>>>, Guest)> {
+    let plugin_instance_opt = {
         let lock = plugins.read().await;
-        lock.get(plugin_name).map(|p| p.config.clone())
+        lock.get(plugin_name).map(|p| {
+            (
+                p.config.clone(),
+                p.store.clone(),
+                p.lifecycle.clone(),
+            )
+        })
     };
 
-    let Some(config) = plugin_config_opt else {
+    let Some((config, plugin_store, plugin_lifecycle)) = plugin_instance_opt else {
         println!("Cannot find plugin: {}", plugin_name);
         return None;
     };
 
+    if config.allow_background {
+        return Some((plugin_store, plugin_lifecycle));
+    }
+
+    let key = (plugin_name.to_string(), session_id.to_string());
+    if let Some(mut slot) = stores.get_mut(&key) {
+        slot.last_used = std::time::Instant::now();
+        return Some((slot.store.clone(), slot.lifecycle.clone()));
+    }
+
     match new_plugin_store(engine, &config, tx.clone()).await {
-        Ok(store) => {
+        Ok(mut store) => {
+            let component = match Component::from_file(engine, config.file.clone()) {
+                Ok(component) => component,
+                Err(err) => {
+                    println!(
+                        "Error loading plugin component: {} (plugin: {}).",
+                        err, plugin_name
+                    );
+                    return None;
+                }
+            };
+
+            let plugin = match HostPlugin::instantiate_async(&mut store, &component, linker).await {
+                Ok(plugin) => plugin,
+                Err(err) => {
+                    println!(
+                        "Error instantiating plugin: {} (plugin: {}).",
+                        err, plugin_name
+                    );
+                    return None;
+                }
+            };
+
+            let lifecycle = plugin.ai_host_plugin_lifecycle().clone();
+
+            let store = Arc::new(Mutex::new(store));
             stores.insert(
-                key.clone(),
+                key,
                 SessionSlot {
-                    store: Arc::new(Mutex::new(store)),
+                    store: store.clone(),
+                    lifecycle: lifecycle.clone(),
                     last_used: std::time::Instant::now(),
                 },
             );
             metrics.set_active_sessions(stores.len());
-            Some(key)
+            Some((store, lifecycle))
         }
         Err(err) => {
             println!(

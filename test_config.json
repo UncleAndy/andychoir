@@ -8,7 +8,8 @@
       "config": {
         "subscriptions": ["system:info", "system:error"],
         "targets": ["system:info"]
-      }
+      },
+      "allow_background": true
     }
   ],
   "metrics": {

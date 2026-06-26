@@ -48,13 +48,14 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     println!("Модули рантайма Wasmtime успешно инициализированы.");
 
     let (tx, rx) = mpsc::channel::<Event>(config.event_queue_size);
-    let plugins = load_plugins(&config, &engine, &linker, tx.clone()).await?;
+    let (plugins, background_plugins) = load_plugins(&config, &engine, &linker, tx.clone()).await?;
 
     let event_bus = start_event_bus(
         plugins,
         rx,
         tx.clone(),
         engine,
+        linker,
         EventBusConfig {
             event_queue_size: config.event_queue_size,
             thread_pool_size: config.thread_pool_size,
@@ -71,6 +72,10 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
 
     drop(tx);
     event_bus.shutdown().await;
+    for background_plugin in background_plugins {
+        background_plugin.shutdown().await;
+    }
 
-    Ok(())
+    println!("[Хост] Выход из процесса.");
+    std::process::exit(0);
 }

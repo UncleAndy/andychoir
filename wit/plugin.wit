@@ -20,6 +20,7 @@ interface plugin-lifecycle {
   use types.{event};
 
   init: async func(config-json: string) -> list<string>;
+  run: async func(); // Если нужен параллельный цикл обработки для плагина.
   handle-event: async func(ev: event);
 }
 

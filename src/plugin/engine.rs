@@ -5,6 +5,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::task::JoinHandle;
 use wasmtime::component::{Component, HasData, Linker, ResourceTable};
 use wasmtime::{Config as WasmtimeConfig, Engine, Store};
 use wasmtime_wasi::sockets::SocketAddrUse;
@@ -22,6 +23,32 @@ pub struct PluginInstance {
     pub topics: Vec<String>,
     pub lifecycle: Guest,
     pub store: Arc<Mutex<Store<ChoirHostState>>>,
+}
+
+pub struct BackgroundPluginHandle {
+    plugin_name: String,
+    handle: JoinHandle<()>,
+}
+
+impl BackgroundPluginHandle {
+    pub async fn shutdown(self) {
+        self.handle.abort();
+
+        match self.handle.await {
+            Ok(()) => println!(
+                "[Хост] Фоновый процесс плагина {} завершён.",
+                self.plugin_name
+            ),
+            Err(err) if err.is_cancelled() => println!(
+                "[Хост] Фоновый процесс плагина {} остановлен.",
+                self.plugin_name
+            ),
+            Err(err) => println!(
+                "[Хост] Фоновый процесс плагина {} завершился с ошибкой: {:?}",
+                self.plugin_name, err
+            ),
+        }
+    }
 }
 
 pub struct ChoirHostState {
@@ -61,11 +88,6 @@ pub fn create_engine(config: &Config) -> anyhow::Result<Engine> {
     // Значение задается в байтах.
     // Например, 256 МБ = 256 * 1024 * 1024
     engine_config.memory_reservation_for_growth(config.max_plugin_memory);
-
-    // Дополнительно: чтобы предотвратить бесконечные циклы (CPU DoS),
-    // можно включить "топливо" (fuel), но это потребует вызова
-    // store.set_fuel() при каждом запуске.
-    engine_config.consume_fuel(true);
     engine_config.concurrency_support(true);
 
     Ok(Engine::new(&engine_config)?)
@@ -87,25 +109,65 @@ pub async fn load_plugins(
     engine: &Engine,
     linker: &Linker<ChoirHostState>,
     tx: mpsc::Sender<Event>,
-) -> anyhow::Result<PluginRegistry> {
+) -> anyhow::Result<(PluginRegistry, Vec<BackgroundPluginHandle>)> {
     let plugins = Arc::new(RwLock::new(HashMap::<String, PluginInstance>::new()));
+    let mut background_handles = Vec::new();
 
     for plugin in config.plugins.iter() {
         let (subscriptions, lifecycle, store) =
             load_and_init_plugin(engine, linker, plugin, tx.clone()).await?;
+        let store = Arc::new(Mutex::new(store));
 
         let plugin_instance = PluginInstance {
             config: plugin.clone(),
             topics: subscriptions,
-            lifecycle,
-            store: Arc::new(Mutex::new(store)),
+            lifecycle: lifecycle.clone(),
+            store: store.clone(),
         };
+
+        if plugin.allow_background {
+            background_handles.push(run_plugin_in_background(
+                plugin.name.clone(),
+                lifecycle,
+                store,
+            ));
+        }
 
         let mut lock = plugins.write().await;
         lock.insert(plugin.name.clone(), plugin_instance);
     }
 
-    Ok(plugins)
+    Ok((plugins, background_handles))
+}
+
+fn run_plugin_in_background(
+    plugin_name: String,
+    lifecycle: Guest,
+    store: Arc<Mutex<Store<ChoirHostState>>>,
+) -> BackgroundPluginHandle {
+    let handle_plugin_name = plugin_name.clone();
+    let handle = tokio::spawn(async move {
+        println!("[Хост] Запуск фонового процесса плагина {}...", plugin_name);
+
+        let mut store_guard = store.lock().await;
+        let run_res = store_guard
+            .run_concurrent(async |accessor| lifecycle.call_run(accessor).await)
+            .await;
+
+        if let Err(err) = run_res {
+            println!(
+                "[Хост] Фоновый процесс плагина {} запустился с ошибкой: {:?}",
+                plugin_name, err
+            );
+        } else {
+            println!("[Хост] Фоновый процесс плагина {} запустился успешно", plugin_name);
+        }
+    });
+
+    BackgroundPluginHandle {
+        plugin_name: handle_plugin_name,
+        handle,
+    }
 }
 
 pub async fn load_and_init_plugin(
@@ -157,8 +219,7 @@ pub async fn new_plugin_store(
         table: Default::default(),
         event_sender,
     };
-    let mut store = Store::new(engine, host_state);
-    let _ = store.set_fuel(1_000_000_000);
+    let store = Store::new(engine, host_state);
 
     Ok(store)
 }

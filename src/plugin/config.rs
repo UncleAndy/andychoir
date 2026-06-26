@@ -22,5 +22,8 @@ pub struct PluginConfig {
     #[allow(unused)]
     pub access: Vec<PluginAccess>,
     #[allow(unused)]
+    #[serde(default)]
+    pub allow_background: bool,
+    #[allow(unused)]
     pub config: serde_json::Value, // Параметры инициализации плагина
 }
