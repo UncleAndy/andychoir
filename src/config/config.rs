@@ -13,22 +13,22 @@ pub struct Config {
 
     #[allow(dead_code)]
     #[serde(default = "default_session_timeout")]
-    pub(crate) session_timeout: u64,
+    pub session_timeout: u64,
     #[allow(dead_code)]
     #[serde(default = "default_session_check_period")]
-    pub(crate) session_check_period: u64,
+    pub session_check_period: u64,
     #[allow(dead_code)]
     #[serde(default = "default_max_fuel_for_call")]
-    pub(crate) max_fuel_for_call: u64,
+    pub max_fuel_for_call: u64,
     #[allow(dead_code)]
     #[serde(default = "default_max_plugin_memory")]
-    pub(crate) max_plugin_memory: u64,
+    pub max_plugin_memory: u64,
     #[allow(dead_code)]
     #[serde(default = "default_thread_pool_size")]
-    pub(crate) thread_pool_size: usize,
+    pub thread_pool_size: usize,
     #[allow(dead_code)]
     #[serde(default = "default_event_queue_size")]
-    pub(crate) event_queue_size: usize,
+    pub event_queue_size: usize,
 }
 
 fn default_max_fuel_for_call() -> u64 {
