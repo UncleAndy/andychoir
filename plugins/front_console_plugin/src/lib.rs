@@ -23,7 +23,7 @@ struct FrontConsolePluginImplementation;
 
 impl Guest for FrontConsolePluginImplementation {
     // Изменяем сигнатуру: возвращаем Vec<String> хосту
-    fn init(config_json: String) -> Vec<String> {
+    async fn init(config_json: String) -> Vec<String> {
         // 1. Парсим конфигурацию плагина
         let parsed_config: FrontConsolePluginConfig = serde_json::from_str(&config_json)
             .unwrap_or_else(|_| FrontConsolePluginConfig {
@@ -54,7 +54,7 @@ impl Guest for FrontConsolePluginImplementation {
         topics_to_subscribe
     }
 
-    fn handle_event(ev: Event) {
+    async fn handle_event(ev: Event) {
         // Логика обработки ивентов (остается прежней)
         if ev.topic == "agent:start" {
             // ...
