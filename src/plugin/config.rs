@@ -2,11 +2,11 @@ use serde::Deserialize;
 
 #[derive(Deserialize, Clone)]
 pub enum PluginAccess {
-    #[serde(rename = "console", untagged)]
+    #[serde(rename = "console")]
     Console(String),
-    #[serde(rename = "filesystem", untagged)]
+    #[serde(rename = "filesystem")]
     Filesystem(String, String, String), // path, dir_perms, file_perms ("ro", "rw")
-    #[serde(rename = "network", untagged)]
+    #[serde(rename = "network")]
     Network(Vec<(String, u16)>),
 }
 
@@ -17,8 +17,6 @@ pub struct PluginConfig {
     pub file: String,
     #[allow(unused)]
     pub name: String,
-    #[allow(unused)]
-    pub class: String,
     #[allow(unused)]
     pub access: Vec<PluginAccess>,
     #[allow(unused)]
