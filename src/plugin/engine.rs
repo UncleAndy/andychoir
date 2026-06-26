@@ -59,6 +59,7 @@ pub struct ChoirHostState {
 
 impl crate::ai::host::event_bus::Host for ChoirHostState {
     fn publish_event(&mut self, event: Event) -> () {
+        println!("[Хост] Новое входящее событие: {:?}.", event);
         if let Err(err) = self.event_sender.try_send(event) {
             println!(
                 "[Хост] Очередь входящих событий переполнена или закрыта: {}",

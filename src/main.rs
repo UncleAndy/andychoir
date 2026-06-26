@@ -71,10 +71,10 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     println!("Завершение работы...");
 
     drop(tx);
-    event_bus.shutdown().await;
     for background_plugin in background_plugins {
         background_plugin.shutdown().await;
     }
+    event_bus.shutdown().await;
 
     println!("[Хост] Выход из процесса.");
     std::process::exit(0);

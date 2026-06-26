@@ -94,6 +94,7 @@ impl Guest for FrontConsolePluginImplementation {
                     break;
                 }
                 Ok(_) => {
+                    println!("[WASM] Новое сообщение из stdin.");
                     let trimmed = buffer.trim();
                     if !trimmed.is_empty() {
                         let host_event = Event {
