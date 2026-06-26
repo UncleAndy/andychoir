@@ -69,7 +69,10 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     );
 
     andychoir::println!("Хост запущен. Нажмите Ctrl+C для выхода.");
-    tokio::signal::ctrl_c().await?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result?,
+        () = andychoir::host::console::wait_for_interrupt() => (),
+    }
     andychoir::println!("Завершение работы...");
 
     drop(tx);
