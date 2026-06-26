@@ -25,7 +25,7 @@ use ai::host::types::Event;
 use exports::ai::host::plugin_lifecycle::Guest;
 
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc, watch};
 
 pub struct PluginInstance {
     pub config: PluginConfig,
@@ -42,10 +42,12 @@ pub struct ChoirHostState {
 
 impl ai::host::event_bus::Host for ChoirHostState {
     fn publish_event(&mut self, event: Event) -> () {
-        let sender = self.event_sender.clone();
-        tokio::spawn(async move {
-            let _ = sender.send(event).await;
-        });
+        if let Err(err) = self.event_sender.try_send(event) {
+            println!(
+                "[Хост] Очередь входящих событий переполнена или закрыта: {}",
+                err
+            );
+        }
     }
 }
 
@@ -72,6 +74,13 @@ pub struct AppArgs {
 struct SessionSlot {
     store: Arc<Mutex<Store<ChoirHostState>>>,
     last_used: std::time::Instant,
+}
+
+struct EventJob {
+    plugin_name: String,
+    store_key: (String, String),
+    lifecycle: Guest,
+    event: Event,
 }
 
 #[tokio::main]
@@ -104,7 +113,7 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     println!("Модули рантайма Wasmtime успешно инициализированы.");
 
     let plugins = Arc::new(RwLock::new(HashMap::<String, PluginInstance>::new()));
-    let (tx, mut rx) = mpsc::channel::<Event>(100);
+    let (tx, mut rx) = mpsc::channel::<Event>(config.event_queue_size);
 
     for plugin in config.plugins.iter() {
         let (subscriptions, lifecycle, store) =
@@ -127,6 +136,54 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     // Хранилище пула Store. Ключ: (<плагин>, <сессия>)
     let stores = Arc::new(dashmap::DashMap::<(String, String), SessionSlot>::new());
 
+    let worker_count = config.thread_pool_size.max(1);
+    let (worker_tx, worker_rx) = mpsc::channel::<EventJob>(config.event_queue_size);
+    let worker_rx = Arc::new(Mutex::new(worker_rx));
+    let mut worker_handles = Vec::with_capacity(worker_count);
+    for worker_id in 0..worker_count {
+        let worker_rx = worker_rx.clone();
+        let stores_worker = stores.clone();
+        let max_fuel_for_call = config.max_fuel_for_call;
+        worker_handles.push(tokio::spawn(async move {
+            loop {
+                let job = {
+                    let mut rx = worker_rx.lock().await;
+                    rx.recv().await
+                };
+
+                let Some(job) = job else {
+                    break;
+                };
+
+                if let Some(mut slot) = stores_worker.get_mut(&job.store_key) {
+                    slot.last_used = std::time::Instant::now();
+                    let store_arc = slot.store.clone();
+                    drop(slot);
+
+                    let mut store_guard = store_arc.lock().await;
+                    let _ = store_guard.set_fuel(max_fuel_for_call);
+
+                    let handle_event_res = store_guard
+                        .run_concurrent(async |accessor| {
+                            job.lifecycle.call_handle_event(accessor, job.event).await
+                        })
+                        .await;
+
+                    if let Err(e) = handle_event_res {
+                        println!(
+                            "[Хост] Ошибка при выполнении плагина {}: {:?}",
+                            job.plugin_name, e
+                        );
+                    }
+                } else {
+                    println!("[Хост] Сессия не найдена для ключа {:?}", job.store_key);
+                }
+            }
+
+            println!("[Хост] Исполнитель событий {} завершён.", worker_id);
+        }));
+    }
+
     // Внутренний процесс очистки неактивных сессий
     let stores_cleanup = stores.clone();
     tokio::spawn(async move {
@@ -142,8 +199,26 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
 
     let dispatcher_plugins_loop = dispatcher_plugins.clone();
     let stores_loop = stores.clone();
-    tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
+    let engine_loop = engine.clone();
+    let worker_tx_loop = worker_tx.clone();
+    let tx_loop = tx.clone();
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let dispatcher_handle = tokio::spawn(async move {
+        loop {
+            let event = tokio::select! {
+                event = rx.recv() => event,
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                    continue;
+                }
+            };
+
+            let Some(event) = event else {
+                break;
+            };
+
             let targets = event.target.split_whitespace().collect::<Vec<_>>();
             for target_pattern in targets {
                 let matched_plugins: Vec<String> = if target_pattern.contains('*') {
@@ -178,8 +253,8 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
                                 };
 
                                 if let Some(config) = plugin_config_opt {
-                                    let tx_clone = tx.clone();
-                                    let engine_ref = engine.clone(); // Engine в Wasmtime реализует Arc внутри
+                                    let tx_clone = tx_loop.clone();
+                                    let engine_ref = engine_loop.clone(); // Engine в Wasmtime реализует Arc внутри
 
                                     match new_plugin_store(&engine_ref, &config, tx_clone).await {
                                         Ok(store) => {
@@ -217,47 +292,46 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
                     };
 
                     if let Some(lifecycle) = plugin_res {
-                        let store_key = current_store_key.clone();
-                        let ev = event.clone();
-                        let plugin_name_log = plugin_name.clone();
-                        let stores_loop = stores.clone();
-                        tokio::task::spawn(async move {
-                            if let Some(mut slot) = stores_loop.get_mut(&store_key) {
-                                slot.last_used = std::time::Instant::now();
-                                let store_arc = slot.store.clone();
-                                drop(slot); // Снимаем замок с карты как можно быстрее!
+                        let job = EventJob {
+                            plugin_name: plugin_name.clone(),
+                            store_key: current_store_key.clone(),
+                            lifecycle,
+                            event: event.clone(),
+                        };
 
-                                let mut store_guard = store_arc.lock().await;
-
-                                // --- ВАЖНО: Заправляем Store перед КАЖДЫМ вызовом ---
-                                // Теперь каждый отдельный event может потратить до 1 млн инструкций.
-                                let _ = store_guard.set_fuel(config.max_fuel_for_call);
-
-                                let handle_event_res = store_guard
-                                    .run_concurrent(async |accessor| {
-                                        lifecycle.call_handle_event(accessor, ev).await
-                                    })
-                                    .await;
-
-                                if let Err(e) = handle_event_res {
-                                    println!(
-                                        "[Хост] Ошибка при выполнении плагина {}: {:?}",
-                                        plugin_name_log, e
-                                    );
-                                }
-                            } else {
-                                println!("[Хост] Сессия не найдена для ключа {:?}", store_key);
-                            };
-                        });
+                        if let Err(err) = worker_tx_loop.try_send(job) {
+                            println!(
+                                "[Хост] Очередь пула исполнителей переполнена или закрыта, событие для плагина {} отклонено: {}",
+                                plugin_name, err
+                            );
+                        }
+                    } else {
+                        println!("[Хост] Не найден lifecycle плагина {}", plugin_name);
                     }
                 }
             }
         }
+
+        println!("[Хост] Диспетчер событий завершён.");
     });
 
     println!("Хост запущен. Нажмите Ctrl+C для выхода.");
     tokio::signal::ctrl_c().await?;
     println!("Завершение работы...");
+
+    let _ = shutdown_tx.send(true);
+    drop(tx);
+    drop(worker_tx);
+
+    if let Err(err) = dispatcher_handle.await {
+        println!("[Хост] Диспетчер событий завершился с ошибкой: {:?}", err);
+    }
+
+    for worker_handle in worker_handles {
+        if let Err(err) = worker_handle.await {
+            println!("[Хост] Исполнитель событий завершился с ошибкой: {:?}", err);
+        }
+    }
 
     Ok(())
 }

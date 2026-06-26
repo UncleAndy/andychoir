@@ -23,6 +23,12 @@ pub struct Config {
     #[allow(dead_code)]
     #[serde(default = "default_max_plugin_memory")]
     pub(crate) max_plugin_memory: u64,
+    #[allow(dead_code)]
+    #[serde(default = "default_thread_pool_size")]
+    pub(crate) thread_pool_size: usize,
+    #[allow(dead_code)]
+    #[serde(default = "default_event_queue_size")]
+    pub(crate) event_queue_size: usize,
 }
 
 fn default_max_fuel_for_call() -> u64 {
@@ -39,6 +45,14 @@ fn default_session_timeout() -> u64 {
 
 fn default_max_plugin_memory() -> u64 {
     512 * 1024 * 1024
+}
+
+fn default_thread_pool_size() -> usize {
+    8
+}
+
+fn default_event_queue_size() -> usize {
+    1000
 }
 
 impl Config {
