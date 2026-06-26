@@ -333,7 +333,7 @@ async fn store_for_event(
         return Some((slot.store.clone(), slot.lifecycle.clone()));
     }
 
-    match new_plugin_store(engine, tx.clone()).await {
+    match new_plugin_store(engine, &config, tx.clone()).await {
         Ok(mut store) => {
             let component = match Component::from_file(engine, config.file.clone()) {
                 Ok(component) => component,

@@ -12,7 +12,7 @@ use crate::ai::host::types::Event;
 use crate::config::Config;
 use crate::exports::ai::host::plugin_lifecycle::Guest;
 use crate::messages::bus::PluginRegistry;
-use crate::plugin::config::{PluginConfig};
+use crate::plugin::config::{PluginAccess, PluginConfig};
 
 pub struct PluginInstance {
     pub config: PluginConfig,
@@ -51,6 +51,7 @@ pub struct ChoirHostState {
     wasi: WasiCtx,
     table: ResourceTable,
     event_sender: mpsc::Sender<Event>,
+    pub current_plugin_permissions: Option<Vec<PluginAccess>>,
 }
 
 impl crate::ai::host::event_bus::Host for ChoirHostState {
@@ -73,9 +74,32 @@ impl crate::ai::host::console::Host for ChoirHostState {
 
 impl crate::ai::host::console::HostWithStore<ChoirHostState> for ChoirHostState {
     async fn read_line(
-        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
         prompt: String,
     ) -> Option<String> {
+        // Проверяем права плагина на работу с консолью.
+        let has_access = accessor.with(|mut access| {
+            // Внутри этого замыкания у нас есть эксклюзивный, временный доступ к состоянию
+            let host_state = access.get();
+
+            // Проверяем наличие PluginAccess::Console в его конфиге
+            if let Some(ref perms) = host_state.current_plugin_permissions {
+                return perms.iter().any(|p| {
+                    if let PluginAccess::Console(allowed_prompt) = p {
+                        // Проверяем, совпадает ли текст запроса из плагина с разрешенным в конфиге
+                        allowed_prompt == &prompt
+                    } else {
+                        false
+                    }
+                });
+            }
+            false
+        });
+        if !has_access {
+            println!("[Хост] Плагин не имеет доступа к чтению консоли с таким промптом.");
+            return None;
+        }
+
         crate::host::console::read_prompted_line(prompt).await
     }
 }
@@ -203,7 +227,7 @@ pub async fn load_and_init_plugin(
     plugin_config: &PluginConfig,
     event_sender: mpsc::Sender<Event>,
 ) -> anyhow::Result<(Vec<String>, Guest, Store<ChoirHostState>)> {
-    let mut store = new_plugin_store(engine, event_sender).await?;
+    let mut store = new_plugin_store(engine, plugin_config, event_sender).await?;
 
     println!("[Хост] Загрузка файла: {:?}", plugin_config.file.clone());
     let component = Component::from_file(engine, plugin_config.file.clone())?;
@@ -234,6 +258,7 @@ pub async fn load_and_init_plugin(
 
 pub async fn new_plugin_store(
     engine: &Engine,
+    config: &PluginConfig,
     event_sender: mpsc::Sender<Event>,
 ) -> anyhow::Result<Store<ChoirHostState>> {
     let mut wasi_builder = WasiCtxBuilder::new();
@@ -242,6 +267,7 @@ pub async fn new_plugin_store(
         wasi: wasi_builder.build(),
         table: Default::default(),
         event_sender,
+        current_plugin_permissions: Some(config.access.clone()),
     };
     let store = Store::new(engine, host_state);
 

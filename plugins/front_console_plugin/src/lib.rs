@@ -22,7 +22,7 @@ const PLUGIN_NAME: &str = "front:console";
 static CONFIG: Mutex<Option<FrontConsolePluginConfig>> = Mutex::new(None);
 static SESSIONS: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
-const PROMPT: &str = "> ";
+const PROMPT: &str = "prompt>";
 
 macro_rules! println {
     ($($arg:tt)*) => {
