@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use tokio::sync::{Mutex, RwLock, mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, watch};
+use tokio::task::{JoinHandle, JoinSet};
 use wasmtime::component::{Component, Linker};
 use wasmtime::Engine;
 
@@ -63,48 +63,53 @@ pub fn start_event_bus(
     config
         .metrics
         .set_worker_queue_fill(0, config.event_queue_size);
-    let worker_rx = Arc::new(Mutex::new(worker_rx));
-    let mut worker_handles = Vec::with_capacity(worker_count);
-    for worker_id in 0..worker_count {
-        let worker_rx = worker_rx.clone();
-        let metrics_worker = config.metrics.clone();
-        let worker_queue_size = config.event_queue_size;
-        let max_fuel_for_call = config.max_fuel_for_call;
-        worker_handles.push(tokio::spawn(async move {
-            loop {
-                let job = {
-                    let mut rx = worker_rx.lock().await;
-                    rx.recv().await
-                };
+    let metrics_worker = config.metrics.clone();
+    let worker_queue_size = config.event_queue_size;
+    let max_fuel_for_call = config.max_fuel_for_call;
+    let worker_limiter = Arc::new(Semaphore::new(worker_count));
+    let mut worker_handles = Vec::with_capacity(1);
+    worker_handles.push(tokio::spawn(async move {
+        let mut worker_rx = worker_rx;
+        let mut worker_tasks = JoinSet::new();
+        let mut worker_id = 0usize;
 
-                let Some(job) = job else {
-                    break;
-                };
-                metrics_worker
-                    .set_worker_queue_fill(worker_rx.lock().await.len(), worker_queue_size);
+        loop {
+            tokio::select! {
+                Some(join_res) = worker_tasks.join_next(), if !worker_tasks.is_empty() => {
+                    if let Err(err) = join_res {
+                        println!("[Хост] Исполнитель событий завершился с ошибкой: {:?}", err);
+                    }
+                }
+                job = worker_rx.recv() => {
+                    let Some(job) = job else {
+                        break;
+                    };
+                    metrics_worker.set_worker_queue_fill(worker_rx.len(), worker_queue_size);
 
-                let mut store_guard = job.store.lock().await;
-                let _ = store_guard.set_fuel(max_fuel_for_call);
+                    let permit = match worker_limiter.clone().acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => break,
+                    };
+                    let metrics_worker = metrics_worker.clone();
+                    let current_worker_id = worker_id;
+                    worker_id = worker_id.wrapping_add(1);
 
-                let started_at = std::time::Instant::now();
-                let handle_event_res = store_guard
-                    .run_concurrent(async |accessor| {
-                        job.lifecycle.call_handle_event(accessor, job.event).await
-                    })
-                    .await;
-                metrics_worker.observe_processing_time(&job.plugin_name, started_at.elapsed());
-
-                if let Err(e) = handle_event_res {
-                    println!(
-                        "[Хост] Ошибка при выполнении плагина {}: {:?}",
-                        job.plugin_name, e
-                    );
+                    worker_tasks.spawn(async move {
+                        let _permit = permit;
+                        process_event_job(current_worker_id, job, metrics_worker, max_fuel_for_call).await;
+                    });
                 }
             }
+        }
 
-            println!("[Хост] Исполнитель событий {} завершён.", worker_id);
-        }));
-    }
+        while let Some(join_res) = worker_tasks.join_next().await {
+            if let Err(err) = join_res {
+                println!("[Хост] Исполнитель событий завершился с ошибкой: {:?}", err);
+            }
+        }
+
+        println!("[Хост] Исполнитель событий завершён.");
+    }));
 
     let stores_cleanup = stores.clone();
     let metrics_cleanup = config.metrics.clone();
@@ -181,6 +186,33 @@ impl EventBusHandle {
     }
 }
 
+async fn process_event_job(
+    worker_id: usize,
+    job: EventJob,
+    metrics: Arc<Metrics>,
+    max_fuel_for_call: u64,
+) {
+    println!("[Хост] Worker {} получил Job для отправки в плагин ивента: {:?}", worker_id, job.event);
+
+    let mut store_guard = job.store.lock().await;
+    let _ = store_guard.set_fuel(max_fuel_for_call);
+
+    let started_at = std::time::Instant::now();
+    let handle_event_res = store_guard
+        .run_concurrent(async |accessor| {
+            job.lifecycle.call_handle_event(accessor, job.event).await
+        })
+        .await;
+    metrics.observe_processing_time(&job.plugin_name, started_at.elapsed());
+
+    if let Err(e) = handle_event_res {
+        println!(
+            "[Хост] Ошибка при выполнении плагина {}: {:?}",
+            job.plugin_name, e
+        );
+    }
+}
+
 async fn dispatch_event(
     event: Event,
     plugins: &PluginRegistry,
@@ -194,8 +226,10 @@ async fn dispatch_event(
     let targets = event.target.split_whitespace().collect::<Vec<_>>();
     for target_pattern in targets {
         let matched_plugins = match_plugins(plugins, target_pattern).await;
+        println!("[Хост] Найдены плагины для получения сообщения: {:?}", matched_plugins);
 
         for plugin_name in matched_plugins {
+            println!("[Хост] Исполнение плагина {} ({:?})", plugin_name, event);
             let Some((store, lifecycle)) = store_for_event(
                 plugins,
                 stores,
@@ -207,8 +241,12 @@ async fn dispatch_event(
                 metrics,
             )
             .await else {
+                let plugins_lock = plugins.read().await;
+                println!("[Хост] Не удалось получить хранилище и жизненный цикл плагина {} ({:?})", plugin_name, plugins_lock.keys());
                 continue;
             };
+
+            println!("[Хост] Подготовка Job для {}", plugin_name);
 
             let job = EventJob {
                 plugin_name: plugin_name.clone(),
@@ -216,6 +254,8 @@ async fn dispatch_event(
                 lifecycle,
                 event: event.clone(),
             };
+
+            println!("[Хост] Отправка Job для {}", plugin_name);
 
             if let Err(err) = worker_tx.try_send(job) {
                 metrics.inc_rejected_event(&plugin_name);
@@ -233,7 +273,10 @@ async fn dispatch_event(
 }
 
 async fn match_plugins(plugins: &PluginRegistry, target_pattern: &str) -> Vec<String> {
-    if target_pattern.contains('*') {
+    if target_pattern == "*" {
+        let lock = plugins.read().await;
+        lock.keys().cloned().collect()
+    } else if target_pattern.contains('*') {
         let pattern = target_pattern.replace("*", "");
         let lock = plugins.read().await;
         lock.keys()

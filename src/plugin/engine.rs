@@ -119,6 +119,18 @@ pub async fn load_plugins(
             load_and_init_plugin(engine, linker, plugin, tx.clone()).await?;
         let store = Arc::new(Mutex::new(store));
 
+        let background_handle = if plugin.allow_background {
+            let (_, background_lifecycle, background_store) =
+                load_and_init_plugin(engine, linker, plugin, tx.clone()).await?;
+            Some(run_plugin_in_background(
+                plugin.name.clone(),
+                background_lifecycle,
+                Arc::new(Mutex::new(background_store)),
+            ))
+        } else {
+            None
+        };
+
         let plugin_instance = PluginInstance {
             config: plugin.clone(),
             topics: subscriptions,
@@ -126,12 +138,8 @@ pub async fn load_plugins(
             store: store.clone(),
         };
 
-        if plugin.allow_background {
-            background_handles.push(run_plugin_in_background(
-                plugin.name.clone(),
-                lifecycle,
-                store,
-            ));
+        if let Some(background_handle) = background_handle {
+            background_handles.push(background_handle);
         }
 
         let mut lock = plugins.write().await;

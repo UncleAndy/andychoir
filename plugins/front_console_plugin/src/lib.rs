@@ -63,13 +63,26 @@ impl Guest for FrontConsolePluginImplementation {
         // Данный метод выполняется асинхронно и независимо от того,
         // ждет ли сейчас функция read_line() ввода в консоли.
 
-        if ev.topic == "agent:start" {
-            println!("[WASM] Получен агент старт от хоста: {}", ev.payload);
+        println!("[WASM] Получен ивент от хоста: {:?}", ev);
 
-            // TODO - здесь будет обработка входящих событий
-            println!("{:?}", ev);
+        // TODO - здесь будет обработка входящих событий
+
+        println!("{}: {}", ev.topic, ev.payload);
+
+        // Имитация пинга
+        if ev.topic == "request" {
+            let host_event = Event {
+                request_id: ev.request_id,
+                session_id: ev.session_id,
+                source: PLUGIN_NAME.to_string(),
+                target: "*".to_string(),
+                topic: "response".to_string(),
+                payload: ev.payload,
+            };
+            ai::host::event_bus::publish_event(&host_event);
         }
     }
+
     async fn run() {
         println!("[WASM] Запуск фонового цикла плагина {}", PLUGIN_NAME);
         // Чтение пользовательского ввода из консоли.

@@ -26,7 +26,8 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     let engine = create_engine(&config)?;
     let linker = create_linker(&engine)?;
     let metrics = Metrics::new();
-    let metrics_console = metrics.clone();
+    let _metrics_console = metrics.clone();
+    /*
     let _metrics_console_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
@@ -34,6 +35,7 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
             println!("{}", metrics_console.render_console());
         }
     });
+     */
     let _metrics_exporter_handle = start_metrics_exporter(
         metrics.clone(),
         MetricsConfig {
