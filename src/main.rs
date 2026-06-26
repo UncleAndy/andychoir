@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use andychoir::ai::host::types::Event;
 use andychoir::config::Config as AppConfig;
 use andychoir::messages::bus::{EventBusConfig, start_event_bus};
+use andychoir::metrics::{Metrics, MetricsConfig, start_metrics_exporter};
 use andychoir::plugin::engine::{create_engine, create_linker, load_plugins};
 use clap::Parser;
 use tokio::sync::mpsc;
@@ -24,6 +25,25 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     let config = AppConfig::new_from_file(args.config).await?;
     let engine = create_engine(&config)?;
     let linker = create_linker(&engine)?;
+    let metrics = Metrics::new();
+    let metrics_console = metrics.clone();
+    let _metrics_console_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            println!("{}", metrics_console.render_console());
+        }
+    });
+    let _metrics_exporter_handle = start_metrics_exporter(
+        metrics.clone(),
+        MetricsConfig {
+            enabled: config.metrics.enabled,
+            host: config.metrics.host.clone(),
+            port: config.metrics.port,
+            update_interval_secs: config.metrics.update_interval_secs,
+            location: config.metrics.location.clone(),
+        },
+    );
 
     println!("Модули рантайма Wasmtime успешно инициализированы.");
 
@@ -41,6 +61,7 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
             max_fuel_for_call: config.max_fuel_for_call,
             session_timeout: config.session_timeout,
             session_check_period: config.session_check_period,
+            metrics,
         },
     );
 

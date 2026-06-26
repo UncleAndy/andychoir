@@ -33,9 +33,7 @@ impl Guest for FrontConsolePluginImplementation {
                     "info".to_string(),
                     "error".to_string(),
                 ],
-                target: vec![
-                    "choir".to_string(),
-                ],
+                target: vec!["choir".to_string()],
             });
 
         // 2. Сохраняем список подписок для хоста, чтобы вернуть его в конце
@@ -48,7 +46,10 @@ impl Guest for FrontConsolePluginImplementation {
         let mut sessions_lock = SESSIONS.lock().unwrap();
         *sessions_lock = Some(HashMap::new());
 
-        println!("[WASM] Плагин инициализирован. Запрошено подписок: {}", topics_to_subscribe.len());
+        println!(
+            "[WASM] Плагин инициализирован. Запрошено подписок: {}",
+            topics_to_subscribe.len()
+        );
 
         // Возвращаем вектор хосту. wit-bindgen сам переведет его в list<string> на уровне Wasm
         topics_to_subscribe

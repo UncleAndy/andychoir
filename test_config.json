@@ -10,5 +10,12 @@
         "targets": ["system:info"]
       }
     }
-  ]
+  ],
+  "metrics": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 9090,
+    "update_interval_secs": 15,
+    "location": "/metrics"
+  }
 }

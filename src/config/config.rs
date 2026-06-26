@@ -29,6 +29,23 @@ pub struct Config {
     #[allow(dead_code)]
     #[serde(default = "default_event_queue_size")]
     pub event_queue_size: usize,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub metrics: MetricsExportConfig,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct MetricsExportConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_metrics_host")]
+    pub host: String,
+    #[serde(default = "default_metrics_port")]
+    pub port: u16,
+    #[serde(default = "default_metrics_update_interval_secs")]
+    pub update_interval_secs: u64,
+    #[serde(default = "default_metrics_location")]
+    pub location: String,
 }
 
 fn default_max_fuel_for_call() -> u64 {
@@ -53,6 +70,34 @@ fn default_thread_pool_size() -> usize {
 
 fn default_event_queue_size() -> usize {
     1000
+}
+
+impl Default for MetricsExportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: default_metrics_host(),
+            port: default_metrics_port(),
+            update_interval_secs: default_metrics_update_interval_secs(),
+            location: default_metrics_location(),
+        }
+    }
+}
+
+fn default_metrics_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_metrics_port() -> u16 {
+    9090
+}
+
+fn default_metrics_update_interval_secs() -> u64 {
+    15
+}
+
+fn default_metrics_location() -> String {
+    "/metrics".to_string()
 }
 
 impl Config {
