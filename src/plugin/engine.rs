@@ -68,6 +68,24 @@ impl crate::ai::host::event_bus::Host for ChoirHostState {
 
 impl crate::ai::host::console::Host for ChoirHostState {
     fn print_line(&mut self, line: String) -> () {
+        // Проверяем права плагина на работу с консолью.
+        let has_access = if let Some(ref perms) = self.current_plugin_permissions {
+            perms.iter().any(|p| {
+                if let PluginAccess::ConsolePrint(max_size) = p {
+                    // Проверяем, совпадает ли текст запроса из плагина с разрешенным в конфиге
+                    line.len() <= *max_size as usize
+                } else {
+                    false
+                }
+            })
+        } else {
+            false
+        };
+        if !has_access {
+            println!("[Хост] Плагин не имеет доступа к чтению консоли с таким промптом.");
+            return ();
+        }
+
         crate::host::console::print_line(format_args!("{}", line));
     }
 }
@@ -85,7 +103,7 @@ impl crate::ai::host::console::HostWithStore<ChoirHostState> for ChoirHostState 
             // Проверяем наличие PluginAccess::Console в его конфиге
             if let Some(ref perms) = host_state.current_plugin_permissions {
                 return perms.iter().any(|p| {
-                    if let PluginAccess::Console(allowed_prompt) = p {
+                    if let PluginAccess::ConsoleInput(allowed_prompt) = p {
                         // Проверяем, совпадает ли текст запроса из плагина с разрешенным в конфиге
                         allowed_prompt == &prompt
                     } else {

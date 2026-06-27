@@ -2,8 +2,10 @@ use serde::Deserialize;
 
 #[derive(Deserialize, Clone)]
 pub enum PluginAccess {
-    #[serde(rename = "console")]
-    Console(String),
+    #[serde(rename = "console_input")]
+    ConsoleInput(String), // Prompt text allowed
+    #[serde(rename = "console_print")]
+    ConsolePrint(u16), // One string max line size allowed
     #[serde(rename = "filesystem")]
     Filesystem(String, String, String), // path, dir_perms, file_perms ("ro", "rw")
     #[serde(rename = "network")]

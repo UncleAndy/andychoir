@@ -45,7 +45,10 @@ pub async fn read_prompted_line(prompt: String) -> Option<String> {
             INTERRUPT.notify_waiters();
             future::pending().await
         }
-        Ok(Err(ReadlineError::Eof)) => None,
+        Ok(Err(ReadlineError::Eof)) => {
+            INTERRUPT.notify_waiters();
+            future::pending().await
+        }
         Ok(Err(err)) => {
             eprintln!("[Хост] Ошибка чтения из stdin: {:?}", err);
             None
