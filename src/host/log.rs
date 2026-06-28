@@ -1,6 +1,7 @@
-use std::fmt;
-use flexi_logger::{FileSpec, Logger, Criterion, Naming, Cleanup, LoggerHandle};
+use flexi_logger::{FileSpec, Logger, Criterion, Naming, Cleanup, LoggerHandle, DeferredNow};
 use std::path::PathBuf;
+use log::Record;
+
 use crate::config::config::LoggerConfig;
 
 pub fn init_log(
@@ -13,7 +14,7 @@ pub fn init_log(
 
     // 2. Инициализируем и настраиваем логгер
     Logger::try_with_str(config.log_level.clone())?
-        // Указываем динамические настройки файла
+        .format(utc_ms_format)
         .log_to_file(file_spec)
         // Настраиваем ротацию через переданные переменные
         .rotate(
@@ -26,15 +27,45 @@ pub fn init_log(
         .start()
 }
 
-pub fn debug(args: fmt::Arguments<'_>) {
-    log::debug!("{}", args);
+#[track_caller]
+fn utc_ms_format(
+    w: &mut dyn std::io::Write,
+    now: &mut DeferredNow,
+    record: &Record,
+) -> Result<(), std::io::Error> {
+    // Получаем время в UTC и форматируем: %.3f оставляет ровно 3 знака после запятой
+    let utc_time = now.now().with_timezone(&chrono::Utc);
+
+    let file = record.file().unwrap_or("unknown");
+    let line = record.line().unwrap_or(0);
+
+    write!(
+        w,
+        "[{}] {} [{}:{}] - {}",
+        utc_time.format("%Y-%m-%d %H:%M:%S%.3f UTC"),
+        record.level(),
+        file,
+        line,
+        record.args()
+    )
 }
-pub fn info(args: fmt::Arguments<'_>) {
-    log::info!("{}", args);
+
+#[macro_export]
+macro_rules! debug {
+    ($($arg:tt)+) => { ::log::debug!($($arg)+); };
 }
-pub fn warn(args: fmt::Arguments<'_>) {
-    log::warn!("{}", args);
+
+#[macro_export]
+macro_rules! info {
+    ($($arg:tt)+) => { ::log::info!($($arg)+) };
 }
-pub fn error(args: fmt::Arguments<'_>) {
-    log::error!("{}", args);
+
+#[macro_export]
+macro_rules! warn {
+    ($($arg:tt)+) => { ::log::warn!($($arg)+) };
+}
+
+#[macro_export]
+macro_rules! error {
+    ($($arg:tt)+) => { ::log::error!($($arg)+) };
 }

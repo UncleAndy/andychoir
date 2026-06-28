@@ -7,7 +7,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use wasmtime::Engine;
 use wasmtime::component::{Component, Linker};
 
-use crate::HostPlugin;
+use crate::{error, info, HostPlugin};
 use crate::ai::host::types::Event;
 use crate::exports::ai::host::plugin_lifecycle::Guest;
 use crate::metrics::Metrics;

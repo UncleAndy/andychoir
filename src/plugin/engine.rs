@@ -7,7 +7,7 @@ use wasmtime::component::{Component, HasData, Linker, ResourceTable};
 use wasmtime::{Config as WasmtimeConfig, Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
-use crate::HostPlugin;
+use crate::{debug, error, info, warn, HostPlugin};
 use crate::ai::host::types::Event;
 use crate::config::Config;
 use crate::exports::ai::host::plugin_lifecycle::Guest;
@@ -92,19 +92,19 @@ impl crate::ai::host::console::Host for ChoirHostState {
 
 impl crate::ai::host::log::Host for ChoirHostState {
     fn debug(&mut self, line: String) -> () {
-        crate::host::log::debug(format_args!("{}", line))
+        debug!("{}", line);
     }
 
     fn info(&mut self, line: String) -> () {
-        crate::host::log::info(format_args!("{}", line))
+        info!("{}", line);
     }
 
     fn warn(&mut self, line: String) -> () {
-        crate::host::log::warn(format_args!("{}", line))
+        warn!("{}", line);
     }
 
     fn error(&mut self, line: String) -> () {
-        crate::host::log::error(format_args!("{}", line))
+        error!("{}", line);
     }
 }
 
