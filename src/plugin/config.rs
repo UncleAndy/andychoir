@@ -5,7 +5,7 @@ pub enum PluginAccess {
     #[serde(rename = "console_input")]
     ConsoleInput(String), // Prompt text allowed
     #[serde(rename = "console_print")]
-    ConsolePrint(u16), // One string max line size allowed
+    ConsolePrint(u32), // One string max line size allowed
     #[serde(rename = "filesystem")]
     Filesystem(String, String, String), // path, dir_perms, file_perms ("ro", "rw")
     #[serde(rename = "network")]
@@ -25,5 +25,5 @@ pub struct PluginConfig {
     #[serde(default)]
     pub allow_background: bool,
     #[allow(unused)]
-    pub config: String, // Параметры инициализации плагина (внутренние параметры плагина в нужном ему формате
+    pub config: serde_json::Value, // Параметры инициализации плагина (внутренние параметры плагина в нужном ему формате
 }

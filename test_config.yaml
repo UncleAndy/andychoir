@@ -1,0 +1,20 @@
+plugins:
+  - file: "./target/wasm32-wasip2/debug/front_console_plugin.wasm"
+    name: "front:console"
+    access:
+      - !console_input "prompt>"
+      - !console_print 102400
+    config:
+      subscriptions:
+        - "system:info"
+        - "system:error"
+      targets:
+        - "system:info"
+    allow_background: true
+
+metrics:
+  enabled: false
+  host: "127.0.0.1"
+  port: 9090
+  update_interval_secs: 15
+  location: "/metrics"
