@@ -82,7 +82,8 @@ impl Guest for FrontConsolePluginImplementation {
         }
 
         info!(
-            "[WASM] Плагин инициализирован. Запрошено подписок: {}",
+            "[WASM] Плагин {} инициализирован. Запрошено подписок: {}",
+            PLUGIN_NAME,
             topics_to_subscribe.len()
         );
 
