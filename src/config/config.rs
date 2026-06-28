@@ -102,11 +102,19 @@ fn default_metrics_location() -> String {
 
 impl Config {
     pub async fn new_from_file(path: PathBuf) -> Result<Config, Box<dyn Error>> {
-        // 1. Асинхронно читаем весь файл в буфер байт (Vec<u8>)
-        let content = tokio::fs::read(path).await?;
+        // Асинхронно читаем весь файл в буфер байт (Vec<u8>)
+        let content = tokio::fs::read(path.clone()).await?;
+
+        // Определяем расширение файла ("json", "toml", "yaml"/"yml")
+        let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("json");
 
         // 2. Десериализуем из среза байт (это быстрая операция в памяти)
-        let config: Config = serde_json::from_slice(&content)?;
+        let config: Config = match extension {
+            "json" => { serde_json::from_slice(&content)? }
+            "toml" => { toml::from_slice(&content)? }
+            "yaml" | "yml" => { serde_yaml::from_slice(&content)? }
+            _ => return Err("Unsupported config file format".into())
+        };
 
         Ok(config)
     }

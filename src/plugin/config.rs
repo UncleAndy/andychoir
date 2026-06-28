@@ -25,5 +25,5 @@ pub struct PluginConfig {
     #[serde(default)]
     pub allow_background: bool,
     #[allow(unused)]
-    pub config: serde_json::Value, // Параметры инициализации плагина
+    pub config: String, // Параметры инициализации плагина (внутренние параметры плагина в нужном ему формате
 }
