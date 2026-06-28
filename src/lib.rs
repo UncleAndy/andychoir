@@ -5,3 +5,4 @@ pub mod host;
 pub mod messages;
 pub mod metrics;
 pub mod plugin;
+pub mod agent;
