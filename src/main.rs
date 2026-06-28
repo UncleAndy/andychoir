@@ -5,7 +5,7 @@ use clap::Parser;
 use tokio::sync::mpsc;
 use andychoir::host;
 
-use andychoir::{debug, info};
+use andychoir::{info};
 use andychoir::ai::host::types::Event;
 use andychoir::config::Config as AppConfig;
 use andychoir::messages::bus::{EventBusConfig, start_event_bus};
@@ -42,7 +42,7 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
-            debug!("{}", metrics_console.render_console());
+            info!("{}", metrics_console.render_console());
         }
     });
 
@@ -78,12 +78,12 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
         },
     );
 
-    info!("Хост запущен. Нажмите Ctrl+C или Ctrl-D для выхода.");
+    println!("Хост запущен. Нажмите Ctrl+C или Ctrl-D для выхода.");
     tokio::select! {
         result = tokio::signal::ctrl_c() => result?,
         () = host::console::wait_for_interrupt() => (),
     }
-    info!("Завершение работы...");
+    info!("[Хост] Завершение работы...");
 
     drop(tx);
     for background_plugin in background_plugins {

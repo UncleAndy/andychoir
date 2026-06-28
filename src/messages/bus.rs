@@ -192,7 +192,7 @@ async fn process_event_job(
     metrics: Arc<Metrics>,
     max_fuel_for_call: u64,
 ) {
-    debug!(
+    info!(
         "[Хост] Worker {} получил Job для отправки в плагин ивента: {:?}",
         worker_id, job.event
     );
@@ -227,13 +227,13 @@ async fn dispatch_event(
     let targets = event.target.split_whitespace().collect::<Vec<_>>();
     for target_pattern in targets {
         let matched_plugins = match_plugins(plugins, target_pattern).await;
-        debug!(
+        info!(
             "[Хост] Найдены плагины для получения сообщения: {:?}",
             matched_plugins
         );
 
         for plugin_name in matched_plugins {
-            debug!("[Хост] Исполнение плагина {} ({:?})", plugin_name, event);
+            info!("[Хост] Исполнение плагина {} ({:?})", plugin_name, event);
             let Some((store, lifecycle)) = store_for_event(
                 plugins,
                 stores,
@@ -255,7 +255,7 @@ async fn dispatch_event(
                 continue;
             };
 
-            debug!("[Хост] Подготовка Job для {}", plugin_name);
+            info!("[Хост] Подготовка Job для {}", plugin_name);
 
             let job = EventJob {
                 plugin_name: plugin_name.clone(),
@@ -264,7 +264,7 @@ async fn dispatch_event(
                 event: event.clone(),
             };
 
-            debug!("[Хост] Отправка Job для {}", plugin_name);
+            info!("[Хост] Отправка Job для {}", plugin_name);
 
             if let Err(err) = worker_tx.try_send(job) {
                 metrics.inc_rejected_event(&plugin_name);

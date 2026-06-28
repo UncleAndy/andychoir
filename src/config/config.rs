@@ -43,7 +43,7 @@ pub struct LoggerConfig {
 }
 
 fn default_log_level() -> String {
-    "debug".to_string()
+    "info".to_string()
 }
 fn default_log_directory() -> String {
     "./logs".to_string()

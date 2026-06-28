@@ -81,7 +81,7 @@ impl Guest for FrontConsolePluginImplementation {
             *sessions_lock = Some(HashMap::new());
         }
 
-        debug!(
+        info!(
             "[WASM] Плагин инициализирован. Запрошено подписок: {}",
             topics_to_subscribe.len()
         );
@@ -91,7 +91,7 @@ impl Guest for FrontConsolePluginImplementation {
     }
 
     async fn run() {
-        debug!("[WASM] Запуск фонового цикла плагина {}", PLUGIN_NAME);
+        info!("[WASM] Запуск фонового цикла плагина {}", PLUGIN_NAME);
         // Чтение пользовательского ввода из консоли.
         // Получаем нативный InputStream из подсистемы WASI, которую сгенерировал wit-bindgen.
         // В зависимости от вашей версии wit-bindgen путь может быть:
@@ -104,11 +104,11 @@ impl Guest for FrontConsolePluginImplementation {
             match ai::host::console::read_line(PROMPT.to_string()).await {
                 None => {
                     // EOF - поток ввода закрылся
-                    debug!("[WASM] Поток stdin завершен.");
+                    info!("[WASM] Поток stdin завершен.");
                     break;
                 }
                 Some(buffer) => {
-                    debug!("[WASM] Новое сообщение из stdin.");
+                    info!("[WASM] Новое сообщение из stdin.");
                     let trimmed = buffer.trim();
                     if !trimmed.is_empty() {
                         let host_event = Event {
