@@ -16,10 +16,32 @@ const PLUGIN_NAME: &str = "example:name";
 
 static CONFIG: Mutex<Option<InnerPluginConfig>> = Mutex::new(None);
 
+#[allow(unused_macros)]
 #[macro_export]
-macro_rules! debug {
+macro_rules! log_debug {
     ($($arg:tt)*) => {
-        crate::ai::host::console::print_line(&format!($($arg)*))
+        crate::ai::host::log::debug(&format!($($arg)*))
+    };
+}
+#[allow(unused_macros)]
+#[macro_export]
+macro_rules! log_error {
+    ($($arg:tt)*) => {
+        crate::ai::host::log::error(&format!($($arg)*))
+    };
+}
+#[allow(unused_macros)]
+#[macro_export]
+macro_rules! log_warn {
+    ($($arg:tt)*) => {
+        crate::ai::host::log::warn(&format!($($arg)*))
+    };
+}
+#[allow(unused_macros)]
+#[macro_export]
+macro_rules! log_info {
+    ($($arg:tt)*) => {
+        crate::ai::host::log::info(&format!($($arg)*))
     };
 }
 

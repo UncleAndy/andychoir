@@ -1,6 +1,7 @@
 use std::fmt;
 use std::future;
 use std::sync::Mutex;
+use std::{println as std_println};
 
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, ExternalPrinter};
@@ -27,7 +28,7 @@ pub fn print_line(args: fmt::Arguments<'_>) {
         }
     } else {
         // Здесь префикс std у println! является обязательным! Иначе возникнет бесконечная рекурсия.
-        std::println!("{}", args);
+        std_println!("{}", args);
     }
 }
 

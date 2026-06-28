@@ -1,15 +1,16 @@
-// TODO: Сделать инструменты: работа с консолью, работа с файлами, работа с сетью.
-
 use std::error::Error;
 use std::path::PathBuf;
 
+use clap::Parser;
+use tokio::sync::mpsc;
+use andychoir::host;
+
+use andychoir::{debug, info};
 use andychoir::ai::host::types::Event;
 use andychoir::config::Config as AppConfig;
 use andychoir::messages::bus::{EventBusConfig, start_event_bus};
 use andychoir::metrics::{Metrics, MetricsConfig, start_metrics_exporter};
 use andychoir::plugin::engine::{create_engine, create_linker, load_plugins};
-use clap::Parser;
-use tokio::sync::mpsc;
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -23,19 +24,28 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     let args = AppArgs::parse();
 
     let config = AppConfig::new_from_file(args.config).await?;
+
+    // Инициализация логов
+    let log_res = host::log::init_log(
+        &config.logger
+    );
+    if log_res.is_err() {
+        return Err(Box::from(log_res.err().unwrap()));
+    }
+
     let engine = create_engine(&config)?;
     let linker = create_linker(&engine)?;
     let metrics = Metrics::new();
-    let _metrics_console = metrics.clone();
-    /*
+    let metrics_console = metrics.clone();
+
     let _metrics_console_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
-            andychoir::host_println!("{}", metrics_console.render_console());
+            debug!("{}", metrics_console.render_console());
         }
     });
-     */
+
     let _metrics_exporter_handle = start_metrics_exporter(
         metrics.clone(),
         MetricsConfig {
@@ -47,7 +57,7 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
         },
     );
 
-    andychoir::println!("Модули рантайма Wasmtime успешно инициализированы.");
+    info!("Модули рантайма Wasmtime успешно инициализированы.");
 
     let (tx, rx) = mpsc::channel::<Event>(config.event_queue_size);
     let (plugins, background_plugins) = load_plugins(&config, &engine, &linker, tx.clone()).await?;
@@ -68,12 +78,12 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
         },
     );
 
-    andychoir::println!("Хост запущен. Нажмите Ctrl+C или Ctrl-D для выхода.");
+    info!("Хост запущен. Нажмите Ctrl+C или Ctrl-D для выхода.");
     tokio::select! {
         result = tokio::signal::ctrl_c() => result?,
-        () = andychoir::host::console::wait_for_interrupt() => (),
+        () = host::console::wait_for_interrupt() => (),
     }
-    andychoir::println!("Завершение работы...");
+    info!("Завершение работы...");
 
     drop(tx);
     for background_plugin in background_plugins {
@@ -81,6 +91,6 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     }
     event_bus.shutdown().await;
 
-    andychoir::println!("[Хост] Выход из процесса.");
+    info!("[Хост] Выход из процесса.");
     std::process::exit(0);
 }

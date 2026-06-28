@@ -26,7 +26,32 @@ const PROMPT: &str = "prompt>";
 
 macro_rules! println {
     ($($arg:tt)*) => {
-        ai::host::console::print_line(&format!($($arg)*))
+        crate::ai::host::console::print_line(&format!($($arg)*))
+    };
+}
+#[allow(unused_macros)]
+#[macro_export]
+macro_rules! debug {
+    ($($arg:tt)*) => {
+        crate::ai::host::log::debug(&format!($($arg)*))
+    };
+}
+#[allow(unused_macros)]
+#[macro_export]macro_rules! error {
+    ($($arg:tt)*) => {
+        crate::ai::host::log::error(&format!($($arg)*))
+    };
+}
+#[allow(unused_macros)]
+#[macro_export]macro_rules! warn {
+    ($($arg:tt)*) => {
+        crate::ai::host::log::warn(&format!($($arg)*))
+    };
+}
+#[allow(unused_macros)]
+#[macro_export]macro_rules! info {
+    ($($arg:tt)*) => {
+        crate::ai::host::log::info(&format!($($arg)*))
     };
 }
 
@@ -56,7 +81,7 @@ impl Guest for FrontConsolePluginImplementation {
             *sessions_lock = Some(HashMap::new());
         }
 
-        println!(
+        debug!(
             "[WASM] Плагин инициализирован. Запрошено подписок: {}",
             topics_to_subscribe.len()
         );
@@ -66,7 +91,7 @@ impl Guest for FrontConsolePluginImplementation {
     }
 
     async fn run() {
-        println!("[WASM] Запуск фонового цикла плагина {}", PLUGIN_NAME);
+        debug!("[WASM] Запуск фонового цикла плагина {}", PLUGIN_NAME);
         // Чтение пользовательского ввода из консоли.
         // Получаем нативный InputStream из подсистемы WASI, которую сгенерировал wit-bindgen.
         // В зависимости от вашей версии wit-bindgen путь может быть:
@@ -79,11 +104,11 @@ impl Guest for FrontConsolePluginImplementation {
             match ai::host::console::read_line(PROMPT.to_string()).await {
                 None => {
                     // EOF - поток ввода закрылся
-                    println!("[WASM] Поток stdin завершен.");
+                    debug!("[WASM] Поток stdin завершен.");
                     break;
                 }
                 Some(buffer) => {
-                    println!("[WASM] Новое сообщение из stdin.");
+                    debug!("[WASM] Новое сообщение из stdin.");
                     let trimmed = buffer.trim();
                     if !trimmed.is_empty() {
                         let host_event = Event {
@@ -107,11 +132,14 @@ impl Guest for FrontConsolePluginImplementation {
         // Данный метод выполняется асинхронно и независимо от того,
         // ждет ли сейчас функция read_line() ввода в консоли.
 
-        println!("[WASM] Получен ивент от хоста: {:?}", ev);
+        debug!("[WASM] Получен ивент от хоста: {:?}", ev);
 
-        // TODO - здесь будет обработка входящих событий
+        debug!("{}: {}", ev.topic, ev.payload);
 
-        println!("{}: {}", ev.topic, ev.payload);
+        // Если это про печать в консоль - выводим
+        if ev.topic == "print" {
+            println!("{}", ev.payload);
+        }
 
         // Имитация пинга
         if ev.topic == "request" {
@@ -120,7 +148,7 @@ impl Guest for FrontConsolePluginImplementation {
                 session_id: ev.session_id,
                 source: PLUGIN_NAME.to_string(),
                 target: "*".to_string(),
-                topic: "response".to_string(),
+                topic: "print".to_string(),
                 payload: ev.payload,
             };
             ai::host::event_bus::publish_event(&host_event);

@@ -1,3 +1,4 @@
+use crate::ai::host::log;
 use crate::ai::host::types::Event;
 use crate::ai::host::event_bus::publish_event;
 use crate::{PLUGIN_NAME};
@@ -7,11 +8,11 @@ pub async fn handle_event(ev: Event) {
     // Данный метод выполняется асинхронно и независимо от того,
     // ждет ли сейчас функция read_line() ввода в консоли.
 
-    debug!("[WASM] Получен ивент от хоста: {:?}", ev);
+    log_debug!("[WASM] Получен ивент от хоста: {:?}", ev);
 
     // TODO - здесь будет обработка входящих событий
 
-    debug!("{}: {}", ev.topic, ev.payload);
+    log_debug!("{}: {}", ev.topic, ev.payload);
 
     // Имитация пинга
     if ev.topic == "request" {

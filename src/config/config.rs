@@ -8,31 +8,56 @@ use std::path::PathBuf;
 
 #[derive(Deserialize)]
 pub struct Config {
-    #[allow(dead_code)]
     pub plugins: Vec<PluginConfig>,
 
-    #[allow(dead_code)]
+    pub logger: LoggerConfig,
+
     #[serde(default = "default_session_timeout")]
     pub session_timeout: u64,
-    #[allow(dead_code)]
     #[serde(default = "default_session_check_period")]
     pub session_check_period: u64,
-    #[allow(dead_code)]
     #[serde(default = "default_max_fuel_for_call")]
     pub max_fuel_for_call: u64,
-    #[allow(dead_code)]
     #[serde(default = "default_max_plugin_memory")]
     pub max_plugin_memory: u64,
-    #[allow(dead_code)]
     #[serde(default = "default_thread_pool_size")]
     pub thread_pool_size: usize,
-    #[allow(dead_code)]
     #[serde(default = "default_event_queue_size")]
     pub event_queue_size: usize,
-    #[allow(dead_code)]
     #[serde(default)]
     pub metrics: MetricsExportConfig,
 }
+
+#[derive(Deserialize)]
+pub struct LoggerConfig {
+    #[serde(default = "default_log_level")]
+    pub log_level: String,         // Например, "info", "debug", "error"
+    #[serde(default = "default_log_directory")]
+    pub logs_directory: String,    // Путь к папке, например, "logs" или "var/log"
+    #[serde(default = "default_log_file_base_name")]
+    pub file_base_name: String,    // Имя файла, например, "app_server"
+    #[serde(default = "default_log_max_file_size_bytes")]
+    pub max_file_size_bytes: u64, // Размер файла для ротации, например, 10_000_000 (10MB)
+    #[serde(default = "default_log_days_to_keep")]
+    pub days_to_keep: usize,     // Сколько дней хранить старые логи, например, 7
+}
+
+fn default_log_level() -> String {
+    "debug".to_string()
+}
+fn default_log_directory() -> String {
+    "./logs".to_string()
+}
+fn default_log_file_base_name() -> String {
+    "andychoir".to_string()
+}
+fn default_log_max_file_size_bytes() -> u64 {
+    10_000_000
+}
+fn default_log_days_to_keep() -> usize {
+    7
+}
+
 
 #[derive(Clone, Deserialize)]
 pub struct MetricsExportConfig {

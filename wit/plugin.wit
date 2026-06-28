@@ -21,6 +21,13 @@ interface console {
   read-line: async func(prompt: string) -> option<string>;
 }
 
+interface log {
+  debug: func(line: string);
+  info: func(line: string);
+  warn: func(line: string);
+  error: func(line: string);
+}
+
 interface plugin-lifecycle {
   use types.{event};
 
@@ -32,5 +39,6 @@ interface plugin-lifecycle {
 world host-plugin {
   import event-bus;
   import console;
+  import log;
   export plugin-lifecycle;
 }

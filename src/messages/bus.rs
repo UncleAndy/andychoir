@@ -77,7 +77,7 @@ pub fn start_event_bus(
             tokio::select! {
                 Some(join_res) = worker_tasks.join_next(), if !worker_tasks.is_empty() => {
                     if let Err(err) = join_res {
-                        println!("[Хост] Исполнитель событий завершился с ошибкой: {:?}", err);
+                        error!("[Хост] Исполнитель событий завершился с ошибкой: {:?}", err);
                     }
                 }
                 job = worker_rx.recv() => {
@@ -104,11 +104,11 @@ pub fn start_event_bus(
 
         while let Some(join_res) = worker_tasks.join_next().await {
             if let Err(err) = join_res {
-                println!("[Хост] Исполнитель событий завершился с ошибкой: {:?}", err);
+                error!("[Хост] Исполнитель событий завершился с ошибкой: {:?}", err);
             }
         }
 
-        println!("[Хост] Исполнитель событий завершён.");
+        info!("[Хост] Исполнитель событий завершён.");
     }));
 
     let stores_cleanup = stores.clone();
@@ -158,7 +158,7 @@ pub fn start_event_bus(
             .await;
         }
 
-        println!("[Хост] Диспетчер событий завершён.");
+        info!("[Хост] Диспетчер событий завершён.");
     });
 
     EventBusHandle {
@@ -175,12 +175,12 @@ impl EventBusHandle {
         drop(self.worker_tx);
 
         if let Err(err) = self.dispatcher_handle.await {
-            println!("[Хост] Диспетчер событий завершился с ошибкой: {:?}", err);
+            error!("[Хост] Диспетчер событий завершился с ошибкой: {:?}", err);
         }
 
         for worker_handle in self.worker_handles {
             if let Err(err) = worker_handle.await {
-                println!("[Хост] Исполнитель событий завершился с ошибкой: {:?}", err);
+                error!("[Хост] Исполнитель событий завершился с ошибкой: {:?}", err);
             }
         }
     }
@@ -192,7 +192,7 @@ async fn process_event_job(
     metrics: Arc<Metrics>,
     max_fuel_for_call: u64,
 ) {
-    println!(
+    debug!(
         "[Хост] Worker {} получил Job для отправки в плагин ивента: {:?}",
         worker_id, job.event
     );
@@ -207,7 +207,7 @@ async fn process_event_job(
     metrics.observe_processing_time(&job.plugin_name, started_at.elapsed());
 
     if let Err(e) = handle_event_res {
-        println!(
+        error!(
             "[Хост] Ошибка при выполнении плагина {}: {:?}",
             job.plugin_name, e
         );
@@ -227,13 +227,13 @@ async fn dispatch_event(
     let targets = event.target.split_whitespace().collect::<Vec<_>>();
     for target_pattern in targets {
         let matched_plugins = match_plugins(plugins, target_pattern).await;
-        println!(
+        debug!(
             "[Хост] Найдены плагины для получения сообщения: {:?}",
             matched_plugins
         );
 
         for plugin_name in matched_plugins {
-            println!("[Хост] Исполнение плагина {} ({:?})", plugin_name, event);
+            debug!("[Хост] Исполнение плагина {} ({:?})", plugin_name, event);
             let Some((store, lifecycle)) = store_for_event(
                 plugins,
                 stores,
@@ -247,7 +247,7 @@ async fn dispatch_event(
             .await
             else {
                 let plugins_lock = plugins.read().await;
-                println!(
+                error!(
                     "[Хост] Не удалось получить хранилище и жизненный цикл плагина {} ({:?})",
                     plugin_name,
                     plugins_lock.keys()
@@ -255,7 +255,7 @@ async fn dispatch_event(
                 continue;
             };
 
-            println!("[Хост] Подготовка Job для {}", plugin_name);
+            debug!("[Хост] Подготовка Job для {}", plugin_name);
 
             let job = EventJob {
                 plugin_name: plugin_name.clone(),
@@ -264,11 +264,11 @@ async fn dispatch_event(
                 event: event.clone(),
             };
 
-            println!("[Хост] Отправка Job для {}", plugin_name);
+            debug!("[Хост] Отправка Job для {}", plugin_name);
 
             if let Err(err) = worker_tx.try_send(job) {
                 metrics.inc_rejected_event(&plugin_name);
-                println!(
+                error!(
                     "[Хост] Очередь пула исполнителей переполнена или закрыта, событие для плагина {} отклонено: {}",
                     plugin_name, err
                 );
@@ -319,7 +319,7 @@ async fn store_for_event(
     };
 
     let Some((config, plugin_store, plugin_lifecycle)) = plugin_instance_opt else {
-        println!("Cannot find plugin: {}", plugin_name);
+        error!("[Хост] Палин не найден: {}", plugin_name);
         return None;
     };
 
@@ -338,8 +338,8 @@ async fn store_for_event(
             let component = match Component::from_file(engine, config.file.clone()) {
                 Ok(component) => component,
                 Err(err) => {
-                    println!(
-                        "Error loading plugin component: {} (plugin: {}).",
+                    error!(
+                        "[Хост] Ошибка загрузки файла плагина: {} (плагин: {}).",
                         err, plugin_name
                     );
                     return None;
@@ -349,8 +349,8 @@ async fn store_for_event(
             let plugin = match HostPlugin::instantiate_async(&mut store, &component, linker).await {
                 Ok(plugin) => plugin,
                 Err(err) => {
-                    println!(
-                        "Error instantiating plugin: {} (plugin: {}).",
+                    error!(
+                        "[Хост] Ошибка инициализации плагина: {} (плагин: {}).",
                         err, plugin_name
                     );
                     return None;
@@ -372,8 +372,8 @@ async fn store_for_event(
             Some((store, lifecycle))
         }
         Err(err) => {
-            println!(
-                "Error creating plugin store: {} (plugin: {}).",
+            error!(
+                "[Хост] Ошибка создания хранилища плагина: {} (плагин: {}).",
                 err, plugin_name
             );
             None

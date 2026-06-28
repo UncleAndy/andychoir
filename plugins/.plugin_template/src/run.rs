@@ -1,7 +1,7 @@
 use crate::PLUGIN_NAME;
 
 pub async fn run() {
-    debug!("[WASM] Запуск фонового цикла плагина {}", PLUGIN_NAME);
+    log_debug!("[WASM] Запуск фонового цикла плагина {}", PLUGIN_NAME);
     // Чтение пользовательского ввода из консоли.
     // Получаем нативный InputStream из подсистемы WASI, которую сгенерировал wit-bindgen.
     // В зависимости от вашей версии wit-bindgen путь может быть:

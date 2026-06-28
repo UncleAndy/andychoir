@@ -251,7 +251,7 @@ pub fn start_metrics_exporter(
         let listener = match TcpListener::bind(&addr).await {
             Ok(listener) => listener,
             Err(err) => {
-                println!(
+                error!(
                     "[Метрики] Не удалось запустить экспорт на {}: {}",
                     addr, err
                 );
@@ -259,7 +259,7 @@ pub fn start_metrics_exporter(
             }
         };
 
-        println!(
+        info!(
             "[Метрики] Экспорт запущен: http://{}{} (интервал обновления {} сек.)",
             addr, config.location, config.update_interval_secs
         );

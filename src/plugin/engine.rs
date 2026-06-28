@@ -31,15 +31,15 @@ impl BackgroundPluginHandle {
         self.handle.abort();
 
         match self.handle.await {
-            Ok(()) => println!(
+            Ok(()) => info!(
                 "[Хост] Фоновый процесс плагина {} завершён.",
                 self.plugin_name
             ),
-            Err(err) if err.is_cancelled() => println!(
+            Err(err) if err.is_cancelled() => info!(
                 "[Хост] Фоновый процесс плагина {} остановлен.",
                 self.plugin_name
             ),
-            Err(err) => println!(
+            Err(err) => error!(
                 "[Хост] Фоновый процесс плагина {} завершился с ошибкой: {:?}",
                 self.plugin_name, err
             ),
@@ -56,9 +56,9 @@ pub struct ChoirHostState {
 
 impl crate::ai::host::event_bus::Host for ChoirHostState {
     fn publish_event(&mut self, event: Event) -> () {
-        println!("[Хост] Новое входящее событие: {:?}.", event);
+        debug!("[Хост] Новое входящее событие: {:?}.", event);
         if let Err(err) = self.event_sender.try_send(event) {
-            println!(
+            error!(
                 "[Хост] Очередь входящих событий переполнена или закрыта: {}",
                 err
             );
@@ -82,11 +82,29 @@ impl crate::ai::host::console::Host for ChoirHostState {
             false
         };
         if !has_access {
-            println!("[Хост] Плагин не имеет доступа к чтению консоли с таким промптом.");
+            error!("[Хост] Плагин не имеет доступа к выводу консоли с таким размером текста.");
             return ();
         }
 
         crate::host::console::print_line(format_args!("{}", line));
+    }
+}
+
+impl crate::ai::host::log::Host for ChoirHostState {
+    fn debug(&mut self, line: String) -> () {
+        crate::host::log::debug(format_args!("{}", line))
+    }
+
+    fn info(&mut self, line: String) -> () {
+        crate::host::log::info(format_args!("{}", line))
+    }
+
+    fn warn(&mut self, line: String) -> () {
+        crate::host::log::warn(format_args!("{}", line))
+    }
+
+    fn error(&mut self, line: String) -> () {
+        crate::host::log::error(format_args!("{}", line))
     }
 }
 
@@ -114,7 +132,7 @@ impl crate::ai::host::console::HostWithStore<ChoirHostState> for ChoirHostState 
             false
         });
         if !has_access {
-            println!("[Хост] Плагин не имеет доступа к чтению консоли с таким промптом.");
+            error!("[Хост] Плагин не имеет доступа к чтению консоли с таким промптом.");
             return None;
         }
 
@@ -155,6 +173,10 @@ pub fn create_linker(engine: &Engine) -> anyhow::Result<Linker<ChoirHostState>> 
         |state| state,
     )?;
     crate::ai::host::console::add_to_linker::<ChoirHostState, ChoirHostState>(
+        &mut linker,
+        |state| state,
+    )?;
+    crate::ai::host::log::add_to_linker::<ChoirHostState, ChoirHostState>(
         &mut linker,
         |state| state,
     )?;
@@ -213,7 +235,7 @@ fn run_plugin_in_background(
 ) -> BackgroundPluginHandle {
     let handle_plugin_name = plugin_name.clone();
     let handle = tokio::spawn(async move {
-        println!("[Хост] Запуск фонового процесса плагина {}...", plugin_name);
+        info!("[Хост] Запуск фонового процесса плагина {}...", plugin_name);
 
         let mut store_guard = store.lock().await;
         let run_res = store_guard
@@ -221,12 +243,12 @@ fn run_plugin_in_background(
             .await;
 
         if let Err(err) = run_res {
-            println!(
+            error!(
                 "[Хост] Фоновый процесс плагина {} запустился с ошибкой: {:?}",
                 plugin_name, err
             );
         } else {
-            println!(
+            info!(
                 "[Хост] Фоновый процесс плагина {} запустился успешно",
                 plugin_name
             );
@@ -247,26 +269,26 @@ pub async fn load_and_init_plugin(
 ) -> anyhow::Result<(Vec<String>, Guest, Store<ChoirHostState>)> {
     let mut store = new_plugin_store(engine, plugin_config, event_sender).await?;
 
-    println!("[Хост] Загрузка файла: {:?}", plugin_config.file.clone());
+    info!("[Хост] Загрузка файла: {:?}", plugin_config.file.clone());
     let component = Component::from_file(engine, plugin_config.file.clone())?;
 
     let plugin = HostPlugin::instantiate_async(&mut store, &component, linker).await?;
     let lifecycle = plugin.ai_host_plugin_lifecycle().clone();
 
-    println!("[Хост] Вызов метода init...");
+    info!("[Хост] Вызов метода init...");
 
     let config_str = plugin_config.config.to_string();
-    println!("[Хост] Конфигурация плагина: {:?}", config_str);
+    info!("[Хост] Конфигурация плагина: {:?}", config_str);
 
     let subscriptions_res = store
         .run_concurrent(async |accessor| lifecycle.call_init(accessor, config_str).await)
         .await;
     let subscriptions = subscriptions_res.and_then(|res| res).unwrap_or_else(|err| {
-        println!("[Хост] Ошибка при вызове метода init: {:?}", err);
+        error!("[Хост] Ошибка при вызове метода init: {:?}", err);
         Vec::<String>::new()
     });
 
-    println!(
+    info!(
         "[Хост] Плагин успешно загружен. Его подписки: {:?}",
         subscriptions
     );

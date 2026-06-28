@@ -15,7 +15,7 @@ pub async fn init(config_json: String) -> Vec<String> {
         *config_lock = Some(parsed_config);
     }
 
-    debug!(
+    log_debug!(
         "[WASM] Плагин инициализирован. Запрошено подписок: {}",
         topics_to_subscribe.len()
     );
