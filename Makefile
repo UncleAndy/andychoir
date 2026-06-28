@@ -4,7 +4,8 @@ host:
 	cargo build -p andychoir
 
 plugins:
-	cargo build -p "*_plugin" --target wasm32-wasip2
+	cd plugins/front_console_plugin && cargo build --target wasm32-wasip2
+	cd plugins/tool_calculator_plugin && cargo build --target wasm32-wasip2
 
 all: host plugins
 

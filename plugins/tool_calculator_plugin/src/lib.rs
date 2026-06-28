@@ -1,10 +1,26 @@
 wit_bindgen::generate!({ world: "host-plugin", path: "../../wit" });
 
+use std::sync::Mutex;
 use exports::ai::host::plugin_lifecycle::Guest;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
 
 // Первое слово - класс плагина (например: "front", "agent", "tool" etc.)
 // Второе слово - индивидуальное название плагина
 const PLUGIN_NAME: &str = "tool:calculator";
+
+static CONFIG: Mutex<Option<ToolDefinition>> = Mutex::new(None);
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct CalculatorArgs {
+    pub expression: String,
+}
 
 #[allow(unused_macros)]
 #[macro_export]

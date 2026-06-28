@@ -138,7 +138,7 @@ impl Guest for FrontConsolePluginImplementation {
         debug!("{}: {}", ev.topic, ev.payload);
 
         // Если это про печать в консоль - выводим
-        if ev.topic == "print" {
+        if ev.topic == "print" || ev.topic == "response" {
             println!("{}", ev.payload);
         }
 
