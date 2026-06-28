@@ -8,6 +8,9 @@ members = [
     ".",
     "plugins/*"
 ]
+exclude = [
+    "plugins/.plugin_template"
+]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
