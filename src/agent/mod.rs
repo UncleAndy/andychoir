@@ -63,8 +63,8 @@ impl AgentWorker {
         )?;
 
         let mut builder = client
-            .agent(model.model_name.as_str())
-            .preamble(&request.system_prompt);
+            .agent(model.model_name.as_str());
+        builder = builder.preamble(&request.system_prompt);
 
         if !request.tools.is_empty() {
             // Инициализируем инструменты
