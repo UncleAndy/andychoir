@@ -19,3 +19,4 @@ log = "0.4"
 flexi_logger = "0.31"
 chrono = "0.4.45"
 tokio = { version = "1.52", features = ["full"] }
+rig = { version = "0.39", features = ["rmcp"] }
