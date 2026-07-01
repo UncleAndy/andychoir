@@ -1,6 +1,7 @@
 pub mod tools;
 pub mod model;
 pub mod contexts;
+pub mod mcp;
 
 use std::sync::{OnceLock};
 use dashmap::DashMap;
