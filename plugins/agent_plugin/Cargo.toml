@@ -1,0 +1,17 @@
+[package]
+name = "agent_plugin"
+version = "0.1.0"
+edition = "2024"
+description = "Code for wasm AI-agent plugin."
+
+[lib]
+# Важно: cdylib указывает компилятору собрать динамическую C-библиотеку,
+# которую затем утилиты WASM превращают в компонент.
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.58"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+openai-api-rs = { git = "https://github.com/UncleAndy/openai-api-rs.git" }
+dashmap = "6.2"
