@@ -3,7 +3,7 @@ wit_bindgen::generate!({ world: "host-plugin", path: "../../wit" });
 use exports::ai::host::plugin_lifecycle::Guest;
 
 use serde::Deserialize;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use dashmap::DashMap;
 
 #[derive(Deserialize, Clone)]
@@ -25,6 +25,7 @@ const PLUGIN_CLASS: &str = "agent";
 
 static CONFIG: Mutex<Option<AgentPluginConfig>> = Mutex::new(None);
 
+#[allow(unused)]
 static CLIENT: RwLock<Option<openai_api_rs::v1::api::OpenAIClient>> = RwLock::new(None);
 
 static STATUS: RwLock<PluginInitStatus> = RwLock::new(PluginInitStatus::NotInitialized);
@@ -44,7 +45,9 @@ pub enum PluginInitStatus {
 #[derive(Deserialize, Clone)]
 pub struct ToolDefinition {
     name: String,
+    #[allow(unused)]
     description: String,
+    #[allow(unused)]
     request_format: serde_json::Value,
 }
 

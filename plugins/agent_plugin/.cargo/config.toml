@@ -1,0 +1,6 @@
+# Файл: .cargo/config.toml
+[build]
+target = "wasm32-wasip2"
+
+[target.wasm32-wasip2]
+rustflags = ["--cfg", "tokio_unstable"]
