@@ -831,8 +831,8 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "openai-api-rs"
-version = "10.0.3"
-source = "git+https://github.com/UncleAndy/openai-api-rs.git#2a23af2609b8d9b56c14a3b8b6dc25abbcfdcdf8"
+version = "10.1.0"
+source = "git+https://github.com/UncleAndy/openai-api-rs.git?tag=v10.1.0#dc9cde97c2b195ba73d92f1e052352cb762346f2"
 dependencies = [
  "anyhow",
  "bytes",

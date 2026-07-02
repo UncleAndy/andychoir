@@ -13,5 +13,5 @@ crate-type = ["cdylib"]
 wit-bindgen = "0.58"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-openai-api-rs = { git = "https://github.com/UncleAndy/openai-api-rs.git" }
+openai-api-rs = { git = "https://github.com/UncleAndy/openai-api-rs.git", tag = "v10.1.0" }
 dashmap = "6.2"
