@@ -63,6 +63,11 @@ interface host-control {
   // Ждать, пока хост не сообщит, что все плагины готовы (host:"ready").
   // Хост сигналит через Notify. Без блокировки wasm-нити (это async).
   wait-for-ready: async func();
+
+  // Ждать, пока не придёт ответ (topic:"response") на запрос с данным
+  // request-id. Хост держит карту request_id -> Notify и сигналит при
+  // приходе response. Без блокировки wasm-нити (это async).
+  wait-for-response: async func(request-id: string);
 }
 
 interface plugin-lifecycle {

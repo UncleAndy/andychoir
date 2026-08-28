@@ -321,6 +321,13 @@ async fn dispatch_event(
         }
     }
 
+    // ============ Сигнал ожидающим ответа (host-control.wait-for-response) ===
+    // Когда приходит событие topic:"response", будим плагины, ожидающие ответ
+    // на этот request_id (консоль в режимах wait/queue).
+    if event.topic == "response" {
+        crate::plugin::engine::signal_response(&event.request_id).await;
+    }
+
     let targets = parse_target_names(&event.target);
     for target_pattern in targets {
         let matched_plugins = match_plugins(plugins, &target_pattern).await;

@@ -4,17 +4,27 @@ use ai::host::types::Event;
 use exports::ai::host::plugin_lifecycle::Guest;
 
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use uuid::Uuid;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct FrontConsolePluginConfig {
     // Плагин может принимать из конфига топики, которые ему нужно слушать
     subscriptions: Vec<String>,
     // Кому плагин будет отправлять сообщения
     #[allow(dead_code)]
     target: Vec<String>,
+    // Режим управления промптом/чтением ввода:
+    //   "wait"   (default) — после отправки запроса НЕ читаем ввод до ответа;
+    //   "queue"  — после ответа отправляем следующее из очереди (ввод копится);
+    //   "direct" — ввод всегда доступен, запросы уходят сразу (параллельно).
+    #[serde(default = "default_mode")]
+    mode: String,
+}
+
+fn default_mode() -> String {
+    "wait".to_string()
 }
 
 const PLUGIN_NAME: &str = "front:console";
@@ -68,6 +78,7 @@ impl Guest for FrontConsolePluginImplementation {
                     "error".to_string(),
                 ],
                 target: vec!["choir".to_string()],
+                mode: default_mode(),
             });
 
         let topics_to_subscribe = parsed_config.subscriptions.clone();
@@ -114,35 +125,67 @@ impl Guest for FrontConsolePluginImplementation {
         crate::ai::host::host_control::wait_for_ready().await;
         crate::ai::host::console::print_line("[Система] Все плагины готовы. Можете вводить запросы.");
 
-        // Чтение пользовательского ввода из консоли.
-        // Получаем нативный InputStream из подсистемы WASI, которую сгенерировал wit-bindgen.
-        // В зависимости от вашей версии wit-bindgen путь может быть:
-        // wasi::cli::stdin::get_stdin() ИЛИ вызов std::io::stdin() напрямую,
-        // так как стандартная библиотека Rust под target_arch="wasm32-wasip2"
-        // автоматически мапит std::io::stdin() на этот интерфейс!
+        // Чтение пользовательского ввода из консоли с управлением режимами.
+        // "wait"/"queue": после отправки запроса НЕ читаем ввод до ответа
+        // (нет ни промпта, ни чтения). "direct": ввод всегда доступен.
+        let mode = CONFIG
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| c.mode.clone())
+            .unwrap_or_else(default_mode);
+
+        // Очередь сообщений для режима "queue".
+        let mut queue: VecDeque<String> = VecDeque::new();
+
         loop {
-            // В контексте WASI Component Model этот вызов блокирует только текущую "микропрограмму" (fiber),
-            // оставляя планировщик хоста свободным для вызовов handle_event.
-            match ai::host::console::read_line(PROMPT.to_string()).await {
+            // Флаг: ждём ли мы ответ на отправленный запрос.
+            // В wait/queue он true после отправки, в direct — всегда false.
+            let mut awaiting = false;
+            let mut pending_request_id = String::new();
+
+            // 1) Читаем ввод (промпт показываем, только если готовы принять).
+            //    В wait/queue после отправки сюда не вернёмся до ответа.
+            let line = ai::host::console::read_line(PROMPT.to_string()).await;
+            match line {
                 None => {
-                    // EOF - поток ввода закрылся
                     info!("[WASM] Поток stdin завершен.");
                     break;
                 }
                 Some(buffer) => {
-                    info!("[WASM] Новое сообщение из stdin.");
-                    let trimmed = buffer.trim();
-                    if !trimmed.is_empty() {
-                        let host_event = Event {
-                            request_id: Uuid::new_v4().to_string(),
-                            session_id: Uuid::new_v4().to_string(),
-                            source: PLUGIN_NAME.to_string(),
-                            target: "agent:*".to_string(),
-                            topic: "request".to_string(),
-                            payload: trimmed.to_string(),
-                        };
-                        // Отправка события в хост
-                        ai::host::event_bus::publish_event(&host_event);
+                    let trimmed = buffer.trim().to_string();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    // Режим direct: сразу отправляем и продолжаем читать.
+                    if mode == "direct" {
+                        publish_request(&trimmed);
+                        continue;
+                    }
+                    // wait/queue: если уже ждём ответ — копим в очередь (queue)
+                    // либо игнорируем (wait не читает ввод, поэтому сюда
+                    // попадём только в queue-итерации — см. ниже).
+                    if awaiting {
+                        queue.push_back(trimmed);
+                        continue;
+                    }
+                    // Отправляем первый запрос.
+                    pending_request_id = publish_request(&trimmed);
+                    awaiting = true;
+                }
+            }
+
+            // 2) В wait/queue ждём ответ на отправленный запрос (async, не
+            //    блокирует wasm). Пока ждём — ввод НЕ читается (нет промпта).
+            if awaiting && mode != "direct" {
+                crate::ai::host::host_control::wait_for_response(pending_request_id).await;
+                awaiting = false;
+                // queue: если есть накопленное — отправляем следующее.
+                if mode == "queue" {
+                    while let Some(next) = queue.pop_front() {
+                        pending_request_id = publish_request(&next);
+                        crate::ai::host::host_control::wait_for_response(pending_request_id)
+                            .await;
                     }
                 }
             }
@@ -177,3 +220,18 @@ impl Guest for FrontConsolePluginImplementation {
 }
 
 export!(FrontConsolePluginImplementation);
+
+/// Отправить пользовательский запрос агенту (target:"agent:*") и вернуть request_id.
+fn publish_request(payload: &str) -> String {
+    let request_id = Uuid::new_v4().to_string();
+    let host_event = Event {
+        request_id: request_id.clone(),
+        session_id: Uuid::new_v4().to_string(),
+        source: PLUGIN_NAME.to_string(),
+        target: "agent:*".to_string(),
+        topic: "request".to_string(),
+        payload: payload.to_string(),
+    };
+    ai::host::event_bus::publish_event(&host_event);
+    request_id
+}

@@ -68,6 +68,38 @@ pub fn signal_host_ready() {
     readiness_notify().notify_waiters();
 }
 
+/// Карта ожидающих ответов: request_id -> Notify. Хост сигналит Notify,
+/// когда приходит событие topic:"response" с этим request_id.
+static PENDING_RESPONSES: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<Notify>>>> =
+    OnceLock::new();
+
+fn pending_responses() -> &'static tokio::sync::Mutex<HashMap<String, Arc<Notify>>> {
+    PENDING_RESPONSES.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+/// Зарегистрировать ожидание ответа на запрос request_id. Возвращает Notify,
+/// который сигналит хост, когда придёт response с этим id.
+pub async fn register_wait_response(request_id: String) -> Arc<Notify> {
+    let mut map = pending_responses().lock().await;
+    if let Some(existing) = map.get(&request_id) {
+        return existing.clone();
+    }
+    let notify = Arc::new(Notify::new());
+    map.insert(request_id, notify.clone());
+    notify
+}
+
+/// Сигналить ожидающим ответ на request_id (вызывается при response).
+pub async fn signal_response(request_id: &str) {
+    let notify = {
+        let mut map = pending_responses().lock().await;
+        map.remove(request_id)
+    };
+    if let Some(n) = notify {
+        n.notify_waiters();
+    }
+}
+
 /// Проверка права плагина на вывод текста в консоль (console_print).
 /// Возвращает true, если среди прав есть `ConsolePrint(max_size)` и длина <= max_size.
 /// Выделено для юнит-тестирования (без состояния хоста).
@@ -214,6 +246,16 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
         // Отдаём управление планировщику и ждём сигнала от хоста.
         // notify_waiters() будит ВСЕх ожидающих, поэтому loop безопасен.
         readiness_notify().notified().await;
+    }
+
+    async fn wait_for_response(
+        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        request_id: String,
+    ) {
+        // Регистрируем ожидание ответа и ждём Notify (async, не блокирует wasm).
+        // Хост сигналит его в signal_response() при приходе topic:"response".
+        let notify = register_wait_response(request_id).await;
+        notify.notified().await;
     }
 }
 

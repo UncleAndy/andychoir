@@ -10,6 +10,7 @@ plugins:
         - "system:error"
       targets:
         - "system:info"
+      mode: "wait"
     allow_background: true
 
   - file: "plugins/tool_calculator_plugin/target/wasm32-wasip2/debug/tool_calculator_plugin.wasm"
