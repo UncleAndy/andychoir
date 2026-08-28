@@ -5,7 +5,7 @@ use crate::init::init_tool;
 
 pub async fn handle_event(ev: Event) {
     // Если это сообщения от инструментов - отправляем в процедуру инициализации
-    if ev.source.starts_with("tool:") && ev.topic == "tool_definition" {
+    if ev.source.starts_with("tool:") && ev.topic == "definition" {
         init_tool(ev);
         return;
     }
