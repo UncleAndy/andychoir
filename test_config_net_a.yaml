@@ -53,12 +53,14 @@ history:
   session_ttl_secs: 604800
   save_period_secs: 1
 
-# Хост A: консоль + calculator, слушает /net на 8092 и подключается к B (агенту).
+# Хост A: консоль + calculator. Это КЛИЕНТ — подключается к серверу B,
+# сам сеть не слушает (listen_port=0). WebSocket двунаправленный: B отвечает
+# по этому же соединению.
 net:
   node_id: "host-a"
-  listen_port: 8092
-  token: "secret-a"
+  listen_port: 0
+  token: []
   remotes:
     - url: "ws://127.0.0.1:8093/net"
-      token: "secret-b"
+      token: "secret-client-1"
       targets: ["agent:demo"]

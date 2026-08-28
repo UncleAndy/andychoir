@@ -39,12 +39,14 @@ history:
   session_ttl_secs: 604800
   save_period_secs: 1
 
-# Хост B: только агент, слушает /net на 8093 и подключается к A (консоль+инструменты).
+# Хост B: только агент. Это СЕРВЕР — слушает /net на 8093, к нему
+# подключаются клиенты (A). Сервер НЕ инициирует подключения к клиентам
+# (клиент может быть за роутером). Ответы клиентам идут по их входящим
+# соединениям (WebSocket двунаправленный).
 net:
   node_id: "host-b"
   listen_port: 8093
-  token: "secret-b"
-  remotes:
-    - url: "ws://127.0.0.1:8092/net"
-      token: "secret-a"
-      targets: ["tool:calculator", "front:console"]
+  token:
+    - "secret-client-1"
+    - "secret-client-2"
+  remotes: []
