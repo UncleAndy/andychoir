@@ -50,17 +50,43 @@ pub async fn handle_event(ev: Event) {
             serde_json::json!({ "role": "system", "content": config.system_prompt }),
         ];
         for hev in &history {
-            let role = match hev.topic.as_str() {
-                "request" => "user",
-                "response" => "assistant",
-                _ => continue,
+            // Классифицируем событие по источнику, чтобы правильно построить
+            // роли для LLM: user (фронт), assistant (ответ агента), tool (утилиты).
+            let src = hev.source.as_str();
+            let classified = if src.starts_with("front") && hev.topic == "request" {
+                // Пользовательский ввод.
+                Some(serde_json::json!({ "role": "user", "content": hev.payload }))
+            } else if src.starts_with("agent") && hev.topic == "response" {
+                // Ответ агента (содержит текст для пользователя).
+                Some(serde_json::json!({ "role": "assistant", "content": hev.payload }))
+            } else if src.starts_with("tool") && hev.topic == "response" {
+                // Результат утилиты -> role "tool".
+                Some(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": hev.request_id,
+                    "content": hev.payload
+                }))
+            } else if src.starts_with("tool") && hev.topic == "request" {
+                // Запрос агента к утилите: пометим как assistant tool_call-намерение.
+                // (Формирование полноценного tool_calls — в U3.)
+                Some(serde_json::json!({
+                    "role": "assistant",
+                    "content": format!("[вызов утилиты {}: {}]", hev.target, hev.payload)
+                }))
+            } else {
+                // Служебные события в контекст не идут.
+                None
             };
-            // Пропускаем сам текущий запрос (если он уже в истории) — его
-            // добавим отдельно ниже, чтобы не задваивать.
-            if role == "user" && hev.request_id == ev.request_id {
-                continue;
+
+            if let Some(msg) = classified {
+                // Пропускаем сам текущий запрос (если он уже в истории).
+                if msg.get("role").and_then(|r| r.as_str()) == Some("user")
+                    && hev.request_id == ev.request_id
+                {
+                    continue;
+                }
+                messages.push(msg);
             }
-            messages.push(serde_json::json!({ "role": role, "content": hev.payload }));
         }
         // Текущий запрос пользователя.
         messages.push(serde_json::json!({ "role": "user", "content": user_input }));

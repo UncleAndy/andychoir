@@ -350,10 +350,12 @@ async fn dispatch_event(
     }
 
     // ============ Запись в историю сессии (вариант A) =======================
-    // Копим только диалоговые события (request/response), и только для
-    // непустых session_id. Служебные (discovery/definition/status/print) не
-    // входят в историю диалога. Ограничиваем длину (FIFO-вытеснение).
-    if event.session_id != "-" && (event.topic == "request" || event.topic == "response") {
+    // Копим ВСЕ содержательные события сессии (request/response/discovery/
+    // definition/error), кроме служебных status/print. Это включает и вызовы
+    // инструментов (у них session_id = сессии пользователя, сквозной).
+    // Ограничиваем длину (FIFO-вытеснение).
+    let is_serving = event.topic == "status" || event.topic == "print";
+    if event.session_id != "-" && !is_serving {
         crate::plugin::engine::history_append(&event.session_id, &event, max_events_per_session)
             .await;
     }
