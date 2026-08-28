@@ -35,6 +35,14 @@ pub fn get_tools() -> &'static DashMap<String, ToolDefinition> {
     TOOLS.get_or_init(DashMap::new)
 }
 
+/// Результаты вызовов инструментов по request_id запроса-вызова.
+/// Заполняется в handle_event (когда приходит response от tool), читается
+/// циклом tool-calling после wait_for_response.
+static TOOL_RESULTS: OnceLock<DashMap<String, String>> = OnceLock::new();
+pub fn get_tool_results() -> &'static DashMap<String, String> {
+    TOOL_RESULTS.get_or_init(DashMap::new)
+}
+
 #[derive(PartialEq, Debug)]
 pub enum PluginInitStatus {
     NotInitialized,

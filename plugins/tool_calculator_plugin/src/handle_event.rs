@@ -34,15 +34,24 @@ pub async fn handle_event(ev: Event) {
             // Сначала надо распарсить запрос в формате JSON
             let request_res: Result<CalculatorArgs, serde_json::Error> = serde_json::from_str(&ev.payload);
 
-            if request_res.is_err() {
-                log_error!("[WASM] Failed to parse request: {}", request_res.err().unwrap());
-                return;
-            }
+            let request = match request_res {
+                Ok(req) => req,
+                Err(e) => {
+                    // Не зависаем у агента: при ошибке парсинга отвечаем сообщением.
+                    log_error!("[WASM] Failed to parse request: {}", e);
+                    publish_event(&Event {
+                        request_id: ev.request_id,
+                        session_id: ev.session_id,
+                        source: PLUGIN_NAME.to_string(),
+                        target: ev.source,
+                        topic: "response".to_string(),
+                        payload: format!("(ошибка: не удалось распарсить запрос: {})", e),
+                    });
+                    return;
+                }
+            };
 
-            let request = request_res.unwrap();
-
-            let res = meval::eval_str(request.expression)
-                .map(|result| result.to_string());
+            let res = meval::eval_str(request.expression);
 
             match res {
                 Ok(ans) => {
@@ -53,11 +62,20 @@ pub async fn handle_event(ev: Event) {
                         source: PLUGIN_NAME.to_string(),
                         target: ev.source,
                         topic: "response".to_string(),
-                        payload: ans,
+                        payload: ans.to_string(),
                     });
                 }
                 Err(e) => {
-                    log_error!("[WASM] Calculator tool error: {}", e)
+                    // При ошибке вычисления тоже отвечаем (иначе агент зависнет).
+                    log_error!("[WASM] Calculator tool error: {}", e);
+                    publish_event(&Event {
+                        request_id: ev.request_id,
+                        session_id: ev.session_id,
+                        source: PLUGIN_NAME.to_string(),
+                        target: ev.source,
+                        topic: "response".to_string(),
+                        payload: format!("(ошибка вычисления: {})", e),
+                    });
                 }
             }
         }

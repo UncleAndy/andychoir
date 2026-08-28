@@ -71,6 +71,11 @@ interface host-control {
   // приходе response. Без блокировки wasm-нити (это async).
   wait-for-response: async func(request-id: string);
 
+  // Ждать ответ с таймаутом (timeout-ms). Возвращает true, если ответ пришёл
+  // до истечения, false — если таймаут. Предотвращает зависание, когда
+  // инструмент не отвечает (ошибка/молчание).
+  wait-for-response-timeout: async func(request-id: string, timeout-ms: u64) -> bool;
+
   // Вернуть историю диалоговых событий сессии (request/response),
   // сохранённую хостом. Пустой список, если сессии нет.
   get-session-history: async func(session-id: string) -> list<event>;

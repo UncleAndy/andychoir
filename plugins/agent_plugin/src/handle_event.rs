@@ -11,6 +11,20 @@ pub async fn handle_event(ev: Event) {
         return;
     }
 
+    // Ответ от инструмента на запрос-вызов (tool-calling): сохраняем результат
+    // по request_id, чтобы цикл tool-calling смог его прочитать после
+    // wait_for_response(request_id).
+    if ev.source.starts_with("tool:") && ev.topic == "response" {
+        crate::get_tool_results().insert(ev.request_id.clone(), ev.payload.clone());
+        log_debug!(
+            "[WASM] Сохранён результат инструмента {} для request_id={}: {:?}",
+            ev.source,
+            ev.request_id,
+            ev.payload
+        );
+        return;
+    }
+
     // Защита от работы неинициализированного плагина
     {
         let lock = STATUS.read().unwrap();
@@ -134,47 +148,125 @@ pub async fn handle_event(ev: Event) {
         if !tool_calls.is_empty() {
             log_debug!("[WASM] LLM вернул {} tool_calls, вызываем инструменты", tool_calls.len());
             publish_status(&ev, &config, "Вызываю инструменты...");
-            // Шаг 2: выполняем инструмент(ы)
-            let mut tool_results = Vec::new();
+
+            // Выполняем инструмент(ы) и собираем результаты.
+            // Первый tool_calls принадлежит сообщению assistant — добавим его
+            // в messages, затем для каждого вызова добавим role:"tool".
+            let assistant_msg = parsed
+                .get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("message"))
+                .cloned()
+                .unwrap_or(serde_json::json!({"role":"assistant","content":""}));
+            messages.push(assistant_msg);
+
             for tc in &tool_calls {
                 let func = match tc.get("function") {
                     Some(f) => f,
                     None => continue,
                 };
                 let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
-                let arguments = func.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
+                let arguments_raw = func.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
+                let tool_call_id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
 
                 if name == "calculator" {
-                    // Вызываем tool:calculator через шину событий
+                    // Парсим аргументы: OpenAI может вернуть arguments как
+                    // JSON-объект ИЛИ как JSON-строку (если модель так сформировала).
+                    // Нормализуем в объект.
+                    let args_obj = match &arguments_raw {
+                        serde_json::Value::String(s) => {
+                            serde_json::from_str::<serde_json::Value>(s).unwrap_or(serde_json::json!({}))
+                        }
+                        other => other.clone(),
+                    };
+                    let expression = args_obj
+                        .get("expression")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    if expression.is_empty() {
+                        // Не удалось извлечь выражение — не зависаем, вернём ошибку.
+                        log_error!("[WASM] calculator: пустое выражение в arguments={:?}", arguments_raw);
+                        messages.push(serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "content": "(ошибка: не удалось получить выражение для калькулятора)"
+                        }));
+                        continue;
+                    }
+
+                    // Вызываем tool:calculator через шину событий.
+                    // request_id делаем уникальным для ЭТОГО вызова, чтобы
+                    // wait_for_response не конфликтовал с основным запросом.
+                    let call_request_id = format!("{}:tool:{}", ev.request_id, tool_call_id);
                     let call_ev = Event {
-                        request_id: ev.request_id.clone(),
+                        request_id: call_request_id.clone(),
                         session_id: ev.session_id.clone(),
                         source: format!("{}:{}", PLUGIN_CLASS, config.name),
                         target: "tool:calculator".to_string(),
                         topic: "request".to_string(),
                         payload: serde_json::json!({
-                            "expression": arguments.get("expression").and_then(|e| e.as_str()).unwrap_or("")
+                            "expression": expression
                         }).to_string(),
                     };
                     publish_event(&call_ev);
 
-                    // Ждём ответ от инструмента: сохраняем в TOOLS как временное
-                    // хранилище ответов. Для простоты P1: читаем последний response
-                    // через отдельный механизм не реализуем — возвращаем заглушку.
-                    // (Полноценный оркестратор tool-calling — следующий шаг P1.1.)
-                    tool_results.push(serde_json::json!({
-                        "tool": name,
-                        "result": "(tool execution queued via event bus)"
+                    // Ждём ответ от инструмента с таймаутом (не зависаем).
+                    let got = crate::ai::host::host_control::wait_for_response_timeout(
+                        call_request_id.clone(),
+                        8000,
+                    ).await;
+
+                    let result = if got {
+                        crate::get_tool_results()
+                            .remove(&call_request_id)
+                            .map(|(_k, v)| v)
+                            .unwrap_or_else(|| "(инструмент не вернул результат)".to_string())
+                    } else {
+                        "(ошибка: таймаут ожидания ответа от инструмента calculator)".to_string()
+                    };
+
+                    log_debug!("[WASM] Результат calculator для {}: {}", tool_call_id, result);
+
+                    // Добавляем в messages пару: уже есть assistant с tool_calls,
+                    // теперь role:"tool" с результатом.
+                    messages.push(serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": result
                     }));
                 }
             }
 
-            // Шаг 3: финальный ответ (без реального результата инструмента в P1)
-            let final_text = format!(
-                "Я бы вычислил это через калькулятор. (P1: tool-calling через шину событий реализован, но сбор результата инструмента — следующий шаг.) Запрос: {}",
-                user_input
-            );
-            let resp_ev = response_event(&config, &ev, &final_text);
+            // Повторный запрос к LLM с результатами инструментов.
+            publish_status(&ev, &config, "Обрабатываю результат инструментов...");
+            let second_req = serde_json::json!({
+                "model": config.model.model_name,
+                "messages": messages,
+                "tools": tools_json,
+                "tool_choice": "auto"
+            });
+            let (s2, b2) = http::post_json(url.clone(), second_req.to_string()).await;
+            log_debug!("[WASM] LLM повторный ответ status={} body={}", s2, b2);
+
+            let content = if s2 == 200 {
+                let parsed2: Option<serde_json::Value> = serde_json::from_str(&b2).ok();
+                let content = parsed2
+                    .as_ref()
+                    .and_then(|v| v.get("choices"))
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("message"))
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("(пусто)")
+                    .to_string();
+                content
+            } else {
+                format!("Ошибка LLM при обработке результата инструмента: status {}", s2)
+            };
+
+            let resp_ev = response_event(&config, &ev, &content);
             publish_event(&resp_ev);
         } else {
             // Нет tool_calls — возвращаем content напрямую

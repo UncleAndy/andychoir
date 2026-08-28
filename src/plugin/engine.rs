@@ -427,6 +427,17 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
         notify.notified().await;
     }
 
+    async fn wait_for_response_timeout(
+        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        request_id: String,
+        timeout_ms: u64,
+    ) -> bool {
+        // Ждём ответ с таймаутом. Возвращает true, если ответ пришёл.
+        let notify = register_wait_response(request_id).await;
+        let duration = std::time::Duration::from_millis(timeout_ms);
+        tokio::time::timeout(duration, notify.notified()).await.is_ok()
+    }
+
     async fn get_session_history(
         _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
         session_id: String,
