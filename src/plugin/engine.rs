@@ -126,6 +126,63 @@ fn dirty_sessions() -> &'static dashmap::DashSet<String> {
     DIRTY_SESSIONS.get_or_init(dashmap::DashSet::new)
 }
 
+/// Полное описание инструмента (name, description, параметры JSON).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    pub parameters_json: String,
+}
+
+/// Реестр ЛОКАЛЬНЫХ инструментов хоста: name -> ToolDef.
+/// Заполняется при загрузке tool-плагинов (их определения из конфига).
+static LOCAL_TOOLS: OnceLock<RwLock<HashMap<String, ToolDef>>> = OnceLock::new();
+
+/// Инструменты СЕССИИ (добавленные в ходе работы, из подключённых хостов):
+/// session_id -> name -> ToolDef. Приоритет над локальными при конфликте.
+static SESSION_TOOLS: OnceLock<RwLock<HashMap<String, HashMap<String, ToolDef>>>> = OnceLock::new();
+
+pub fn local_tools() -> &'static RwLock<HashMap<String, ToolDef>> {
+    LOCAL_TOOLS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn session_tools() -> &'static RwLock<HashMap<String, HashMap<String, ToolDef>>> {
+    SESSION_TOOLS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Зарегистрировать локальный инструмент хоста (вызывается при загрузке
+/// tool-плагина).
+pub async fn register_local_tool(def: ToolDef) {
+    local_tools().write().await.insert(def.name.clone(), def);
+}
+
+/// Добавить инструменты в сессию (например, при подключении удалённого хоста,
+/// инструменты которого привязаны к этому коннекту/сессии).
+pub async fn add_session_tools(session_id: &str, defs: Vec<ToolDef>) {
+    let mut map = session_tools().write().await;
+    let entry = map.entry(session_id.to_string()).or_default();
+    for d in defs {
+        entry.insert(d.name.clone(), d);
+    }
+}
+
+/// Инструменты, доступные сессии: <инструменты сессии> + <локальные>,
+/// с приоритетом инструмента сессии при конфликте.
+pub async fn get_session_tools(session_id: &str) -> Vec<ToolDef> {
+    let mut result: HashMap<String, ToolDef> = HashMap::new();
+    // Сначала локальные (будут перекрыты сессионными при конфликте).
+    for (k, v) in local_tools().read().await.iter() {
+        result.insert(k.clone(), v.clone());
+    }
+    // Затем инструменты сессии (перекрывают локальные).
+    if let Some(map) = session_tools().read().await.get(session_id) {
+        for (k, v) in map.iter() {
+            result.insert(k.clone(), v.clone());
+        }
+    }
+    result.into_values().collect()
+}
+
 /// Добавить диалоговое событие в историю сессии (с FIFO-лимитом),
 /// обновить время последнего изменения и пометить сессию как «грязную»
 /// (saver-цикл перепишет её файл).
@@ -633,6 +690,20 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
         _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
     ) -> String {
         get_or_create_current_session(current_session_file()).await
+    }
+
+    async fn get_session_tools(
+        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        session_id: String,
+    ) -> Vec<crate::ai::host::types::ToolDefinition> {
+        let defs = get_session_tools(&session_id).await;
+        defs.into_iter()
+            .map(|d| crate::ai::host::types::ToolDefinition {
+                name: d.name,
+                description: d.description,
+                parameters_json: d.parameters_json,
+            })
+            .collect()
     }
 }
 

@@ -45,37 +45,25 @@ pub async fn init(config_json: String) -> Vec<String> {
 
     {
         let mut status_lock = STATUS.write().unwrap();
-        // Если инструменты не заданы в конфиге — сразу готовы (не ждём
-        // ответа от инструментов, иначе возникает замкнутый круг:
-        // пустой config.tools → нет discovery → нет definition → не Initialized).
-        if config.tools.is_empty() {
-            *status_lock = PluginInitStatus::Initialized;
-            log_info!("[WASM] Агент инициализирован без инструментов (config.tools пуст)");
-            // Публикуем готовность сразу (нет инструментов — ждать нечего).
-            publish_event(&Event {
-                request_id: "-".to_string(),
-                session_id: "-".to_string(),
-                source: format!("{}:{}", PLUGIN_CLASS, config.name),
-                target: "*".to_string(),
-                topic: "status".to_string(),
-                payload: "ready".to_string(),
-            });
-        } else {
-            *status_lock = PluginInitStatus::NotInitializedYet;
-        }
-    }
-
-    // Отправляем discovery запросы инструментам
-    for tool in config.tools {
-        let host_event = Event {
+        // По новой модели инструменты агент получает ДИНАМИЧЕСКИ через
+        // host-control.get_session_tools в момент запроса (пер-сессионно).
+        // Поэтому при init не ждём discovery-ответов — сразу Initialized.
+        // Белый список config.tools фильтрует инструменты при построении
+        // запроса (build_tools_json).
+        *status_lock = PluginInitStatus::Initialized;
+        log_info!(
+            "[WASM] Агент инициализирован (config.tools = {:?})",
+            config.tools
+        );
+        // Публикуем готовность сразу (discovery-цикл не нужен).
+        publish_event(&Event {
             request_id: "-".to_string(),
             session_id: "-".to_string(),
-            source: format!("{}:{}", PLUGIN_CLASS.to_string(), config.name),
-            target: format!("tool:{}", tool),
-            topic: "discovery".to_string(),
-            payload: "".to_string(),
-        };
-        publish_event(&host_event);
+            source: format!("{}:{}", PLUGIN_CLASS, config.name),
+            target: "*".to_string(),
+            topic: "status".to_string(),
+            payload: "ready".to_string(),
+        });
     }
 
     // Возвращаем вектор хосту. Фоновый цикл чтения консоли запускается хостом через run.

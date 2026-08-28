@@ -12,6 +12,9 @@ pub struct Config {
 
     pub logger: LoggerConfig,
 
+    #[serde(default)]
+    pub net: NetConfig,
+
     #[serde(default = "default_session_timeout")]
     pub session_timeout: u64,
     #[serde(default = "default_session_check_period")]
@@ -196,6 +199,42 @@ fn default_session_ttl_secs() -> u64 {
 }
 fn default_save_period_secs() -> u64 {
     1
+}
+
+/// Настройки сетевого моста между экземплярами andychour.
+#[derive(Deserialize, Default, Clone)]
+#[serde(default)]
+pub struct NetConfig {
+    /// Уникальный идентификатор этого узла (для предотвращения циклов).
+    pub node_id: String,
+    /// Порт, на котором хост слушает входящие сетевые события (/net).
+    pub listen_port: u16,
+    /// Секрет для аутентификации входящих соединений.
+    pub token: String,
+    /// Удалённые хосты (персистентные исходящие WS-соединения).
+    pub remotes: Vec<NetRemote>,
+}
+
+/// Один удалённый хост, к которому мост держит персистентное соединение.
+#[derive(Deserialize, Clone)]
+#[serde(default)]
+pub struct NetRemote {
+    /// WS-URL удалённого хоста (напр. "ws://host-b:8092/net").
+    pub url: String,
+    /// Секрет для аутентификации на удалённом хосте.
+    pub token: String,
+    /// Какие target обслуживает удалённый хост (напр. ["tool:calculator"]).
+    pub targets: Vec<String>,
+}
+
+impl Default for NetRemote {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            token: String::new(),
+            targets: Vec::new(),
+        }
+    }
 }
 
 impl Config {

@@ -313,11 +313,48 @@ async fn dispatch_event(
     readiness: &Arc<StartupReadiness>,
     max_events_per_session: usize,
 ) {
+    // ==================== Реестр локальных инструментов =====================
+    // Когда tool-плагин отвечает на discovery (topic:"definition"), хост
+    // запоминает его определение в реестре ЛОКАЛЬНЫХ инструментов. Так
+    // get_session_tools сможет отдать агенту доступные локальные инструменты
+    // (без отдельного discovery-цикла со стороны агента).
+    if event.topic == "definition" && event.source.starts_with("tool:") {
+        // Tool-плагин публикует {name, description, parameters}. Нормализуем в
+        // наш ToolDef (parameters -> parameters_json).
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&event.payload) {
+            let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            if !name.is_empty() {
+                let def = crate::plugin::engine::ToolDef {
+                    name,
+                    description: v.get("description").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                    parameters_json: v.get("parameters").cloned().unwrap_or(serde_json::Value::Null).to_string(),
+                };
+                crate::plugin::engine::register_local_tool(def).await;
+            }
+        }
+    }
+
     // ==================== Агрегация готовности плагинов ====================
     // Хост НЕ знает о семантике плагинов. Он лишь собирает status:"ready"
     // от всех плагинов (кроме источника "host") и, когда готовы все,
     // публикует глобальный host:"status"/"ready" на target:"*".
     if event.topic == "status" && event.payload == "ready" && event.source != "host" {
+        // Для tool-плагинов: запрашиваем их определение (discovery), чтобы
+        // зарегистрировать в реестре ЛОКАЛЬНЫХ инструментов (для
+        // get_session_tools). Tool ответит topic:"definition", перехват
+        // зарегистрирует.
+        if event.source.starts_with("tool:") {
+            let _ = tx
+                .send(Event {
+                    request_id: "-".to_string(),
+                    session_id: "-".to_string(),
+                    source: "host".to_string(),
+                    target: event.source.clone(),
+                    topic: "discovery".to_string(),
+                    payload: "".to_string(),
+                })
+                .await;
+        }
         let all_ready = readiness.record_ready(&event.source).await;
         debug!(
             "[Хост] Плагин {} сообщил о готовности. ready={:?} (ожидается {})",
@@ -383,6 +420,17 @@ async fn dispatch_event(
             "[Хост] Найдены плагины для получения сообщения: {:?}",
             matched_plugins
         );
+
+        // Если локальных получателей нет — пробуем сетевой мост (удалённые
+        // утилиты/агенты). Плагины и шина не знают о сети: это чисто хостовый
+        // транспорт. Событие не должно быть служебным (готовность/печать).
+        let is_serving = event.topic == "status" || event.topic == "print";
+        if matched_plugins.is_empty() && !is_serving {
+            let sent = crate::host::net::forward(&event).await;
+            if sent {
+                continue; // событие ушло по сети, локально обрабатывать нечего
+            }
+        }
 
         for plugin_name in matched_plugins {
             info!("[Хост] Исполнение плагина {} ({:?})", plugin_name, event);

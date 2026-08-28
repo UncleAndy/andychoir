@@ -10,6 +10,14 @@ interface types {
     payload: string,
   }
 
+  // Полное описание инструмента, доступного агенту. Возвращается хостом
+  // в get-session-tools (без отдельного discovery-цикла).
+  record tool-definition {
+    name: string,        // напр. "calculator" или "tool:calculator"
+    description: string,
+    parameters-json: string, // JSON-схема параметров (OpenAI function.parameters)
+  }
+
   // ============================================================================
   // СЛОВАРЬ ТОПИКОВ (event.topic) — ЕДИНЫЙ ДЛЯ ВСЕХ ПЛАГИНОВ И ХОСТА
   // ============================================================================
@@ -60,7 +68,7 @@ interface http {
 // Управление хостом: блокирующие async-ожидания, которые отдают управление
 // wasm-планировщику (чтобы handle_event мог выполняться во время ожидания).
 interface host-control {
-  use types.{event};
+  use types.{event, tool-definition};
 
   // Ждать, пока хост не сообщит, что все плагины готовы (host:"ready").
   // Хост сигналит через Notify. Без блокировки wasm-нити (это async).
@@ -89,6 +97,11 @@ interface host-control {
   // Вернуть текущий session-id для проекта: восстановленный из
   // ~/.andychour/current_session.json (если есть) либо новый.
   get-current-session-id: async func() -> string;
+
+  // Вернуть полные определения инструментов, доступных агенту для ДАННОЙ
+  // сессии: <инструменты сессии> + <локальные инструменты хоста>, после
+  // фильтра белого списка агента. Приоритет у инструмента сессии.
+  get-session-tools: async func(session-id: string) -> list<tool-definition>;
 }
 
 // Регистрация HTTP-слушателей: http-фронт объявляет хосту, какие порты/URI

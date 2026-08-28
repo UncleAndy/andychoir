@@ -105,7 +105,7 @@ pub async fn handle_event(ev: Event) {
         // Текущий запрос пользователя.
         messages.push(serde_json::json!({ "role": "user", "content": user_input }));
 
-        let tools_json = build_tools_json();
+        let tools_json = build_tools_json(&ev, &config).await;
         let first_req = serde_json::json!({
             "model": config.model.model_name,
             "messages": messages,
@@ -169,74 +169,56 @@ pub async fn handle_event(ev: Event) {
                 let arguments_raw = func.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
                 let tool_call_id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
 
-                if name == "calculator" {
-                    // Парсим аргументы: OpenAI может вернуть arguments как
-                    // JSON-объект ИЛИ как JSON-строку (если модель так сформировала).
-                    // Нормализуем в объект.
-                    let args_obj = match &arguments_raw {
-                        serde_json::Value::String(s) => {
-                            serde_json::from_str::<serde_json::Value>(s).unwrap_or(serde_json::json!({}))
-                        }
-                        other => other.clone(),
-                    };
-                    let expression = args_obj
-                        .get("expression")
-                        .and_then(|e| e.as_str())
-                        .unwrap_or("")
-                        .to_string();
-
-                    if expression.is_empty() {
-                        // Не удалось извлечь выражение — не зависаем, вернём ошибку.
-                        log_error!("[WASM] calculator: пустое выражение в arguments={:?}", arguments_raw);
-                        messages.push(serde_json::json!({
-                            "role": "tool",
-                            "tool_call_id": tool_call_id,
-                            "content": "(ошибка: не удалось получить выражение для калькулятора)"
-                        }));
-                        continue;
-                    }
-
-                    // Вызываем tool:calculator через шину событий.
-                    // request_id делаем уникальным для ЭТОГО вызова, чтобы
-                    // wait_for_response не конфликтовал с основным запросом.
-                    let call_request_id = format!("{}:tool:{}", ev.request_id, tool_call_id);
-                    let call_ev = Event {
-                        request_id: call_request_id.clone(),
-                        session_id: ev.session_id.clone(),
-                        source: format!("{}:{}", PLUGIN_CLASS, config.name),
-                        target: "tool:calculator".to_string(),
-                        topic: "request".to_string(),
-                        payload: serde_json::json!({
-                            "expression": expression
-                        }).to_string(),
-                    };
-                    publish_event(&call_ev);
-
-                    // Ждём ответ от инструмента с таймаутом (не зависаем).
-                    let got = crate::ai::host::host_control::wait_for_response_timeout(
-                        call_request_id.clone(),
-                        8000,
-                    ).await;
-
-                    let result = if got {
-                        crate::get_tool_results()
-                            .remove(&call_request_id)
-                            .map(|(_k, v)| v)
-                            .unwrap_or_else(|| "(инструмент не вернул результат)".to_string())
-                    } else {
-                        "(ошибка: таймаут ожидания ответа от инструмента calculator)".to_string()
-                    };
-
-                    log_debug!("[WASM] Результат calculator для {}: {}", tool_call_id, result);
-
-                    // Добавляем в messages пару: уже есть assistant с tool_calls,
-                    // теперь role:"tool" с результатом.
-                    messages.push(serde_json::json!({
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": result
-                    }));
+                if name.is_empty() {
+                    continue;
                 }
+
+                // Парсим аргументы: OpenAI может вернуть arguments как
+                // JSON-объект ИЛИ как JSON-строку. Нормализуем в строку для
+                // payload события (инструмент сам разберёт свой формат).
+                let args_payload = match &arguments_raw {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+
+                // Обобщённый вызов инструмента: target = "tool:<name>".
+                // request_id делаем уникальным для ЭТОГО вызова, чтобы
+                // wait_for_response не конфликтовал с основным запросом.
+                let call_request_id = format!("{}:tool:{}", ev.request_id, tool_call_id);
+                let call_ev = Event {
+                    request_id: call_request_id.clone(),
+                    session_id: ev.session_id.clone(),
+                    source: format!("{}:{}", PLUGIN_CLASS, config.name),
+                    target: format!("tool:{}", name),
+                    topic: "request".to_string(),
+                    payload: args_payload,
+                };
+                publish_event(&call_ev);
+
+                // Ждём ответ от инструмента с таймаутом (не зависаем).
+                let got = crate::ai::host::host_control::wait_for_response_timeout(
+                    call_request_id.clone(),
+                    8000,
+                ).await;
+
+                let result = if got {
+                    crate::get_tool_results()
+                        .remove(&call_request_id)
+                        .map(|(_k, v)| v)
+                        .unwrap_or_else(|| "(инструмент не вернул результат)".to_string())
+                } else {
+                    format!("(ошибка: таймаут ожидания ответа от инструмента {})", name)
+                };
+
+                log_debug!("[WASM] Результат {} для {}: {}", name, tool_call_id, result);
+
+                // Добавляем в messages пару: уже есть assistant с tool_calls,
+                // теперь role:"tool" с результатом.
+                messages.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": result
+                }));
             }
 
             // Повторный запрос к LLM с результатами инструментов.
@@ -285,26 +267,64 @@ pub async fn handle_event(ev: Event) {
 }
 
 /// Построить JSON-описание инструментов для OpenAI-compatible API.
-fn build_tools_json() -> serde_json::Value {
-    serde_json::json!([
-        {
+///
+/// Инструменты берутся ДИНАМИЧЕСКИ у хоста для данной сессии
+/// (get_session_tools: <сессия> + <локальные>, приоритет у сессии), затем
+/// фильтруются белым списком агента (config.tools).
+///
+/// Фильтр (config.tools) — белый список:
+///   - пуст -> НЕТ инструментов (агент ничего не может вызывать);
+///   - содержит "*" (значение ИЛИ маска, напр. "tool:*", "*:calculator") ->
+///     доступ ко всем / по маске;
+///   - иначе — только перечисленные инструменты.
+async fn build_tools_json(ev: &Event, config: &crate::AgentPluginConfig) -> serde_json::Value {
+    let defs = crate::ai::host::host_control::get_session_tools(ev.session_id.clone()).await;
+
+    // Фильтр белого списка агента.
+    let whitelist = &config.tools;
+    let allow_all = whitelist.iter().any(|t| t == "*");
+    let filtered: Vec<_> = defs
+        .into_iter()
+        .filter(|d| {
+            if allow_all {
+                return true;
+            }
+            // match_allowlist: точное имя, или маска с '*'.
+            whitelist.iter().any(|w| wildcard_match(w, &d.name))
+        })
+        .collect();
+
+    let mut arr = Vec::new();
+    for d in filtered {
+        // parameters_json — JSON-схема параметров. Может быть "null" — тогда {}.
+        let params = serde_json::from_str(&d.parameters_json)
+            .unwrap_or(serde_json::json!({ "type": "object" }));
+        arr.push(serde_json::json!({
             "type": "function",
             "function": {
-                "name": "calculator",
-                "description": "Вычисляет математическое выражение и возвращает результат.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "expression": {
-                            "type": "string",
-                            "description": "Математическое выражение, например '2 + 2 * 3'"
-                        }
-                    },
-                    "required": ["expression"]
-                }
+                "name": d.name,
+                "description": d.description,
+                "parameters": params,
             }
-        }
-    ])
+        }));
+    }
+    serde_json::json!(arr)
+}
+
+/// Совпадение имени инструмента с шаблоном, где "*" = любая подстрока.
+fn wildcard_match(pattern: &str, name: &str) -> bool {
+    if pattern == name {
+        return true;
+    }
+    if let Some(idx) = pattern.find('*') {
+        let prefix = &pattern[..idx];
+        let suffix = &pattern[idx + 1..];
+        // "*..." (звёздка в начале) — префиксный матч, "...*" — суффиксный,
+        // "a*b" — по обеим сторонам.
+        name.starts_with(prefix) && name.ends_with(suffix)
+    } else {
+        false
+    }
 }
 
 /// Сформировать событие-ответ и вернуть его.

@@ -107,6 +107,8 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     let _http_handle = andychoir::host::http_server::start_http_servers(tx.clone()).await;
     // Запускаем WS-серверы на портах, зарегистрированных ws-фронтами.
     let _ws_handle = andychoir::host::ws_server::start_ws_servers(tx.clone()).await;
+    // Запускаем сетевой мост (входящий /net + исходящие соединения к remotes).
+    let _net_handle = andychoir::host::net::start_net(tx.clone(), config.net.clone()).await;
 
     // ============ Таймер готовности: ждём status:"ready" от ВСЕХ плагинов ============
     // Если за startup.timeout_secs не все плагины отчитались о готовности —
