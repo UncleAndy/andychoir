@@ -161,6 +161,13 @@ pub struct HistoryConfig {
     /// Файл текущей сессии в домашнем каталоге пользователя.
     #[serde(default = "default_current_session_file")]
     pub current_session_file: String,
+    /// Срок жизни сессии (сек). Сессии, файлы которых старше этого возраста,
+    /// удаляются при загрузке. 0 = отключить чистку.
+    #[serde(default = "default_session_ttl_secs")]
+    pub session_ttl_secs: u64,
+    /// Период автосохранения изменённых сессий на диск (сек).
+    #[serde(default = "default_save_period_secs")]
+    pub save_period_secs: u64,
 }
 
 impl Default for HistoryConfig {
@@ -169,6 +176,8 @@ impl Default for HistoryConfig {
             max_events_per_session: default_history_max_events(),
             dir: default_history_dir(),
             current_session_file: default_current_session_file(),
+            session_ttl_secs: default_session_ttl_secs(),
+            save_period_secs: default_save_period_secs(),
         }
     }
 }
@@ -181,6 +190,12 @@ fn default_history_dir() -> String {
 }
 fn default_current_session_file() -> String {
     "~/.andychour/current_session.json".to_string()
+}
+fn default_session_ttl_secs() -> u64 {
+    604800 // 7 дней
+}
+fn default_save_period_secs() -> u64 {
+    1
 }
 
 impl Config {

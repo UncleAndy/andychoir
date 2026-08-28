@@ -38,12 +38,17 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
         return Err(Box::from(log_res.err().unwrap()));
     }
 
-    // Инициализация истории сессий: путь текущей сессии + загрузка с диска.
+    // Инициализация истории сессий: путь текущей сессии + загрузка с диска
+    // (с TTL-чисткой устаревших файлов).
     andychoir::plugin::engine::set_current_session_file(config.history.current_session_file.clone());
-    andychoir::plugin::engine::load_histories_from_disk(&config.history.dir).await;
+    andychoir::plugin::engine::load_histories_from_disk(
+        &config.history.dir,
+        config.history.session_ttl_secs,
+    )
+    .await;
     info!(
-        "[Хост] История сессий: каталог '{}', файл текущей сессии '{}'",
-        config.history.dir, config.history.current_session_file
+        "[Хост] История сессий: каталог '{}', файл текущей сессии '{}', TTL {}с",
+        config.history.dir, config.history.current_session_file, config.history.session_ttl_secs
     );
 
     let engine = create_engine(&config)?;
@@ -141,13 +146,38 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     }
 
     println!("Хост запущен. Нажмите Ctrl+C или Ctrl-D для выхода.");
+
+    // Фоновый saver-цикл: автосохраняет «грязные» сессии в файл сразу,
+    // не дожидаясь shutdown. Не блокирует основную обработку (только короткий
+    // снимок под read-lock, запись на диск вне lock).
+    let saver_dir = config.history.dir.clone();
+    let save_period = std::time::Duration::from_secs(
+        config.history.save_period_secs.max(1),
+    );
+    let saver_handle = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(save_period).await;
+            let dirty = andychoir::plugin::engine::take_dirty_sessions();
+            for sid in dirty {
+                andychoir::plugin::engine::save_session_to_disk(&saver_dir, &sid).await;
+            }
+        }
+    });
+
     tokio::select! {
         result = tokio::signal::ctrl_c() => result?,
         () = host::console::wait_for_interrupt() => (),
     }
     info!("[Хост] Завершение работы...");
 
+    // Останавливаем saver-цикл.
+    saver_handle.abort();
+
     // Сохраняем истории сессий на диск и текущий session_id.
+    // Сначала дописываем ещё не сохранённые (грязные) сессии.
+    for sid in andychoir::plugin::engine::take_dirty_sessions() {
+        andychoir::plugin::engine::save_session_to_disk(&config.history.dir, &sid).await;
+    }
     andychoir::plugin::engine::save_histories_to_disk(&config.history.dir).await;
     info!("[Хост] Истории сессий сохранены в '{}'", config.history.dir);
 

@@ -102,45 +102,110 @@ pub async fn signal_response(request_id: &str) {
 
 /// Глобальное хранилище историй сессий (вариант A).
 /// session_id -> упорядоченные диалоговые события (request/response).
-static SESSION_HISTORIES: OnceLock<tokio::sync::Mutex<HashMap<String, Vec<Event>>>> =
-    OnceLock::new();
+/// RwLock: много читателей (агент history_get, saver-снимок), редкие короткие
+/// записи (append). Читатели идут параллельно, блокируются только на запись.
+static SESSION_HISTORIES: OnceLock<RwLock<HashMap<String, Vec<Event>>>> = OnceLock::new();
 
-fn session_histories() -> &'static tokio::sync::Mutex<HashMap<String, Vec<Event>>> {
-    SESSION_HISTORIES.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+/// Время последнего изменения каждой сессии (для TTL и решения о сохранении).
+/// std::sync::Mutex: почти всегда пишется append-ом, RwLock выигрыша не даёт.
+static SESSION_MTIME: OnceLock<StdMutex<HashMap<String, std::time::Instant>>> = OnceLock::new();
+
+/// Набор session_id, изменившихся с последнего автосохранения (команда saver-у).
+/// DashSet: конкурентная структура, добавление/чтение без долгих блокировок.
+static DIRTY_SESSIONS: OnceLock<dashmap::DashSet<String>> = OnceLock::new();
+
+fn session_histories() -> &'static RwLock<HashMap<String, Vec<Event>>> {
+    SESSION_HISTORIES.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Добавить диалоговое событие в историю сессии (с FIFO-лимитом).
+fn session_mtimes() -> &'static StdMutex<HashMap<String, std::time::Instant>> {
+    SESSION_MTIME.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn dirty_sessions() -> &'static dashmap::DashSet<String> {
+    DIRTY_SESSIONS.get_or_init(dashmap::DashSet::new)
+}
+
+/// Добавить диалоговое событие в историю сессии (с FIFO-лимитом),
+/// обновить время последнего изменения и пометить сессию как «грязную»
+/// (saver-цикл перепишет её файл).
 pub async fn history_append(session_id: &str, ev: &Event, max_events: usize) {
-    let mut map = session_histories().lock().await;
-    let entries = map.entry(session_id.to_string()).or_default();
-    if entries.len() >= max_events {
-        let overflow = entries.len() - (max_events.saturating_sub(1));
-        entries.drain(..overflow);
+    {
+        let mut map = session_histories().write().await;
+        let entries = map.entry(session_id.to_string()).or_default();
+        if entries.len() >= max_events {
+            let overflow = entries.len() - (max_events.saturating_sub(1));
+            entries.drain(..overflow);
+        }
+        entries.push(ev.clone());
     }
-    entries.push(ev.clone());
+    // Время последнего изменения (микросекунды, отдельный Mutex).
+    if let Ok(mut m) = session_mtimes().lock() {
+        m.insert(session_id.to_string(), std::time::Instant::now());
+    }
+    // Команда saver-у: эта сессия изменилась, её файл надо переписать.
+    dirty_sessions().insert(session_id.to_string());
 }
 
 /// Получить копию истории сессии (в порядке: старые -> новые).
 pub async fn history_get(session_id: &str) -> Vec<Event> {
-    let map = session_histories().lock().await;
+    let map = session_histories().read().await;
     map.get(session_id).cloned().unwrap_or_default()
 }
 
-/// Очистить историю сессии.
+/// Очистить историю сессии (и убрать из набора изменённых).
 pub async fn history_clear(session_id: &str) {
-    let mut map = session_histories().lock().await;
-    map.remove(session_id);
+    {
+        let mut map = session_histories().write().await;
+        map.remove(session_id);
+    }
+    if let Ok(mut m) = session_mtimes().lock() {
+        m.remove(session_id);
+    }
+    dirty_sessions().remove(session_id);
 }
 
 /// Вернуть все истории (для сохранения на диск при shutdown).
 pub async fn history_all() -> HashMap<String, Vec<Event>> {
-    session_histories().lock().await.clone()
+    session_histories().read().await.clone()
 }
 
 /// Загрузить истории в хранилище (при старте из файла).
 pub async fn history_load(data: HashMap<String, Vec<Event>>) {
-    let mut map = session_histories().lock().await;
+    let mut map = session_histories().write().await;
     map.extend(data);
+}
+
+/// Сохранить ОДНУ сессию в файл <dir>/<sid>.json (если она существует).
+/// Используется saver-циклом. Запись на диск ВНЕ lock (только снимок под lock).
+pub async fn save_session_to_disk(dir: &str, sid: &str) {
+    let events: Vec<Event> = {
+        let map = session_histories().read().await;
+        map.get(sid).cloned().unwrap_or_default()
+    };
+    if events.is_empty() {
+        return;
+    }
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let path = format!("{}/{}.json", dir, sid);
+    let evs: Vec<serde_json::Value> = events.iter().map(event_to_value).collect();
+    let data = serde_json::json!({ "session_id": sid, "events": evs });
+    let _ = tokio::fs::write(&path, data.to_string()).await;
+}
+
+/// Забрать (drain) набор «грязных» сессий для автосохранения.
+/// Возвращает список session_id, файлы которых нужно переписать.
+pub fn take_dirty_sessions() -> Vec<String> {
+    let ids: Vec<String> = dirty_sessions()
+        .iter()
+        .map(|r| r.clone())
+        .collect();
+    for id in &ids {
+        dirty_sessions().remove(id);
+    }
+    ids
 }
 
 /// Сгенерировать новый session_id (хост централизованно).
@@ -258,7 +323,8 @@ pub async fn save_histories_to_disk(dir: &str) {
 }
 
 /// Загрузить все истории из каталога dir (файлы <session_id>.json).
-pub async fn load_histories_from_disk(dir: &str) {
+/// Файлы, чей возраст (mtime) больше ttl_secs, удаляются (0 = не чистить).
+pub async fn load_histories_from_disk(dir: &str, ttl_secs: u64) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -267,6 +333,28 @@ pub async fn load_histories_from_disk(dir: &str) {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
+        }
+        // TTL-чистка: файл старше лимита удаляем и не грузим.
+        if ttl_secs > 0 {
+            let stale = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .map(|modified| {
+                    modified.elapsed().map(|e| e.as_secs() > ttl_secs).unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if stale {
+                let sid_hint = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?")
+                    .to_string();
+                info!(
+                    "[Хост] Удалена устаревшая сессия {} (возраст > TTL {}с)",
+                    sid_hint, ttl_secs
+                );
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
         }
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
@@ -800,5 +888,87 @@ mod tests {
     #[test]
     fn read_denied_when_no_perms() {
         assert!(!can_plugin_read_console(&[], "prompt>"));
+    }
+
+    // --- history / автосохранение / TTL -------------------------------------
+
+    #[tokio::test]
+    async fn history_append_marks_dirty_and_mtime() {
+        let sid = "sess-ttl-1";
+        let ev = Event {
+            request_id: "r".into(),
+            session_id: sid.into(),
+            source: "front:console".into(),
+            target: "agent:*".into(),
+            topic: "request".into(),
+            payload: "hi".into(),
+        };
+        history_append(sid, &ev, 100).await;
+
+        // Сессия попала в «грязные».
+        let dirty = take_dirty_sessions();
+        assert!(dirty.contains(&sid.to_string()), "сессия должна быть грязной");
+
+        // mtime записан.
+        let mtime_set = session_mtimes().lock().unwrap().contains_key(sid);
+        assert!(mtime_set);
+
+        // dirty очистился после take.
+        assert!(!take_dirty_sessions().contains(&sid.to_string()));
+    }
+
+    #[tokio::test]
+    async fn save_session_to_disk_writes_file() {
+        let sid = "sess-save-test";
+        let ev = Event {
+            request_id: "r".into(),
+            session_id: sid.into(),
+            source: "front:console".into(),
+            target: "agent:*".into(),
+            topic: "request".into(),
+            payload: "hello".into(),
+        };
+        history_append(sid, &ev, 100).await;
+
+        let dir = "./.test_andychour_sessions";
+        let _ = std::fs::remove_dir_all(dir);
+        save_session_to_disk(dir, sid).await;
+
+        let path = format!("{}/{}.json", dir, sid);
+        assert!(std::path::Path::new(&path).exists(), "файл сессии должен создаться");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["session_id"], sid);
+
+        let _ = std::fs::remove_dir_all(dir);
+        history_clear(sid).await;
+    }
+
+    #[tokio::test]
+    async fn load_cleans_stale_file_over_ttl() {
+        // Создаём старый файл (mtime в прошлом) и свежий.
+        let dir = "./.test_andychour_ttl";
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+
+        let stale = format!("{}/stale.json", dir);
+        std::fs::write(&stale, r#"{"session_id":"stale","events":[]}"#).unwrap();
+        // Откатываем mtime в прошлое (> 1с).
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let filetime = filetime::FileTime::from_system_time(past);
+        let _ = filetime::set_file_mtime(&stale, filetime);
+
+        let fresh = format!("{}/fresh.json", dir);
+        std::fs::write(&fresh, r#"{"session_id":"fresh","events":[]}"#).unwrap();
+
+        // TTL = 60с: stale (1ч) удалится, fresh останется.
+        load_histories_from_disk(dir, 60).await;
+
+        assert!(!std::path::Path::new(&stale).exists(), "старый файл должен удалиться");
+        assert!(std::path::Path::new(&fresh).exists(), "свежий файл должен остаться");
+
+        let _ = std::fs::remove_dir_all(dir);
+        history_clear("stale").await;
+        history_clear("fresh").await;
     }
 }
