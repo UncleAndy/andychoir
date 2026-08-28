@@ -54,6 +54,32 @@ pub struct ChoirHostState {
     pub current_plugin_permissions: Option<Vec<PluginAccess>>,
 }
 
+/// Проверка права плагина на вывод текста в консоль (console_print).
+/// Возвращает true, если среди прав есть `ConsolePrint(max_size)` и длина <= max_size.
+/// Выделено для юнит-тестирования (без состояния хоста).
+pub(crate) fn can_plugin_print(perms: &[PluginAccess], text: &str) -> bool {
+    perms.iter().any(|p| {
+        if let PluginAccess::ConsolePrint(max_size) = p {
+            text.len() <= *max_size as usize
+        } else {
+            false
+        }
+    })
+}
+
+/// Проверка права плагина на чтение из консоли (console_input).
+/// Возвращает true, если среди прав есть `ConsoleInput(prompt)` и prompt совпадает с запрошенным.
+/// Выделено для юнит-тестирования (без состояния хоста).
+pub(crate) fn can_plugin_read_console(perms: &[PluginAccess], prompt: &str) -> bool {
+    perms.iter().any(|p| {
+        if let PluginAccess::ConsoleInput(allowed_prompt) = p {
+            allowed_prompt == prompt
+        } else {
+            false
+        }
+    })
+}
+
 impl crate::ai::host::event_bus::Host for ChoirHostState {
     fn publish_event(&mut self, event: Event) -> () {
         info!("[Хост] Новое входящее событие: {:?}.", event);
@@ -69,18 +95,11 @@ impl crate::ai::host::event_bus::Host for ChoirHostState {
 impl crate::ai::host::console::Host for ChoirHostState {
     fn print_line(&mut self, line: String) -> () {
         // Проверяем права плагина на работу с консолью.
-        let has_access = if let Some(ref perms) = self.current_plugin_permissions {
-            perms.iter().any(|p| {
-                if let PluginAccess::ConsolePrint(max_size) = p {
-                    // Проверяем, совпадает ли текст запроса из плагина с разрешенным в конфиге
-                    line.len() <= *max_size as usize
-                } else {
-                    false
-                }
-            })
-        } else {
-            false
-        };
+        let has_access = self
+            .current_plugin_permissions
+            .as_ref()
+            .map(|perms| can_plugin_print(perms, &line))
+            .unwrap_or(false);
         if !has_access {
             error!("[Хост] Плагин не имеет доступа к выводу консоли с таким размером текста.");
             return ();
@@ -118,18 +137,12 @@ impl crate::ai::host::console::HostWithStore<ChoirHostState> for ChoirHostState 
             // Внутри этого замыкания у нас есть эксклюзивный, временный доступ к состоянию
             let host_state = access.get();
 
-            // Проверяем наличие PluginAccess::Console в его конфиге
-            if let Some(ref perms) = host_state.current_plugin_permissions {
-                return perms.iter().any(|p| {
-                    if let PluginAccess::ConsoleInput(allowed_prompt) = p {
-                        // Проверяем, совпадает ли текст запроса из плагина с разрешенным в конфиге
-                        allowed_prompt == &prompt
-                    } else {
-                        false
-                    }
-                });
-            }
-            false
+            // Проверяем наличие PluginAccess::ConsoleInput в его конфиге
+            host_state
+                .current_plugin_permissions
+                .as_ref()
+                .map(|perms| can_plugin_read_console(perms, &prompt))
+                .unwrap_or(false)
         });
         if !has_access {
             error!("[Хост] Плагин не имеет доступа к чтению консоли с таким промптом.");
@@ -312,4 +325,59 @@ pub async fn new_plugin_store(
     let store = Store::new(engine, host_state);
 
     Ok(store)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- can_plugin_print ----------------------------------------------------
+    #[test]
+    fn print_allowed_when_within_limit() {
+        let perms = vec![PluginAccess::ConsolePrint(10)];
+        assert!(can_plugin_print(&perms, "short"));
+        assert!(can_plugin_print(&perms, "0123456789")); // ровно лимит
+    }
+
+    #[test]
+    fn print_denied_when_over_limit() {
+        let perms = vec![PluginAccess::ConsolePrint(5)];
+        assert!(!can_plugin_print(&perms, "too long"));
+    }
+
+    #[test]
+    fn print_denied_when_no_console_print_perm() {
+        // Есть другие права, но не console_print
+        let perms = vec![PluginAccess::ConsoleInput("prompt>".to_string())];
+        assert!(!can_plugin_print(&perms, "any"));
+    }
+
+    #[test]
+    fn print_denied_when_no_perms() {
+        assert!(!can_plugin_print(&[], "any"));
+    }
+
+    // --- can_plugin_read_console -------------------------------------------
+    #[test]
+    fn read_allowed_when_prompt_matches() {
+        let perms = vec![PluginAccess::ConsoleInput("prompt>".to_string())];
+        assert!(can_plugin_read_console(&perms, "prompt>"));
+    }
+
+    #[test]
+    fn read_denied_when_prompt_differs() {
+        let perms = vec![PluginAccess::ConsoleInput("prompt>".to_string())];
+        assert!(!can_plugin_read_console(&perms, "other>"));
+    }
+
+    #[test]
+    fn read_denied_when_no_console_input_perm() {
+        let perms = vec![PluginAccess::ConsolePrint(100)];
+        assert!(!can_plugin_read_console(&perms, "prompt>"));
+    }
+
+    #[test]
+    fn read_denied_when_no_perms() {
+        assert!(!can_plugin_read_console(&[], "prompt>"));
+    }
 }

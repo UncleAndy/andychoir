@@ -224,9 +224,9 @@ async fn dispatch_event(
     worker_tx: &mpsc::Sender<EventJob>,
     metrics: &Arc<Metrics>,
 ) {
-    let targets = event.target.split_whitespace().collect::<Vec<_>>();
+    let targets = parse_target_names(&event.target);
     for target_pattern in targets {
-        let matched_plugins = match_plugins(plugins, target_pattern).await;
+        let matched_plugins = match_plugins(plugins, &target_pattern).await;
         info!(
             "[Хост] Найдены плагины для получения сообщения: {:?}",
             matched_plugins
@@ -281,25 +281,43 @@ async fn dispatch_event(
     }
 }
 
-async fn match_plugins(plugins: &PluginRegistry, target_pattern: &str) -> Vec<String> {
+/// Чистая (без блокировок) логика матчинга имени плагина по шаблону target.
+/// Выделена из `match_plugins` для юнит-тестирования.
+///
+/// Правила:
+/// - `*`            -> все зарегистрированные плагины
+/// - `"agent:*"`    -> плагины, чьё имя начинается на префикс до `*` (здесь "agent:")
+/// - точное имя    -> только если присутствует в `known`
+pub(crate) fn match_plugin_names(known: &[String], target_pattern: &str) -> Vec<String> {
     if target_pattern == "*" {
-        let lock = plugins.read().await;
-        lock.keys().cloned().collect()
+        known.to_vec()
     } else if target_pattern.contains('*') {
-        let pattern = target_pattern.replace("*", "");
-        let lock = plugins.read().await;
-        lock.keys()
-            .filter(|name| name.starts_with(&pattern))
+        let prefix = target_pattern.replace('*', "");
+        known.iter()
+            .filter(|name| name.starts_with(&prefix))
             .cloned()
             .collect()
+    } else if known.iter().any(|name| name == target_pattern) {
+        vec![target_pattern.to_string()]
     } else {
-        let lock = plugins.read().await;
-        if lock.contains_key(target_pattern) {
-            vec![target_pattern.to_string()]
-        } else {
-            vec![]
-        }
+        vec![]
     }
+}
+
+/// Распарс поля `target` события: несколько имён/масок разделены пробелами.
+/// Выделено для юнит-тестирования.
+pub(crate) fn parse_target_names(target: &str) -> Vec<String> {
+    target
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+async fn match_plugins(plugins: &PluginRegistry, target_pattern: &str) -> Vec<String> {
+    let lock = plugins.read().await;
+    let known: Vec<String> = lock.keys().cloned().collect();
+    drop(lock);
+    match_plugin_names(&known, target_pattern)
 }
 
 async fn store_for_event(
@@ -378,5 +396,97 @@ async fn store_for_event(
             );
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- match_plugin_names -------------------------------------------------
+    #[test]
+    fn match_wildcard_returns_all() {
+        let known = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let got = match_plugin_names(&known, "*");
+        assert_eq!(got.len(), 3);
+        assert!(got.contains(&"a".to_string()));
+        assert!(got.contains(&"b".to_string()));
+        assert!(got.contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn match_prefix_star_returns_matching() {
+        let known = vec![
+            "agent:one".to_string(),
+            "agent:two".to_string(),
+            "tool:calc".to_string(),
+        ];
+        // "agent:*" -> префикс "agent:"
+        let got = match_plugin_names(&known, "agent:*");
+        assert_eq!(got.len(), 2);
+        assert!(got.contains(&"agent:one".to_string()));
+        assert!(got.contains(&"agent:two".to_string()));
+        assert!(!got.contains(&"tool:calc".to_string()));
+    }
+
+    #[test]
+    fn match_exact_name_present() {
+        let known = vec!["front:console".to_string(), "agent:coder".to_string()];
+        let got = match_plugin_names(&known, "front:console");
+        assert_eq!(got, vec!["front:console".to_string()]);
+    }
+
+    #[test]
+    fn match_exact_name_absent_returns_empty() {
+        let known = vec!["front:console".to_string()];
+        // Точное имя, которого нет -> пусто (не искать по подстроке)
+        let got = match_plugin_names(&known, "agent:missing");
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn match_empty_pattern_returns_empty() {
+        let known = vec!["a".to_string()];
+        let got = match_plugin_names(&known, "");
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn match_prefix_with_no_match_returns_empty() {
+        let known = vec!["tool:calc".to_string()];
+        let got = match_plugin_names(&known, "agent:*");
+        assert!(got.is_empty());
+    }
+
+    // --- parse_target_names -------------------------------------------------
+    #[test]
+    fn parse_single_target() {
+        assert_eq!(parse_target_names("front:console"), vec!["front:console".to_string()]);
+    }
+
+    #[test]
+    fn parse_multiple_targets_split_by_whitespace() {
+        let got = parse_target_names("agent:one agent:two tool:calc");
+        assert_eq!(
+            got,
+            vec![
+                "agent:one".to_string(),
+                "agent:two".to_string(),
+                "tool:calc".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_empty_target_returns_empty() {
+        assert!(parse_target_names("").is_empty());
+        assert!(parse_target_names("   ").is_empty());
+    }
+
+    #[test]
+    fn parse_extra_spaces_deduplicated_to_tokens() {
+        // Несколько пробелов между именами -> всё равно 2 токена
+        let got = parse_target_names("a   b");
+        assert_eq!(got, vec!["a".to_string(), "b".to_string()]);
     }
 }
