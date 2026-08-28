@@ -1,6 +1,6 @@
 use crate::ai::host::types::Event;
 use crate::ai::host::event_bus::publish_event;
-use crate::{CalculatorArgs, CONFIG, PLUGIN_NAME};
+use crate::{CalculatorArgs, CONFIG, PLUGIN_NAME, ToolDefinition};
 
 pub async fn handle_event(ev: Event) {
     log_debug!("[WASM] Получен ивент от хоста: {:?}", ev);
@@ -8,14 +8,25 @@ pub async fn handle_event(ev: Event) {
 
     match ev.topic.as_str() {
         "discovery" => {
-            // Отправляем в ответ свой конфиг
+            // Отправляем в ответ свой конфиг.
+            // ВАЖНО: CONFIG — это Mutex<Option<ToolDefinition>; сериализуем
+            // содержимое, а не сам Mutex (иначе будет "null").
+            let cfg_guard = CONFIG.lock().unwrap();
+            let tool_def: ToolDefinition = cfg_guard
+                .clone()
+                .unwrap_or_else(|| ToolDefinition {
+                    name: "calculator".to_string(),
+                    description: String::new(),
+                    parameters: serde_json::Value::Null,
+                });
+            drop(cfg_guard);
             publish_event(&Event {
                 request_id: ev.request_id,
                 session_id: ev.session_id,
                 source: PLUGIN_NAME.to_string(),
                 target: ev.source,
                 topic: "definition".to_string(),
-                payload: serde_json::to_string(&CONFIG).unwrap(),
+                payload: serde_json::to_string(&tool_def).unwrap(),
             });
         }
         // Вычисляем выражение в payload и ответным сообщением отправляем ответ

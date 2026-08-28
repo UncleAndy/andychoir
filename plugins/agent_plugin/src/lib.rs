@@ -48,7 +48,7 @@ pub struct ToolDefinition {
     #[allow(unused)]
     description: String,
     #[allow(unused)]
-    request_format: serde_json::Value,
+    parameters: serde_json::Value,
 }
 
 #[allow(unused_macros)]

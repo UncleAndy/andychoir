@@ -1,0 +1,19 @@
+version: "0.5"
+
+processes:
+  andychoir:
+    command: >
+      nix-shell -p rustup gcc binutils pkg-config openssl wasm-tools
+      --run 'cd /home/hermes/projects/RUST/andychoir &&
+      RUSTUP_HOME=$HOME/.rustup CARGO_HOME=$HOME/.cargo
+      ./target/debug/andychoir --config test_config.yaml'
+    working_dir: "/home/hermes/projects/RUST/andychoir"
+    # Хост блокируется на чтении консоли (front_console run-loop), поэтому
+    # это долгоживущий процесс. restart: "false" — не перезапускать при выходе.
+    restart: "false"
+    availability:
+      rule: "status"
+    log_location: "/home/hermes/projects/RUST/andychoir/logs/andychoir.log"
+
+settings:
+  log_level: "INFO"

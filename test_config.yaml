@@ -1,5 +1,5 @@
 plugins:
-  - file: "./target/wasm32-wasip2/debug/front_console_plugin.wasm"
+  - file: "/home/hermes/projects/RUST/andychoir/plugins/front_console_plugin/target/wasm32-wasip2/debug/front_console_plugin.wasm"
     name: "front:console"
     access:
       - !console_input "prompt>"
@@ -12,13 +12,13 @@ plugins:
         - "system:info"
     allow_background: true
 
-  - file: "./target/wasm32-wasip2/debug/tool_calculator_plugin.wasm"
+  - file: "/home/hermes/projects/RUST/andychoir/plugins/tool_calculator_plugin/target/wasm32-wasip2/debug/tool_calculator_plugin.wasm"
     name: "tool:calculator"
     access: []
     config: {}
     allow_background: false
 
-  - file: "./target/wasm32-wasip2/debug/agent_plugin.wasm"
+  - file: "/home/hermes/projects/RUST/andychoir/plugins/agent_plugin/target/wasm32-wasip2/debug/agent_plugin.wasm"
     name: "agent:demo"
     access: []
     config:

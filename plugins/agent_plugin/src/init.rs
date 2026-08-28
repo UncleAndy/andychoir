@@ -68,14 +68,36 @@ pub fn init_tool(ev: Event) {
     // Обрабатываем ответ от инструмента
     log_debug!("[WASM] Получен ответ от инструмента: {:?}", ev);
 
-    let tool_definition: ToolDefinition = serde_json::from_str(&ev.payload).unwrap();
+    // Безопасный парсинг: payload может быть пустым/null/невалидным JSON
+    // (например, инструмент ещё не проинициализирован). Не паникуем.
+    let tool_definition: ToolDefinition = match serde_json::from_str(&ev.payload) {
+        Ok(td) => td,
+        Err(e) => {
+            log_error!(
+                "[WASM] Не удалось распарсить ToolDefinition от {}: {} (payload={:?})",
+                ev.source,
+                e,
+                ev.payload
+            );
+            return;
+        }
+    };
 
     let tools = get_tools();
     tools.insert(tool_definition.name.clone(), tool_definition);
 
+    // CONFIG может быть ещё не заполнен, если discovery-ответ пришёл
+    // до завершения init() агента. Не паникуем — выходим, статус
+    // обновится при следующем валидном ответе.
     let config = {
         let config_lock = CONFIG.lock().unwrap();
-        config_lock.clone().unwrap()
+        match config_lock.clone() {
+            Some(c) => c,
+            None => {
+                log_debug!("[WASM] CONFIG ещё не готов, пропускаем обновление статуса");
+                return;
+            }
+        }
     };
 
     if tools.len() == config.tools.len() {
