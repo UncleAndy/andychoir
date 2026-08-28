@@ -113,6 +113,28 @@ interface http-server {
   get-listeners: async func() -> list<listener>;
 }
 
+// Регистрация WebSocket-слушателей: ws-фронт объявляет хосту, какие порты/URI
+// слушать. Хост (axum WS-сервер) транслирует входящие WS-сообщения в события
+// шины с source="host:ws", target="<имя плагина>:<port>:<uri>".
+// Одно подключение может вести много сессий (session_id в каждом сообщении);
+// ответы идут на сокет с пометкой session_id и request_id.
+interface ws-server {
+  record ws-listener {
+    port: u16,
+    path: string,
+    target: string,
+  }
+
+  // Зарегистрировать WS-слушатель. Возвращает true при успехе.
+  listen-ws: async func(l: ws-listener) -> bool;
+
+  // Снять WS-слушатель (по порту и пути). Возвращает true при успехе.
+  remove-listener: async func(port: u16, path: string) -> bool;
+
+  // Вернуть список активных слушателей.
+  get-listeners: async func() -> list<ws-listener>;
+}
+
 interface plugin-lifecycle {
   use types.{event};
 
@@ -128,5 +150,6 @@ world host-plugin {
   import http;
   import host-control;
   import http-server;
+  import ws-server;
   export plugin-lifecycle;
 }

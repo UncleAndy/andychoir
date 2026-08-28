@@ -354,7 +354,13 @@ async fn dispatch_event(
             event.clone(),
         )
         .await;
-        if !handled_by_http {
+        // Затем WS-сервер.
+        let handled_by_ws = if handled_by_http {
+            false
+        } else {
+            crate::host::ws_server::deliver_ws_response(&event.request_id, event.clone()).await
+        };
+        if !handled_by_http && !handled_by_ws {
             crate::plugin::engine::signal_response(&event.request_id).await;
         }
     }

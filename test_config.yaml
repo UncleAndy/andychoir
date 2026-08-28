@@ -23,6 +23,16 @@ plugins:
           target: "agent:*"
     allow_background: true
 
+  - file: "plugins/front_ws_plugin/target/wasm32-wasip2/debug/front_ws_plugin.wasm"
+    name: "front:ws"
+    access: []
+    config:
+      listeners:
+        - port: 8091
+          path: "/ws"
+          target: "agent:*"
+    allow_background: true
+
   - file: "plugins/tool_calculator_plugin/target/wasm32-wasip2/debug/tool_calculator_plugin.wasm"
     name: "tool:calculator"
     access: []
@@ -65,4 +75,4 @@ history:
   dir: "./.andychour/sessions"
   current_session_file: "~/.andychour/current_session.json"
   session_ttl_secs: 604800
-  save_period_secs: 1
+  save_period_secs: 5

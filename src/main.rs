@@ -105,6 +105,8 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     // Запускаем HTTP-серверы на портах, зарегистрированных http-фронтами.
     // (front:http в init регистрирует слушатели до host:ready.)
     let _http_handle = andychoir::host::http_server::start_http_servers(tx.clone()).await;
+    // Запускаем WS-серверы на портах, зарегистрированных ws-фронтами.
+    let _ws_handle = andychoir::host::ws_server::start_ws_servers(tx.clone()).await;
 
     // ============ Таймер готовности: ждём status:"ready" от ВСЕХ плагинов ============
     // Если за startup.timeout_secs не все плагины отчитались о готовности —

@@ -221,6 +221,14 @@ pub struct HttpListener {
     pub target: String,
 }
 
+/// Один WebSocket-слушатель, зарегистрированный ws-фронтом.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct WsListener {
+    pub port: u16,
+    pub path: String,
+    pub target: String,
+}
+
 /// Глобальное хранилище HTTP-слушателей: (port, path) -> listener.
 /// Используем std::sync::Mutex (не tokio), чтобы обращение было синхронным
 /// и не зависало внутри axum-обработчика.
@@ -253,6 +261,39 @@ pub fn http_remove(port: u16, path: &str) -> bool {
 /// Список активных слушателей.
 pub fn http_listeners_snapshot() -> Vec<HttpListener> {
     http_listeners().lock().unwrap().values().cloned().collect()
+}
+
+/// Глобальное хранилище WebSocket-слушателей: (port, path) -> listener.
+/// std::sync::Mutex (как у http), чтобы обращение было синхронным.
+static WS_LISTENERS: OnceLock<StdMutex<HashMap<(u16, String), WsListener>>> = OnceLock::new();
+
+fn ws_listeners() -> &'static StdMutex<HashMap<(u16, String), WsListener>> {
+    WS_LISTENERS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// Зарегистрировать WS-слушатель. Возвращает false, если (порт,путь) занят.
+pub fn ws_listen(l: WsListener) -> bool {
+    let key = (l.port, l.path.clone());
+    let mut map = ws_listeners().lock().unwrap();
+    if map.contains_key(&key) {
+        return false;
+    }
+    map.insert(key, l);
+    true
+}
+
+/// Снять WS-слушатель.
+pub fn ws_remove(port: u16, path: &str) -> bool {
+    ws_listeners()
+        .lock()
+        .unwrap()
+        .remove(&(port, path.to_string()))
+        .is_some()
+}
+
+/// Список активных WS-слушателей.
+pub fn ws_listeners_snapshot() -> Vec<WsListener> {
+    ws_listeners().lock().unwrap().values().cloned().collect()
 }
 
 /// Получить (или создать) текущий session_id для проекта.
@@ -648,6 +689,59 @@ impl crate::ai::host::http_server::HostWithStore<ChoirHostState> for ChoirHostSt
     }
 }
 
+// Реализация ws-server: регистрация/снятие WebSocket-слушателей, которые
+// затем обслуживает хостовый axum WS-сервер (transparent transport).
+impl crate::ai::host::ws_server::Host for ChoirHostState {}
+
+impl crate::ai::host::ws_server::HostWithStore<ChoirHostState> for ChoirHostState {
+    async fn listen_ws(
+        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        l: crate::ai::host::ws_server::WsListener,
+    ) -> bool {
+        let port = l.port;
+        let path = l.path.clone();
+        let target = l.target.clone();
+        let listener = WsListener {
+            port: l.port,
+            path: l.path,
+            target: l.target,
+        };
+        let ok = ws_listen(listener);
+        info!(
+            "[Хост] WS-слушатель {}:{}/{} (target={}) -> {}",
+            "0.0.0.0",
+            port,
+            path,
+            target,
+            if ok { "зарегистрирован" } else { "УЖЕ ЗАНЯТ" }
+        );
+        ok
+    }
+
+    async fn remove_listener(
+        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        port: u16,
+        path: String,
+    ) -> bool {
+        let ok = ws_remove(port, &path);
+        info!("[Хост] WS-слушатель {}:{} удалён: {}", port, path, ok);
+        ok
+    }
+
+    async fn get_listeners(
+        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+    ) -> Vec<crate::ai::host::ws_server::WsListener> {
+        ws_listeners_snapshot()
+            .into_iter()
+            .map(|l| crate::ai::host::ws_server::WsListener {
+                port: l.port,
+                path: l.path,
+                target: l.target,
+            })
+            .collect()
+    }
+}
+
 impl WasiView for ChoirHostState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
@@ -697,6 +791,10 @@ pub fn create_linker(engine: &Engine) -> anyhow::Result<Linker<ChoirHostState>> 
         |state| state,
     )?;
     crate::ai::host::http_server::add_to_linker::<ChoirHostState, ChoirHostState>(
+        &mut linker,
+        |state| state,
+    )?;
+    crate::ai::host::ws_server::add_to_linker::<ChoirHostState, ChoirHostState>(
         &mut linker,
         |state| state,
     )?;
