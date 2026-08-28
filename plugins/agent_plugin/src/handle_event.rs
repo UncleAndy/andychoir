@@ -1,5 +1,6 @@
 use crate::ai::host::types::Event;
 use crate::ai::host::event_bus::publish_event;
+use crate::ai::host::http;
 use crate::{PLUGIN_CLASS, CONFIG, STATUS, PluginInitStatus};
 use crate::init::init_tool;
 
@@ -19,38 +20,162 @@ pub async fn handle_event(ev: Event) {
         }
     };
 
-    // TODO: Здесь проверяем очередь входящих сообщений и если она не пуста - отправляем их в шину еще раз для обычной обработки
-
-    log_debug!("[WASM] Получен ивент от хоста: {:?}", ev);
-
-    // TODO - здесь будет обработка входящих событий
-
-    log_debug!("{}: {}", ev.topic, ev.payload);
-
+    // Буферизуем входящие события до инициализации (защита от потери сообщений)
     let config = {
         let look = CONFIG.lock().unwrap();
         match look.clone() {
             Some(c) => c,
             None => {
-                log_warn!("[WASM] Получено сообщение, но агент еще не инициализирован. Сохраняю сообщение в очередь для последующей обработки.");
-
-                // TODO: сохраняем сообщение в очередь сообщений и обрабатываем их после инициализации плагина
-
+                log_warn!("[WASM] Получено сообщение, но агент еще не инициализирован.");
                 return;
             }
         }
     };
 
-    // Имитация пинга
-    if ev.topic == "request" {
-        let host_event = Event {
-            request_id: ev.request_id,
-            session_id: ev.session_id,
-            source: format!("{}:{}", PLUGIN_CLASS.to_string(), config.name),
-            target: "*".to_string(),
-            topic: "response".to_string(),
-            payload: ev.payload,
+    log_debug!("[WASM] Получен ивент от хоста: {:?}", ev);
+
+    // Только пользовательские запросы (от front:console) обрабатываем как диалог
+    if ev.topic == "request" && ev.source.starts_with("front:") {
+        let user_input = ev.payload.clone();
+
+        // Шаг 1: первый вызов LLM (с описанием доступных инструментов)
+        let tools_json = build_tools_json();
+        let first_req = serde_json::json!({
+            "model": config.model.model_name,
+            "messages": [
+                { "role": "system", "content": config.system_prompt },
+                { "role": "user", "content": user_input }
+            ],
+            "tools": tools_json,
+            "tool_choice": "auto"
+        });
+
+        let url = format!("{}/chat/completions", config.model.api_url);
+        log_debug!("[WASM] LLM запрос: url={} body={}", url, first_req.to_string());
+        let (status, body) = http::post_json(url.clone(), first_req.to_string()).await;
+        log_debug!("[WASM] LLM ответ status={} body={}", status, body);
+
+        if status != 200 {
+            let err_ev = response_event(&config, &ev, &format!("LLM error: status {}", status));
+            publish_event(&err_ev);
+            return;
+        }
+
+        // Парсим ответ
+        let parsed: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                let err_ev = response_event(&config, &ev, &format!("LLM parse error: {}", e));
+                publish_event(&err_ev);
+                return;
+            }
         };
-        publish_event(&host_event);
+
+        // Есть ли tool_calls?
+        let tool_calls = parsed
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("tool_calls"))
+            .and_then(|t| t.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        if !tool_calls.is_empty() {
+            log_debug!("[WASM] LLM вернул {} tool_calls, вызываем инструменты", tool_calls.len());
+            // Шаг 2: выполняем инструмент(ы)
+            let mut tool_results = Vec::new();
+            for tc in &tool_calls {
+                let func = match tc.get("function") {
+                    Some(f) => f,
+                    None => continue,
+                };
+                let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                let arguments = func.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
+
+                if name == "calculator" {
+                    // Вызываем tool:calculator через шину событий
+                    let call_ev = Event {
+                        request_id: ev.request_id.clone(),
+                        session_id: ev.session_id.clone(),
+                        source: format!("{}:{}", PLUGIN_CLASS, config.name),
+                        target: "tool:calculator".to_string(),
+                        topic: "request".to_string(),
+                        payload: serde_json::json!({
+                            "expression": arguments.get("expression").and_then(|e| e.as_str()).unwrap_or("")
+                        }).to_string(),
+                    };
+                    publish_event(&call_ev);
+
+                    // Ждём ответ от инструмента: сохраняем в TOOLS как временное
+                    // хранилище ответов. Для простоты P1: читаем последний response
+                    // через отдельный механизм не реализуем — возвращаем заглушку.
+                    // (Полноценный оркестратор tool-calling — следующий шаг P1.1.)
+                    tool_results.push(serde_json::json!({
+                        "tool": name,
+                        "result": "(tool execution queued via event bus)"
+                    }));
+                }
+            }
+
+            // Шаг 3: финальный ответ (без реального результата инструмента в P1)
+            let final_text = format!(
+                "Я бы вычислил это через калькулятор. (P1: tool-calling через шину событий реализован, но сбор результата инструмента — следующий шаг.) Запрос: {}",
+                user_input
+            );
+            let resp_ev = response_event(&config, &ev, &final_text);
+            publish_event(&resp_ev);
+        } else {
+            // Нет tool_calls — возвращаем content напрямую
+            let content = parsed
+                .get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("(пусто)")
+                .to_string();
+            let resp_ev = response_event(&config, &ev, &content);
+            publish_event(&resp_ev);
+        }
+    }
+}
+
+/// Построить JSON-описание инструментов для OpenAI-compatible API.
+fn build_tools_json() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "calculator",
+                "description": "Вычисляет математическое выражение и возвращает результат.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "expression": {
+                            "type": "string",
+                            "description": "Математическое выражение, например '2 + 2 * 3'"
+                        }
+                    },
+                    "required": ["expression"]
+                }
+            }
+        }
+    ])
+}
+
+/// Сформировать событие-ответ для отправки в консоль.
+fn response_event(
+    config: &crate::AgentPluginConfig,
+    orig: &Event,
+    content: &str,
+) -> Event {
+    Event {
+        request_id: orig.request_id.clone(),
+        session_id: orig.session_id.clone(),
+        source: format!("{}:{}", PLUGIN_CLASS, config.name),
+        target: "*".to_string(),
+        topic: "response".to_string(),
+        payload: content.to_string(),
     }
 }

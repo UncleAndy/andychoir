@@ -12,8 +12,15 @@ pub fn init_log(
         .directory(PathBuf::from(config.logs_directory.clone()))
         .basename(config.file_base_name.clone());
 
+    // Подавляем DEBUG-шум wasm-движка (wasmtime/cranelift), чтобы лог
+    // не раздувался до десятков МБ за один запуск. Наш debug остаётся.
+    let level_spec = format!(
+        "{}, wasmtime=warn, cranelift=warn, cranelift_codegen=warn",
+        config.log_level
+    );
+
     // 2. Инициализируем и настраиваем логгер
-    Logger::try_with_str(config.log_level.clone())?
+    Logger::try_with_str(&level_spec)?
         .format(utc_ms_format)
         .log_to_file(file_spec)
         // Настраиваем ротацию через переданные переменные

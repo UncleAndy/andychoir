@@ -48,6 +48,15 @@ interface log {
   error: func(line: string);
 }
 
+// HTTP-прокси: плагин НЕ имеет прямого сетевого доступа (песочница,
+// fail-closed для сети). Все HTTP-запросы идут через хост, который
+// выполняет реальный сетевой вызов и возвращает результат.
+// Узкий контракт: плагин шлёт и получает готовый JSON (OpenAI-compatible LLM).
+interface http {
+  // Выполнить POST с JSON-телом. Возвращает HTTP-статус и тело ответа (как строку).
+  post-json: async func(url: string, json-body: string) -> tuple<u16, string>;
+}
+
 interface plugin-lifecycle {
   use types.{event};
 
@@ -60,5 +69,6 @@ world host-plugin {
   import event-bus;
   import console;
   import log;
+  import http;
   export plugin-lifecycle;
 }

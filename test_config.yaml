@@ -1,5 +1,5 @@
 plugins:
-  - file: "/home/hermes/projects/RUST/andychoir/plugins/front_console_plugin/target/wasm32-wasip2/debug/front_console_plugin.wasm"
+  - file: "plugins/front_console_plugin/target/wasm32-wasip2/debug/front_console_plugin.wasm"
     name: "front:console"
     access:
       - !console_input "prompt>"
@@ -12,25 +12,25 @@ plugins:
         - "system:info"
     allow_background: true
 
-  - file: "/home/hermes/projects/RUST/andychoir/plugins/tool_calculator_plugin/target/wasm32-wasip2/debug/tool_calculator_plugin.wasm"
+  - file: "plugins/tool_calculator_plugin/target/wasm32-wasip2/debug/tool_calculator_plugin.wasm"
     name: "tool:calculator"
     access: []
     config: {}
     allow_background: false
 
-  - file: "/home/hermes/projects/RUST/andychoir/plugins/agent_plugin/target/wasm32-wasip2/debug/agent_plugin.wasm"
+  - file: "plugins/agent_plugin/target/wasm32-wasip2/debug/agent_plugin.wasm"
     name: "agent:demo"
     access: []
     config:
       name: "demo"
       model:
-        model_name: "gpt-4o-mini"
-        api_url: "https://api.openai.com/v1"
+        model_name: "gemma4:cloud"
+        api_url: "http://localhost:11434/v1"
         api_key: null
       system_prompt: "You are a helpful assistant."
       tools:
         - "calculator"
-    allow_background: false
+    allow_background: true
 
 metrics:
   enabled: false
@@ -40,3 +40,8 @@ metrics:
   location: "/metrics"
 
 logger:
+  log_level: "debug"
+  logs_directory: "./logs"
+  file_base_name: "andychoir"
+  max_file_size_bytes: 1048576
+  days_to_keep: 3

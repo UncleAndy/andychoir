@@ -127,6 +127,43 @@ impl crate::ai::host::log::Host for ChoirHostState {
     }
 }
 
+// HTTP-прокси: плагин не имеет прямого сетевого доступа (песочница,
+// fail-closed для сети). Хост выполняет реальный POST-запрос и возвращает
+// (HTTP-статус, тело ответа). Узкий контракт: JSON in / JSON out.
+//
+// wit_bindgen генерирует и `Host` (для синхронных функций интерфейса), и
+// `HostWithStore` (для async). Для async-интерфейса требуются оба трейта,
+// поэтому здесь пустой `Host`, а вся логика — в `HostWithStore` ниже.
+impl crate::ai::host::http::Host for ChoirHostState {}
+
+impl crate::ai::host::http::HostWithStore<ChoirHostState> for ChoirHostState {
+    async fn post_json(
+        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        url: String,
+        json_body: String,
+    ) -> (u16, String) {
+        // TODO(P1): здесь можно добавить проверку прав плагина на сетевой
+        // доступ (PluginAccess::Network) — fail-closed, как для консоли.
+        match reqwest::Client::new()
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body(json_body)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+                (status, body)
+            }
+            Err(e) => {
+                error!("[Хост] HTTP-прокси ошибка запроса к {}: {}", url, e);
+                (0, format!("{{\"error\": \"{}\"}}", e))
+            }
+        }
+    }
+}
+
 impl crate::ai::host::console::HostWithStore<ChoirHostState> for ChoirHostState {
     async fn read_line(
         accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
@@ -193,6 +230,10 @@ pub fn create_linker(engine: &Engine) -> anyhow::Result<Linker<ChoirHostState>> 
         &mut linker,
         |state| state,
     )?;
+    crate::ai::host::http::add_to_linker::<ChoirHostState, ChoirHostState>(
+        &mut linker,
+        |state| state,
+    )?;
 
     Ok(linker)
 }
@@ -246,11 +287,13 @@ fn run_plugin_in_background(
     lifecycle: Guest,
     store: Arc<Mutex<Store<ChoirHostState>>>,
 ) -> BackgroundPluginHandle {
-    let handle_plugin_name = plugin_name.clone();
+    let name_for_spawn = plugin_name.clone();
+    let name_for_return = plugin_name.clone();
     let handle = tokio::spawn(async move {
-        info!("[Хост] Запуск фонового процесса плагина {}...", plugin_name);
+        info!("[Хост] Запуск фонового процесса плагина {}...", name_for_spawn);
 
         let mut store_guard = store.lock().await;
+        debug!("[Хост] Вызов run() для плагина {}", name_for_spawn);
         let run_res = store_guard
             .run_concurrent(async |accessor| lifecycle.call_run(accessor).await)
             .await;
@@ -258,18 +301,18 @@ fn run_plugin_in_background(
         if let Err(err) = run_res {
             error!(
                 "[Хост] Фоновый процесс плагина {} запустился с ошибкой: {:?}",
-                plugin_name, err
+                name_for_spawn, err
             );
         } else {
             info!(
                 "[Хост] Фоновый процесс плагина {} запустился успешно",
-                plugin_name
+                name_for_spawn
             );
         }
     });
 
     BackgroundPluginHandle {
-        plugin_name: handle_plugin_name,
+        plugin_name: name_for_return,
         handle,
     }
 }

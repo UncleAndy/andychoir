@@ -38,13 +38,22 @@ pub async fn init(config_json: String) -> Vec<String> {
     topics_to_subscribe.push(mask_name);
 
     log_debug!(
-        "[WASM] Плагин инициализирован. Запрошено подписок: {}",
-        topics_to_subscribe.len()
+        "[WASM] init: config.tools = {:?}, system_prompt_len = {}",
+        config.tools,
+        config.system_prompt.len()
     );
 
     {
         let mut status_lock = STATUS.write().unwrap();
-        *status_lock = PluginInitStatus::NotInitializedYet;
+        // Если инструменты не заданы в конфиге — сразу готовы (не ждём
+        // ответа от инструментов, иначе возникает замкнутый круг:
+        // пустой config.tools → нет discovery → нет definition → не Initialized).
+        if config.tools.is_empty() {
+            *status_lock = PluginInitStatus::Initialized;
+            log_info!("[WASM] Агент инициализирован без инструментов (config.tools пуст)");
+        } else {
+            *status_lock = PluginInitStatus::NotInitializedYet;
+        }
     }
 
     // Отправляем discovery запросы инструментам
@@ -100,10 +109,19 @@ pub fn init_tool(ev: Event) {
         }
     };
 
-    if tools.len() == config.tools.len() {
-        {
-            let mut status_lock = STATUS.write().unwrap();
-            *status_lock = PluginInitStatus::Initialized;
-        }
+    // Агент считается готовым, когда получил хотя бы одно определение
+    // инструмента (независимо от config.tools.len(), который может быть
+    // пустым из-за особенностей парсинга конфига).
+    let tool_count = tools.len();
+    log_debug!(
+        "[WASM] init_tool: получено определений {}/{}, config.tools.len()={}",
+        tool_count,
+        config.tools.len(),
+        config.tools.len()
+    );
+    if tool_count >= 1 {
+        let mut status_lock = STATUS.write().unwrap();
+        *status_lock = PluginInitStatus::Initialized;
+        log_info!("[WASM] Агент инициализирован (инструментов: {})", tool_count);
     }
 }

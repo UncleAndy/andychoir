@@ -116,7 +116,7 @@ impl Guest for FrontConsolePluginImplementation {
                             request_id: Uuid::new_v4().to_string(),
                             session_id: Uuid::new_v4().to_string(),
                             source: PLUGIN_NAME.to_string(),
-                            target: "*".to_string(),
+                            target: "agent:*".to_string(),
                             topic: "request".to_string(),
                             payload: trimmed.to_string(),
                         };
@@ -142,18 +142,9 @@ impl Guest for FrontConsolePluginImplementation {
             println!("{}", ev.payload);
         }
 
-        // Имитация пинга
-        if ev.topic == "request" {
-            let host_event = Event {
-                request_id: ev.request_id,
-                session_id: ev.session_id,
-                source: PLUGIN_NAME.to_string(),
-                target: "*".to_string(),
-                topic: "print".to_string(),
-                payload: ev.payload,
-            };
-            ai::host::event_bus::publish_event(&host_event);
-        }
+        // NOTE: эхо введённой строки (topic == "request") намеренно убрано —
+        // иначе консоль дублирует пользовательский ввод. Маршрутизацию
+        // пользовательского запроса агенту выполняет фронт в run() (target="agent:*").
     }
 }
 

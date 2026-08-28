@@ -7,7 +7,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use wasmtime::Engine;
 use wasmtime::component::{Component, Linker};
 
-use crate::{error, info, HostPlugin};
+use crate::{error, info, debug, HostPlugin};
 use crate::ai::host::types::Event;
 use crate::exports::ai::host::plugin_lifecycle::Guest;
 use crate::metrics::Metrics;
@@ -201,6 +201,10 @@ async fn process_event_job(
     let _ = store_guard.set_fuel(max_fuel_for_call);
 
     let started_at = std::time::Instant::now();
+    debug!(
+        "[Хост] Вызов handle_event для плагина {}: {:?}",
+        job.plugin_name, job.event
+    );
     let handle_event_res = store_guard
         .run_concurrent(async |accessor| job.lifecycle.call_handle_event(accessor, job.event).await)
         .await;
