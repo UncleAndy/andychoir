@@ -344,9 +344,19 @@ async fn dispatch_event(
 
     // ============ Сигнал ожидающим ответа (host-control.wait-for-response) ===
     // Когда приходит событие topic:"response", будим плагины, ожидающие ответ
-    // на этот request_id (консоль в режимах wait/queue).
+    // на этот request_id (консоль в режимах wait/queue), И отдаём ответ
+    // HTTP-серверу (transparent transport), если он его ждёт.
     if event.topic == "response" {
-        crate::plugin::engine::signal_response(&event.request_id).await;
+        // Сначала пробуем HTTP-сервер (по request_id). Если обработано — пропускаем
+        // консольный сигнал (HTTP-ответ не предназначен консоли).
+        let handled_by_http = crate::host::http_server::deliver_http_response(
+            &event.request_id,
+            event.clone(),
+        )
+        .await;
+        if !handled_by_http {
+            crate::plugin::engine::signal_response(&event.request_id).await;
+        }
     }
 
     // ============ Запись в историю сессии (вариант A) =======================
@@ -436,7 +446,15 @@ pub(crate) fn match_plugin_names(known: &[String], target_pattern: &str) -> Vec<
     } else if known.iter().any(|name| name == target_pattern) {
         vec![target_pattern.to_string()]
     } else {
-        vec![]
+        // Вложенные адреса: плагин "front:http" матчит target "front:http:8090:/query"
+        // (имя плагина + ":" + под-адрес). Это нужно http-фронтам, чтобы события
+        // с (порт, uri) доходили до конкретного плагина.
+        known.iter()
+            .filter(|name| {
+                target_pattern.starts_with(&format!("{}:", name)) || name.as_str() == target_pattern
+            })
+            .cloned()
+            .collect()
     }
 }
 

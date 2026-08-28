@@ -13,6 +13,16 @@ plugins:
       mode: "wait"
     allow_background: true
 
+  - file: "plugins/front_http_plugin/target/wasm32-wasip2/debug/front_http_plugin.wasm"
+    name: "front:http"
+    access: []
+    config:
+      listeners:
+        - port: 8090
+          path: "/query"
+          target: "agent:*"
+    allow_background: true
+
   - file: "plugins/tool_calculator_plugin/target/wasm32-wasip2/debug/tool_calculator_plugin.wasm"
     name: "tool:calculator"
     access: []

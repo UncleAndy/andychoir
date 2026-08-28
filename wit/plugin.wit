@@ -91,6 +91,28 @@ interface host-control {
   get-current-session-id: async func() -> string;
 }
 
+// Регистрация HTTP-слушателей: http-фронт объявляет хосту, какие порты/URI
+// слушать. Хост (axum-сервер) транслирует входящие HTTP-запросы в события
+// шины с source="host:http", target="<имя плагина>:<port>:<uri>".
+// Это позволяет нескольким http-фронтам сосуществовать: события разделяются
+// по (порт, uri) в target.
+interface http-server {
+  record listener {
+    port: u16,
+    path: string,
+    target: string,
+  }
+
+  // Зарегистрировать HTTP-слушатель. Возвращает true при успехе.
+  listen-http: async func(l: listener) -> bool;
+
+  // Снять HTTP-слушатель (по порту и пути). Возвращает true при успехе.
+  remove-listener: async func(port: u16, path: string) -> bool;
+
+  // Вернуть список активных слушателей.
+  get-listeners: async func() -> list<listener>;
+}
+
 interface plugin-lifecycle {
   use types.{event};
 
@@ -105,5 +127,6 @@ world host-plugin {
   import log;
   import http;
   import host-control;
+  import http-server;
   export plugin-lifecycle;
 }

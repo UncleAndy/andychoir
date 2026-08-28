@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::{Mutex as StdMutex, OnceLock};
 
 use tokio::sync::{Mutex, RwLock, Notify, mpsc};
 use tokio::task::JoinHandle;
@@ -146,6 +146,48 @@ pub async fn history_load(data: HashMap<String, Vec<Event>>) {
 /// Сгенерировать новый session_id (хост централизованно).
 pub fn new_session_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// Один HTTP-слушатель, зарегистрированный http-фронтом.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct HttpListener {
+    pub port: u16,
+    pub path: String,
+    pub target: String,
+}
+
+/// Глобальное хранилище HTTP-слушателей: (port, path) -> listener.
+/// Используем std::sync::Mutex (не tokio), чтобы обращение было синхронным
+/// и не зависало внутри axum-обработчика.
+static HTTP_LISTENERS: OnceLock<StdMutex<HashMap<(u16, String), HttpListener>>> = OnceLock::new();
+
+fn http_listeners() -> &'static StdMutex<HashMap<(u16, String), HttpListener>> {
+    HTTP_LISTENERS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// Зарегистрировать HTTP-слушатель. Возвращает false, если (порт,путь) занят.
+pub fn http_listen(l: HttpListener) -> bool {
+    let key = (l.port, l.path.clone());
+    let mut map = http_listeners().lock().unwrap();
+    if map.contains_key(&key) {
+        return false;
+    }
+    map.insert(key, l);
+    true
+}
+
+/// Снять HTTP-слушатель.
+pub fn http_remove(port: u16, path: &str) -> bool {
+    http_listeners()
+        .lock()
+        .unwrap()
+        .remove(&(port, path.to_string()))
+        .is_some()
+}
+
+/// Список активных слушателей.
+pub fn http_listeners_snapshot() -> Vec<HttpListener> {
+    http_listeners().lock().unwrap().values().cloned().collect()
 }
 
 /// Получить (или создать) текущий session_id для проекта.
@@ -465,6 +507,59 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
     }
 }
 
+// Реализация http-server: регистрация/снятие HTTP-слушателей, которые
+// затем обслуживает хостовый axum-сервер (transparent transport).
+impl crate::ai::host::http_server::Host for ChoirHostState {}
+
+impl crate::ai::host::http_server::HostWithStore<ChoirHostState> for ChoirHostState {
+    async fn listen_http(
+        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        l: crate::ai::host::http_server::Listener,
+    ) -> bool {
+        let port = l.port;
+        let path = l.path.clone();
+        let target = l.target.clone();
+        let listener = HttpListener {
+            port: l.port,
+            path: l.path,
+            target: l.target,
+        };
+        let ok = http_listen(listener);
+        info!(
+            "[Хост] HTTP-слушатель {}:{}/{} (target={}) -> {}",
+            "0.0.0.0",
+            port,
+            path,
+            target,
+            if ok { "зарегистрирован" } else { "УЖЕ ЗАНЯТ" }
+        );
+        ok
+    }
+
+    async fn remove_listener(
+        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        port: u16,
+        path: String,
+    ) -> bool {
+        let ok = http_remove(port, &path);
+        info!("[Хост] HTTP-слушатель {}:{} удалён: {}", port, path, ok);
+        ok
+    }
+
+    async fn get_listeners(
+        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+    ) -> Vec<crate::ai::host::http_server::Listener> {
+        http_listeners_snapshot()
+            .into_iter()
+            .map(|l| crate::ai::host::http_server::Listener {
+                port: l.port,
+                path: l.path,
+                target: l.target,
+            })
+            .collect()
+    }
+}
+
 impl WasiView for ChoirHostState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
@@ -510,6 +605,10 @@ pub fn create_linker(engine: &Engine) -> anyhow::Result<Linker<ChoirHostState>> 
         |state| state,
     )?;
     crate::ai::host::host_control::add_to_linker::<ChoirHostState, ChoirHostState>(
+        &mut linker,
+        |state| state,
+    )?;
+    crate::ai::host::http_server::add_to_linker::<ChoirHostState, ChoirHostState>(
         &mut linker,
         |state| state,
     )?;
