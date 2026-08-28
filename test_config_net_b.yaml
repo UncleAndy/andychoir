@@ -1,16 +1,7 @@
 plugins:
-  - file: "plugins/front_console_plugin/target/wasm32-wasip2/debug/front_console_plugin.wasm"
-    name: "front:console"
-    access:
-      - !console_input "prompt>"
-      - !console_print 102400
-    config:
-      subscriptions: ["system:info", "system:error"]
-      targets: ["system:info"]
-      mode: "wait"
-    allow_background: true
-
-  # На хосте B НЕТ локального calculator — он доступен через сетевой мост на A.
+  # Хост B: только агент (удалённый LLM-обработчик).
+  # Агент использует инструмент calculator, который живёт на хосте A
+  # (доступен через сетевой мост, привязывается к сессии динамически).
   - file: "plugins/agent_plugin/target/wasm32-wasip2/debug/agent_plugin.wasm"
     name: "agent:demo"
     access: []
@@ -32,7 +23,7 @@ metrics:
   location: "/metrics"
 
 startup:
-  timeout_secs: 15
+  timeout_secs: 20
 
 logger:
   log_level: "debug"
@@ -48,7 +39,7 @@ history:
   session_ttl_secs: 604800
   save_period_secs: 1
 
-# Хост B: нет локального calculator, подключается к A (где calculator живёт).
+# Хост B: только агент, слушает /net на 8093 и подключается к A (консоль+инструменты).
 net:
   node_id: "host-b"
   listen_port: 8093
@@ -56,4 +47,4 @@ net:
   remotes:
     - url: "ws://127.0.0.1:8092/net"
       token: "secret-a"
-      targets: ["tool:calculator"]
+      targets: ["tool:calculator", "front:console"]

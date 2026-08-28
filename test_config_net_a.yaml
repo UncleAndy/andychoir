@@ -1,12 +1,33 @@
 plugins:
-  # Хост A: только calculator (утилита). Нет agent — поэтому ответы на
-  # tool-вызовы (target=agent:demo) не находят локального получателя и
-  # форвардятся по сети обратно на хост-инициатор B через net-мост.
+  # Хост A: консоль + локальный инструмент calculator.
+  # (Практический сценарий: локальный фронт с утилитами.)
+  - file: "plugins/front_console_plugin/target/wasm32-wasip2/debug/front_console_plugin.wasm"
+    name: "front:console"
+    access:
+      - !console_input "prompt>"
+      - !console_print 102400
+    config:
+      subscriptions: ["system:info", "system:error"]
+      targets: ["system:info"]
+      mode: "wait"
+    allow_background: true
+
   - file: "plugins/tool_calculator_plugin/target/wasm32-wasip2/debug/tool_calculator_plugin.wasm"
     name: "tool:calculator"
     access: []
     config: {}
     allow_background: false
+
+  # Для неинтерактивного теста: HTTP-фронт на A (вместо консоли).
+  - file: "plugins/front_http_plugin/target/wasm32-wasip2/debug/front_http_plugin.wasm"
+    name: "front:http"
+    access: []
+    config:
+      listeners:
+        - port: 8090
+          path: "/query"
+          target: "agent:demo"
+    allow_background: true
 
 metrics:
   enabled: false
@@ -32,9 +53,12 @@ history:
   session_ttl_secs: 604800
   save_period_secs: 1
 
-# Хост A: держит calculator локально, слушает входящий /net на 8092.
+# Хост A: консоль + calculator, слушает /net на 8092 и подключается к B (агенту).
 net:
   node_id: "host-a"
   listen_port: 8092
   token: "secret-a"
-  remotes: []
+  remotes:
+    - url: "ws://127.0.0.1:8093/net"
+      token: "secret-b"
+      targets: ["agent:demo"]
