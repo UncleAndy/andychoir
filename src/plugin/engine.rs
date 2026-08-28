@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, Notify, mpsc};
 use tokio::task::JoinHandle;
 use wasmtime::component::{Component, HasData, Linker, ResourceTable};
 use wasmtime::{Config as WasmtimeConfig, Engine, Store};
@@ -52,6 +53,19 @@ pub struct ChoirHostState {
     table: ResourceTable,
     event_sender: mpsc::Sender<Event>,
     pub current_plugin_permissions: Option<Vec<PluginAccess>>,
+}
+
+/// Глобальный сигнал готовности: хост сигналит, когда все плагины готовы
+/// (host:"ready"). Консоль (и др.) await-ит его через host-control.wait-for-ready.
+static READINESS_NOTIFY: OnceLock<Arc<Notify>> = OnceLock::new();
+
+fn readiness_notify() -> &'static Arc<Notify> {
+    READINESS_NOTIFY.get_or_init(|| Arc::new(Notify::new()))
+}
+
+/// Сигналить ожидающим плагинам, что все плагины готовы. Идемпотентно.
+pub fn signal_host_ready() {
+    readiness_notify().notify_waiters();
 }
 
 /// Проверка права плагина на вывод текста в консоль (console_print).
@@ -190,6 +204,19 @@ impl crate::ai::host::console::HostWithStore<ChoirHostState> for ChoirHostState 
     }
 }
 
+// Реализация host-control.wait-for-ready: блокирует до сигнала готовности.
+impl crate::ai::host::host_control::Host for ChoirHostState {}
+
+impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostState {
+    async fn wait_for_ready(
+        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+    ) {
+        // Отдаём управление планировщику и ждём сигнала от хоста.
+        // notify_waiters() будит ВСЕх ожидающих, поэтому loop безопасен.
+        readiness_notify().notified().await;
+    }
+}
+
 impl WasiView for ChoirHostState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
@@ -231,6 +258,10 @@ pub fn create_linker(engine: &Engine) -> anyhow::Result<Linker<ChoirHostState>> 
         |state| state,
     )?;
     crate::ai::host::http::add_to_linker::<ChoirHostState, ChoirHostState>(
+        &mut linker,
+        |state| state,
+    )?;
+    crate::ai::host::host_control::add_to_linker::<ChoirHostState, ChoirHostState>(
         &mut linker,
         |state| state,
     )?;

@@ -38,6 +38,10 @@ pub async fn handle_event(ev: Event) {
     if ev.topic == "request" && ev.source.starts_with("front:") {
         let user_input = ev.payload.clone();
 
+        // ======= ПРОГРЕСС: сообщаем консоли о начале обработки =======
+        publish_status(&ev, &config, "Обработка запроса...");
+        // ===============================================================
+
         // Шаг 1: первый вызов LLM (с описанием доступных инструментов)
         let tools_json = build_tools_json();
         let first_req = serde_json::json!({
@@ -51,6 +55,7 @@ pub async fn handle_event(ev: Event) {
         });
 
         let url = format!("{}/chat/completions", config.model.api_url);
+        publish_status(&ev, &config, "Обращаюсь к модели LLM...");
         log_debug!("[WASM] LLM запрос: url={} body={}", url, first_req.to_string());
         let (status, body) = http::post_json(url.clone(), first_req.to_string()).await;
         log_debug!("[WASM] LLM ответ status={} body={}", status, body);
@@ -83,6 +88,7 @@ pub async fn handle_event(ev: Event) {
 
         if !tool_calls.is_empty() {
             log_debug!("[WASM] LLM вернул {} tool_calls, вызываем инструменты", tool_calls.len());
+            publish_status(&ev, &config, "Вызываю инструменты...");
             // Шаг 2: выполняем инструмент(ы)
             let mut tool_results = Vec::new();
             for tc in &tool_calls {
@@ -178,4 +184,17 @@ fn response_event(
         topic: "response".to_string(),
         payload: content.to_string(),
     }
+}
+
+/// Опубликовать событие прогресса (topic:"status") с тем же request_id,
+/// чтобы консоль могла показать текущий этап обработки запроса.
+fn publish_status(orig: &Event, config: &crate::AgentPluginConfig, msg: &str) {
+    publish_event(&Event {
+        request_id: orig.request_id.clone(),
+        session_id: orig.session_id.clone(),
+        source: format!("{}:{}", PLUGIN_CLASS, config.name),
+        target: "*".to_string(),
+        topic: "status".to_string(),
+        payload: msg.to_string(),
+    });
 }

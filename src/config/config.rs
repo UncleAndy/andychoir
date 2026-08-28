@@ -26,6 +26,28 @@ pub struct Config {
     pub event_queue_size: usize,
     #[serde(default)]
     pub metrics: MetricsExportConfig,
+    #[serde(default)]
+    pub startup: StartupConfig,
+}
+
+/// Параметры старта (готовность плагинов).
+#[derive(Deserialize)]
+pub struct StartupConfig {
+    /// Сколько секунд ждать готовность ВСЕХ плагинов (их status:"ready").
+    /// Если за это время не все отчитались — хост выходит с ошибкой,
+    /// перечисляя неготовые плагины.
+    #[serde(default = "default_startup_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for StartupConfig {
+    fn default() -> Self {
+        Self { timeout_secs: default_startup_timeout_secs() }
+    }
+}
+
+fn default_startup_timeout_secs() -> u64 {
+    15
 }
 
 #[derive(Deserialize)]

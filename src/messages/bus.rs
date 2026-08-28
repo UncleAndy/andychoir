@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use dashmap::DashMap;
 use tokio::sync::{Mutex, RwLock, Semaphore, mpsc, watch};
@@ -15,6 +17,57 @@ use crate::plugin::engine::{ChoirHostState, PluginInstance, new_plugin_store};
 
 pub type PluginRegistry = Arc<RwLock<HashMap<String, PluginInstance>>>;
 
+/// Агрегатор готовности плагинов (startup).
+/// Хост не знает о семантике конкретных плагинов — только собирает их
+/// status:"ready" и публикует глобальный host:"ready", когда готовы все.
+/// Чистая логика вынесена в `record_ready` для юнит-тестирования.
+pub struct StartupReadiness {
+    ready_sources: Mutex<HashSet<String>>,
+    host_ready_sent: AtomicBool,
+    expected: usize,
+}
+
+impl StartupReadiness {
+    pub fn new(expected: usize) -> Self {
+        Self {
+            ready_sources: Mutex::new(HashSet::new()),
+            host_ready_sent: AtomicBool::new(false),
+            expected,
+        }
+    }
+
+    /// Зарегистрировать источник как готовый. Возвращает true, если после
+    /// этого готовы ВСЕ ожидаемые плагины (expected). Дубликаты безопасны.
+    pub async fn record_ready(&self, source: &str) -> bool {
+        let mut set = self.ready_sources.lock().await;
+        set.insert(source.to_string());
+        set.len() >= self.expected
+    }
+
+    /// true, если глобальный host:"ready" уже отправлен.
+    pub fn ready_sent(&self) -> bool {
+        self.host_ready_sent.load(Ordering::SeqCst)
+    }
+
+    /// Атомарно отметить, что host:"ready" отправлен. Возвращает false,
+    /// если уже был отправлен (защита от повторной отправки).
+    pub fn mark_ready_sent(&self) -> bool {
+        !self.host_ready_sent.swap(true, Ordering::SeqCst)
+    }
+
+    /// Множество источников, уже приславших ready.
+    pub async fn ready_sources(&self) -> Vec<String> {
+        let set = self.ready_sources.lock().await;
+        let mut v: Vec<String> = set.iter().cloned().collect();
+        v.sort();
+        v
+    }
+
+    pub fn expected(&self) -> usize {
+        self.expected
+    }
+}
+
 pub struct EventBusConfig {
     pub event_queue_size: usize,
     pub thread_pool_size: usize,
@@ -22,6 +75,8 @@ pub struct EventBusConfig {
     pub session_timeout: u64,
     pub session_check_period: u64,
     pub metrics: Arc<Metrics>,
+    /// Сколько плагинов ожидается к готовности (startup readiness).
+    pub expected_plugins: usize,
 }
 
 pub struct EventBusHandle {
@@ -29,6 +84,8 @@ pub struct EventBusHandle {
     worker_tx: mpsc::Sender<EventJob>,
     dispatcher_handle: JoinHandle<()>,
     worker_handles: Vec<JoinHandle<()>>,
+    /// Агрегатор готовности старта (для таймера готовности из main).
+    pub readiness: Arc<StartupReadiness>,
 }
 
 struct SessionSlot {
@@ -53,6 +110,9 @@ pub fn start_event_bus(
     config: EventBusConfig,
 ) -> EventBusHandle {
     let stores = Arc::new(DashMap::<(String, String), SessionSlot>::new());
+
+    // Агрегатор готовности старта: ждём status:"ready" от всех плагинов.
+    let readiness = Arc::new(StartupReadiness::new(config.expected_plugins));
 
     let worker_count = config.thread_pool_size.max(1);
     let (worker_tx, worker_rx) = mpsc::channel::<EventJob>(config.event_queue_size);
@@ -128,6 +188,7 @@ pub fn start_event_bus(
     let metrics_loop = config.metrics.clone();
     let event_queue_size = config.event_queue_size;
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let readiness_dispatcher = readiness.clone();
     let dispatcher_handle = tokio::spawn(async move {
         loop {
             let event = tokio::select! {
@@ -154,6 +215,7 @@ pub fn start_event_bus(
                 &tx,
                 &worker_tx_loop,
                 &metrics_loop,
+                &readiness_dispatcher,
             )
             .await;
         }
@@ -166,6 +228,7 @@ pub fn start_event_bus(
         worker_tx,
         dispatcher_handle,
         worker_handles,
+        readiness,
     }
 }
 
@@ -227,7 +290,37 @@ async fn dispatch_event(
     tx: &mpsc::Sender<Event>,
     worker_tx: &mpsc::Sender<EventJob>,
     metrics: &Arc<Metrics>,
+    readiness: &Arc<StartupReadiness>,
 ) {
+    // ==================== Агрегация готовности плагинов ====================
+    // Хост НЕ знает о семантике плагинов. Он лишь собирает status:"ready"
+    // от всех плагинов (кроме источника "host") и, когда готовы все,
+    // публикует глобальный host:"status"/"ready" на target:"*".
+    if event.topic == "status" && event.payload == "ready" && event.source != "host" {
+        let all_ready = readiness.record_ready(&event.source).await;
+        debug!(
+            "[Хост] Плагин {} сообщил о готовности. ready={:?} (ожидается {})",
+            event.source,
+            readiness.ready_sources().await,
+            readiness.expected()
+        );
+        if all_ready && readiness.mark_ready_sent() {
+            info!("[Хост] Все плагины готовы. Публикуем глобальный host:ready.");
+            let _ = tx
+                .send(Event {
+                    request_id: "-".to_string(),
+                    session_id: "-".to_string(),
+                    source: "host".to_string(),
+                    target: "*".to_string(),
+                    topic: "status".to_string(),
+                    payload: "ready".to_string(),
+                })
+                .await;
+            // Сигналим ожидающим плагинам (host-control.wait-for-ready).
+            crate::plugin::engine::signal_host_ready();
+        }
+    }
+
     let targets = parse_target_names(&event.target);
     for target_pattern in targets {
         let matched_plugins = match_plugins(plugins, &target_pattern).await;
@@ -492,5 +585,48 @@ mod tests {
         // Несколько пробелов между именами -> всё равно 2 токена
         let got = parse_target_names("a   b");
         assert_eq!(got, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    // --- StartupReadiness (агрегатор готовности) -----------------------------
+    #[tokio::test]
+    async fn readiness_all_ready_after_expected() {
+        let r = StartupReadiness::new(3);
+        assert!(!r.record_ready("front:console").await);
+        assert!(!r.record_ready("tool:calculator").await);
+        // Третий источник делает всех готовыми.
+        assert!(r.record_ready("agent:demo").await);
+        assert!(!r.ready_sent());
+    }
+
+    #[tokio::test]
+    async fn readiness_duplicates_do_not_inflate_count() {
+        let r = StartupReadiness::new(2);
+        assert!(!r.record_ready("a").await);
+        assert!(!r.record_ready("a").await); // дубликат
+        assert!(r.record_ready("b").await); // теперь 2 уникальных
+    }
+
+    #[tokio::test]
+    async fn readiness_not_ready_until_expected() {
+        let r = StartupReadiness::new(5);
+        for s in ["a", "b", "c", "d"] {
+            assert!(!r.record_ready(s).await);
+        }
+        assert!(r.record_ready("e").await);
+    }
+
+    #[test]
+    fn readiness_mark_ready_sent_only_once() {
+        let r = StartupReadiness::new(1);
+        assert!(r.mark_ready_sent()); // первый раз — Ok
+        assert!(!r.mark_ready_sent()); // повторно — false (защита)
+        assert!(r.ready_sent());
+    }
+
+    #[tokio::test]
+    async fn readiness_zero_expected_is_immediately_ready() {
+        let r = StartupReadiness::new(0);
+        // С zero expected любой источник даёт >= 0.
+        assert!(r.record_ready("x").await);
     }
 }

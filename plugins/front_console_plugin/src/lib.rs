@@ -87,12 +87,33 @@ impl Guest for FrontConsolePluginImplementation {
             topics_to_subscribe.len()
         );
 
+        // Сообщаем хосту о готовности (хост агрегирует и публикует host:"ready").
+        // Само приглашение (prompt>) показываем ТОЛЬКО после host:"ready"
+        // (см. run()), чтобы не спамить промпт до готовности всех плагинов.
+        crate::ai::host::event_bus::publish_event(&Event {
+            request_id: "-".to_string(),
+            session_id: "-".to_string(),
+            source: PLUGIN_NAME.to_string(),
+            target: "*".to_string(),
+            topic: "status".to_string(),
+            payload: "ready".to_string(),
+        });
+
         // Возвращаем вектор хосту. Фоновый цикл чтения консоли запускается хостом через run.
         topics_to_subscribe
     }
 
     async fn run() {
         info!("[WASM] Запуск фонового цикла плагина {}", PLUGIN_NAME);
+
+        // Ждём, пока хост не сообщит, что ВСЕ плагины готовы (host:"ready").
+        // wait-for-ready — это async-вызов к хосту: он отдаёт управление
+        // wasm-планировщику (handle_event может выполняться), а хост сигналит
+        // Notify, когда все плагины готовы. Без блокировки wasm-нити.
+        crate::ai::host::console::print_line("[Система] Загрузка плагинов...");
+        crate::ai::host::host_control::wait_for_ready().await;
+        crate::ai::host::console::print_line("[Система] Все плагины готовы. Можете вводить запросы.");
+
         // Чтение пользовательского ввода из консоли.
         // Получаем нативный InputStream из подсистемы WASI, которую сгенерировал wit-bindgen.
         // В зависимости от вашей версии wit-bindgen путь может быть:
@@ -136,6 +157,13 @@ impl Guest for FrontConsolePluginImplementation {
         debug!("[WASM] Получен ивент от хоста: {:?}", ev);
 
         debug!("{}: {}", ev.topic, ev.payload);
+
+        // Прогресс обработки запроса (от агентов/инструментов) — показываем.
+        // События status с payload=="ready" — это сигналы готовности, НЕ прогресс,
+        // их не печатаем (готовность хост обрабатывает через wait-for-ready).
+        if ev.topic == "status" && ev.payload != "ready" {
+            println!("  ⏳ {}", ev.payload);
+        }
 
         // Если это про печать в консоль - выводим
         if ev.topic == "print" || ev.topic == "response" {

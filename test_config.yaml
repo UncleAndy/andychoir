@@ -39,6 +39,9 @@ metrics:
   update_interval_secs: 15
   location: "/metrics"
 
+startup:
+  timeout_secs: 15
+
 logger:
   log_level: "debug"
   logs_directory: "./logs"

@@ -51,6 +51,15 @@ pub async fn init(config_json: String) -> Vec<String> {
         if config.tools.is_empty() {
             *status_lock = PluginInitStatus::Initialized;
             log_info!("[WASM] Агент инициализирован без инструментов (config.tools пуст)");
+            // Публикуем готовность сразу (нет инструментов — ждать нечего).
+            publish_event(&Event {
+                request_id: "-".to_string(),
+                session_id: "-".to_string(),
+                source: format!("{}:{}", PLUGIN_CLASS, config.name),
+                target: "*".to_string(),
+                topic: "status".to_string(),
+                payload: "ready".to_string(),
+            });
         } else {
             *status_lock = PluginInitStatus::NotInitializedYet;
         }
@@ -123,5 +132,17 @@ pub fn init_tool(ev: Event) {
         let mut status_lock = STATUS.write().unwrap();
         *status_lock = PluginInitStatus::Initialized;
         log_info!("[WASM] Агент инициализирован (инструментов: {})", tool_count);
+
+        // Сообщаем хосту о готовности. Хост агрегирует готовность всех
+        // плагинов и публикует глобальный host:"status"/"ready".
+        let ready_ev = Event {
+            request_id: ev.request_id.clone(),
+            session_id: ev.session_id.clone(),
+            source: format!("{}:{}", PLUGIN_CLASS, config.name),
+            target: "*".to_string(),
+            topic: "status".to_string(),
+            payload: "ready".to_string(),
+        };
+        publish_event(&ready_ev);
     }
 }

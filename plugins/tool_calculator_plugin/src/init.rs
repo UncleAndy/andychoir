@@ -31,6 +31,16 @@ pub async fn init(_config_json: String) -> Vec<String> {
         topics_to_subscribe.len()
     );
 
+    // Сообщаем хосту о готовности (хост агрегирует и публикует host:"ready").
+    crate::ai::host::event_bus::publish_event(&crate::ai::host::types::Event {
+        request_id: "-".to_string(),
+        session_id: "-".to_string(),
+        source: PLUGIN_NAME.to_string(),
+        target: "*".to_string(),
+        topic: "status".to_string(),
+        payload: "ready".to_string(),
+    });
+
     // Возвращаем вектор хосту. Фоновый цикл чтения консоли запускается хостом через run.
     topics_to_subscribe
 }

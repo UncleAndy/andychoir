@@ -10,7 +10,7 @@ use clap::Parser;
 use tokio::sync::mpsc;
 use andychoir::host;
 
-use andychoir::{info};
+use andychoir::{error, info};
 use andychoir::ai::host::types::Event;
 use andychoir::config::Config as AppConfig;
 use andychoir::messages::bus::{EventBusConfig, start_event_bus};
@@ -67,6 +67,10 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     let (tx, rx) = mpsc::channel::<Event>(config.event_queue_size);
     let (plugins, background_plugins) = load_plugins(&config, &engine, &linker, tx.clone()).await?;
 
+    let expected_plugins = plugins.read().await.len();
+    let all_plugin_names: Vec<String> = plugins.read().await.keys().cloned().collect();
+    info!("[Хост] Загружено плагинов: {} (ожидаем готовность всех)", expected_plugins);
+
     let event_bus = start_event_bus(
         plugins,
         rx,
@@ -80,8 +84,48 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
             session_timeout: config.session_timeout,
             session_check_period: config.session_check_period,
             metrics,
+            expected_plugins,
         },
     );
+
+    // ============ Таймер готовности: ждём status:"ready" от ВСЕХ плагинов ============
+    // Если за startup.timeout_secs не все плагины отчитались о готовности —
+    // выходим из приложения с ошибкой и списком неготовых (fail-fast).
+    {
+        let readiness = event_bus.readiness.clone();
+        let all_names = all_plugin_names.clone();
+        let timeout = std::time::Duration::from_secs(config.startup.timeout_secs);
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                if readiness.ready_sent() {
+                    info!("[Хост] Готовность всех плагинов подтверждена.");
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+
+            // Таймаут истёк, а не все готовы.
+            let ready = readiness.ready_sources().await;
+            let not_ready: Vec<&String> = all_names
+                .iter()
+                .filter(|n| !ready.contains(n))
+                .collect();
+            error!(
+                "[Хост] СТАРТОВЫЙ ТАЙМАУТ ({}с) истёк, не все плагины инициализировались. \
+                 Неготовые плагины: {:?}. Выход.",
+                timeout.as_secs(),
+                not_ready
+            );
+            // Даём время профлашить stderr/лог перед выходом.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::process::exit(1);
+        });
+    }
 
     println!("Хост запущен. Нажмите Ctrl+C или Ctrl-D для выхода.");
     tokio::select! {
