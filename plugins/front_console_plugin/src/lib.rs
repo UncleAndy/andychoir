@@ -31,6 +31,9 @@ const PLUGIN_NAME: &str = "front:console";
 
 static CONFIG: Mutex<Option<FrontConsolePluginConfig>> = Mutex::new(None);
 static SESSIONS: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+/// Текущий session_id сессии (стабилен для всей сессии, меняется только
+/// при чистом старте без сохранённой сессии или по команде /new).
+static CURRENT_SESSION: Mutex<Option<String>> = Mutex::new(None);
 
 const PROMPT: &str = "prompt>";
 
@@ -125,6 +128,24 @@ impl Guest for FrontConsolePluginImplementation {
         crate::ai::host::host_control::wait_for_ready().await;
         crate::ai::host::console::print_line("[Система] Все плагины готовы. Можете вводить запросы.");
 
+        // Восстанавливаем (или создаём) текущую сессию.
+        {
+            let sid = crate::ai::host::host_control::get_current_session_id().await;
+            let mut cur = CURRENT_SESSION.lock().unwrap();
+            *cur = Some(sid.clone());
+            drop(cur);
+
+            // Показываем предыдущую историю сессии (если есть).
+            let history = crate::ai::host::host_control::get_session_history(sid.clone()).await;
+            for ev in &history {
+                if ev.topic == "request" {
+                    println!("> {}", ev.payload);
+                } else if ev.topic == "response" {
+                    println!("{}", ev.payload);
+                }
+            }
+        }
+
         // Чтение пользовательского ввода из консоли с управлением режимами.
         // "wait"/"queue": после отправки запроса НЕ читаем ввод до ответа
         // (нет ни промпта, ни чтения). "direct": ввод всегда доступен.
@@ -157,9 +178,14 @@ impl Guest for FrontConsolePluginImplementation {
                     if trimmed.is_empty() {
                         continue;
                     }
+                    // Команды: /new — новая сессия; /help — справка.
+                    if trimmed.starts_with('/') {
+                        handle_command(&trimmed).await;
+                        continue;
+                    }
                     // Режим direct: сразу отправляем и продолжаем читать.
                     if mode == "direct" {
-                        publish_request(&trimmed);
+                        publish_request(&trimmed).await;
                         continue;
                     }
                     // wait/queue: если уже ждём ответ — копим в очередь (queue)
@@ -170,7 +196,7 @@ impl Guest for FrontConsolePluginImplementation {
                         continue;
                     }
                     // Отправляем первый запрос.
-                    pending_request_id = publish_request(&trimmed);
+                    pending_request_id = publish_request(&trimmed).await;
                     awaiting = true;
                 }
             }
@@ -183,7 +209,7 @@ impl Guest for FrontConsolePluginImplementation {
                 // queue: если есть накопленное — отправляем следующее.
                 if mode == "queue" {
                     while let Some(next) = queue.pop_front() {
-                        pending_request_id = publish_request(&next);
+                        pending_request_id = publish_request(&next).await;
                         crate::ai::host::host_control::wait_for_response(pending_request_id)
                             .await;
                     }
@@ -222,11 +248,17 @@ impl Guest for FrontConsolePluginImplementation {
 export!(FrontConsolePluginImplementation);
 
 /// Отправить пользовательский запрос агенту (target:"agent:*") и вернуть request_id.
-fn publish_request(payload: &str) -> String {
+async fn publish_request(payload: &str) -> String {
     let request_id = Uuid::new_v4().to_string();
+    // Используем стабильный session_id текущей сессии.
+    let session_id = CURRENT_SESSION
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let host_event = Event {
         request_id: request_id.clone(),
-        session_id: Uuid::new_v4().to_string(),
+        session_id,
         source: PLUGIN_NAME.to_string(),
         target: "agent:*".to_string(),
         topic: "request".to_string(),
@@ -234,4 +266,29 @@ fn publish_request(payload: &str) -> String {
     };
     ai::host::event_bus::publish_event(&host_event);
     request_id
+}
+
+/// Обработать команду пользователя (начинается с '/').
+async fn handle_command(cmd: &str) {
+    match cmd {
+        "/new" => {
+            // Новая сессия: очищаем старую историю, генерим новый id.
+            let old = CURRENT_SESSION.lock().unwrap().clone();
+            let new_id = crate::ai::host::host_control::new_session_id().await;
+            if let Some(old_id) = old {
+                crate::ai::host::host_control::clear_session(old_id).await;
+            }
+            let mut cur = CURRENT_SESSION.lock().unwrap();
+            *cur = Some(new_id);
+            println!("[Система] Начата новая сессия.");
+        }
+        "/help" => {
+            println!(
+                "[Система] Команды: /new — начать новую сессию, /help — эта справка."
+            );
+        }
+        _ => {
+            println!("[Система] Неизвестная команда: {} (введите /help)", cmd);
+        }
+    }
 }

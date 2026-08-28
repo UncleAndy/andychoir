@@ -38,6 +38,14 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
         return Err(Box::from(log_res.err().unwrap()));
     }
 
+    // Инициализация истории сессий: путь текущей сессии + загрузка с диска.
+    andychoir::plugin::engine::set_current_session_file(config.history.current_session_file.clone());
+    andychoir::plugin::engine::load_histories_from_disk(&config.history.dir).await;
+    info!(
+        "[Хост] История сессий: каталог '{}', файл текущей сессии '{}'",
+        config.history.dir, config.history.current_session_file
+    );
+
     let engine = create_engine(&config)?;
     let linker = create_linker(&engine)?;
     let metrics = Metrics::new();
@@ -85,6 +93,7 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
             session_check_period: config.session_check_period,
             metrics,
             expected_plugins,
+            max_events_per_session: config.history.max_events_per_session,
         },
     );
 
@@ -133,6 +142,10 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
         () = host::console::wait_for_interrupt() => (),
     }
     info!("[Хост] Завершение работы...");
+
+    // Сохраняем истории сессий на диск и текущий session_id.
+    andychoir::plugin::engine::save_histories_to_disk(&config.history.dir).await;
+    info!("[Хост] Истории сессий сохранены в '{}'", config.history.dir);
 
     drop(tx);
     for background_plugin in background_plugins {

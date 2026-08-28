@@ -77,6 +77,8 @@ pub struct EventBusConfig {
     pub metrics: Arc<Metrics>,
     /// Сколько плагинов ожидается к готовности (startup readiness).
     pub expected_plugins: usize,
+    /// Максимум диалоговых событий на одну сессию (история, FIFO).
+    pub max_events_per_session: usize,
 }
 
 pub struct EventBusHandle {
@@ -92,6 +94,22 @@ struct SessionSlot {
     store: Arc<Mutex<wasmtime::Store<ChoirHostState>>>,
     lifecycle: Guest,
     last_used: std::time::Instant,
+}
+
+/// История одной сессии: упорядоченные диалоговые события (request/response).
+/// Вариант A: хранится в хосте глобально, не привязано к wasm-store.
+pub struct SessionHistory {
+    pub entries: Vec<Event>,
+    pub last_used: std::time::Instant,
+}
+
+impl SessionHistory {
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            last_used: std::time::Instant::now(),
+        }
+    }
 }
 
 struct EventJob {
@@ -113,6 +131,7 @@ pub fn start_event_bus(
 
     // Агрегатор готовности старта: ждём status:"ready" от всех плагинов.
     let readiness = Arc::new(StartupReadiness::new(config.expected_plugins));
+    let max_events_per_session = config.max_events_per_session;
 
     let worker_count = config.thread_pool_size.max(1);
     let (worker_tx, worker_rx) = mpsc::channel::<EventJob>(config.event_queue_size);
@@ -216,6 +235,7 @@ pub fn start_event_bus(
                 &worker_tx_loop,
                 &metrics_loop,
                 &readiness_dispatcher,
+                max_events_per_session,
             )
             .await;
         }
@@ -291,6 +311,7 @@ async fn dispatch_event(
     worker_tx: &mpsc::Sender<EventJob>,
     metrics: &Arc<Metrics>,
     readiness: &Arc<StartupReadiness>,
+    max_events_per_session: usize,
 ) {
     // ==================== Агрегация готовности плагинов ====================
     // Хост НЕ знает о семантике плагинов. Он лишь собирает status:"ready"
@@ -326,6 +347,15 @@ async fn dispatch_event(
     // на этот request_id (консоль в режимах wait/queue).
     if event.topic == "response" {
         crate::plugin::engine::signal_response(&event.request_id).await;
+    }
+
+    // ============ Запись в историю сессии (вариант A) =======================
+    // Копим только диалоговые события (request/response), и только для
+    // непустых session_id. Служебные (discovery/definition/status/print) не
+    // входят в историю диалога. Ограничиваем длину (FIFO-вытеснение).
+    if event.session_id != "-" && (event.topic == "request" || event.topic == "response") {
+        crate::plugin::engine::history_append(&event.session_id, &event, max_events_per_session)
+            .await;
     }
 
     let targets = parse_target_names(&event.target);

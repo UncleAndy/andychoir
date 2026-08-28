@@ -60,6 +60,8 @@ interface http {
 // Управление хостом: блокирующие async-ожидания, которые отдают управление
 // wasm-планировщику (чтобы handle_event мог выполняться во время ожидания).
 interface host-control {
+  use types.{event};
+
   // Ждать, пока хост не сообщит, что все плагины готовы (host:"ready").
   // Хост сигналит через Notify. Без блокировки wasm-нити (это async).
   wait-for-ready: async func();
@@ -68,6 +70,20 @@ interface host-control {
   // request-id. Хост держит карту request_id -> Notify и сигналит при
   // приходе response. Без блокировки wasm-нити (это async).
   wait-for-response: async func(request-id: string);
+
+  // Вернуть историю диалоговых событий сессии (request/response),
+  // сохранённую хостом. Пустой список, если сессии нет.
+  get-session-history: async func(session-id: string) -> list<event>;
+
+  // Очистить историю сессии (для команды /new).
+  clear-session: async func(session-id: string);
+
+  // Сгенерировать новый идентификатор сессии (хост централизованно).
+  new-session-id: async func() -> string;
+
+  // Вернуть текущий session-id для проекта: восстановленный из
+  // ~/.andychour/current_session.json (если есть) либо новый.
+  get-current-session-id: async func() -> string;
 }
 
 interface plugin-lifecycle {

@@ -28,6 +28,8 @@ pub struct Config {
     pub metrics: MetricsExportConfig,
     #[serde(default)]
     pub startup: StartupConfig,
+    #[serde(default)]
+    pub history: HistoryConfig,
 }
 
 /// Параметры старта (готовность плагинов).
@@ -145,6 +147,40 @@ fn default_metrics_update_interval_secs() -> u64 {
 
 fn default_metrics_location() -> String {
     "/metrics".to_string()
+}
+
+/// Настройки истории сессий (вариант A: хост хранит события сессий глобально).
+#[derive(Deserialize)]
+pub struct HistoryConfig {
+    /// Максимум событий на одну сессию (FIFO-вытеснение старых).
+    #[serde(default = "default_history_max_events")]
+    pub max_events_per_session: usize,
+    /// Каталог хранения историй (относительный путь, в корне проекта).
+    #[serde(default = "default_history_dir")]
+    pub dir: String,
+    /// Файл текущей сессии в домашнем каталоге пользователя.
+    #[serde(default = "default_current_session_file")]
+    pub current_session_file: String,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            max_events_per_session: default_history_max_events(),
+            dir: default_history_dir(),
+            current_session_file: default_current_session_file(),
+        }
+    }
+}
+
+fn default_history_max_events() -> usize {
+    100
+}
+fn default_history_dir() -> String {
+    "./.andychour/sessions".to_string()
+}
+fn default_current_session_file() -> String {
+    "~/.andychour/current_session.json".to_string()
 }
 
 impl Config {

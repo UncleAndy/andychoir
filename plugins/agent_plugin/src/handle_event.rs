@@ -42,14 +42,33 @@ pub async fn handle_event(ev: Event) {
         publish_status(&ev, &config, "Обработка запроса...");
         // ===============================================================
 
-        // Шаг 1: первый вызов LLM (с описанием доступных инструментов)
+        // Шаг 1: первый вызов LLM (с описанием доступных инструментов).
+        // Подмешиваем историю сессии (request от front -> user, response от
+        // agent -> assistant), чтобы модель помнила предыдущий диалог.
+        let history = crate::ai::host::host_control::get_session_history(ev.session_id.clone()).await;
+        let mut messages = vec![
+            serde_json::json!({ "role": "system", "content": config.system_prompt }),
+        ];
+        for hev in &history {
+            let role = match hev.topic.as_str() {
+                "request" => "user",
+                "response" => "assistant",
+                _ => continue,
+            };
+            // Пропускаем сам текущий запрос (если он уже в истории) — его
+            // добавим отдельно ниже, чтобы не задваивать.
+            if role == "user" && hev.request_id == ev.request_id {
+                continue;
+            }
+            messages.push(serde_json::json!({ "role": role, "content": hev.payload }));
+        }
+        // Текущий запрос пользователя.
+        messages.push(serde_json::json!({ "role": "user", "content": user_input }));
+
         let tools_json = build_tools_json();
         let first_req = serde_json::json!({
             "model": config.model.model_name,
-            "messages": [
-                { "role": "system", "content": config.system_prompt },
-                { "role": "user", "content": user_input }
-            ],
+            "messages": messages,
             "tools": tools_json,
             "tool_choice": "auto"
         });

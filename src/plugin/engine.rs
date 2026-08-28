@@ -100,6 +100,175 @@ pub async fn signal_response(request_id: &str) {
     }
 }
 
+/// Глобальное хранилище историй сессий (вариант A).
+/// session_id -> упорядоченные диалоговые события (request/response).
+static SESSION_HISTORIES: OnceLock<tokio::sync::Mutex<HashMap<String, Vec<Event>>>> =
+    OnceLock::new();
+
+fn session_histories() -> &'static tokio::sync::Mutex<HashMap<String, Vec<Event>>> {
+    SESSION_HISTORIES.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+/// Добавить диалоговое событие в историю сессии (с FIFO-лимитом).
+pub async fn history_append(session_id: &str, ev: &Event, max_events: usize) {
+    let mut map = session_histories().lock().await;
+    let entries = map.entry(session_id.to_string()).or_default();
+    if entries.len() >= max_events {
+        let overflow = entries.len() - (max_events.saturating_sub(1));
+        entries.drain(..overflow);
+    }
+    entries.push(ev.clone());
+}
+
+/// Получить копию истории сессии (в порядке: старые -> новые).
+pub async fn history_get(session_id: &str) -> Vec<Event> {
+    let map = session_histories().lock().await;
+    map.get(session_id).cloned().unwrap_or_default()
+}
+
+/// Очистить историю сессии.
+pub async fn history_clear(session_id: &str) {
+    let mut map = session_histories().lock().await;
+    map.remove(session_id);
+}
+
+/// Вернуть все истории (для сохранения на диск при shutdown).
+pub async fn history_all() -> HashMap<String, Vec<Event>> {
+    session_histories().lock().await.clone()
+}
+
+/// Загрузить истории в хранилище (при старте из файла).
+pub async fn history_load(data: HashMap<String, Vec<Event>>) {
+    let mut map = session_histories().lock().await;
+    map.extend(data);
+}
+
+/// Сгенерировать новый session_id (хост централизованно).
+pub fn new_session_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Получить (или создать) текущий session_id для проекта.
+/// Читает ~/.andychour/current_session.json; если там нет id — генерит новый
+/// и сохраняет. Путь файла настраивается в конфиге (history.current_session_file).
+pub async fn get_or_create_current_session(current_session_file: &str) -> String {
+    let path = expand_tilde(current_session_file);
+    if let Ok(content) = tokio::fs::read_to_string(&path).await {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(id) = v.get("session_id").and_then(|x| x.as_str()) {
+                if !id.is_empty() {
+                    return id.to_string();
+                }
+            }
+        }
+    }
+    let id = new_session_id();
+    save_current_session(current_session_file, &id).await;
+    id
+}
+
+/// Сохранить текущий session_id в ~/.andychour/current_session.json.
+pub async fn save_current_session(current_session_file: &str, id: &str) {
+    let path = expand_tilde(current_session_file);
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            // не критично — просто не сможем сохранить
+        }
+    }
+    let data = serde_json::json!({ "session_id": id });
+    let _ = tokio::fs::write(&path, data.to_string()).await;
+}
+
+/// Развернуть `~` в домашний каталог.
+fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{}/{}", home, rest);
+        }
+    }
+    path.to_string()
+}
+
+/// Путь к файлу текущей сессии (из конфига history.current_session_file),
+/// устанавливается при старте хоста.
+static CURRENT_SESSION_FILE: OnceLock<String> = OnceLock::new();
+
+pub fn set_current_session_file(path: String) {
+    let _ = CURRENT_SESSION_FILE.set(path);
+}
+
+fn current_session_file() -> &'static str {
+    CURRENT_SESSION_FILE.get().map(String::as_str).unwrap_or("~/.andychour/current_session.json")
+}
+
+/// Сохранить все истории сессий в каталог dir как <session_id>.json.
+pub async fn save_histories_to_disk(dir: &str) {
+    let all = history_all().await;
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    for (sid, events) in all {
+        let path = format!("{}/{}.json", dir, sid);
+        let evs: Vec<serde_json::Value> = events.iter().map(event_to_value).collect();
+        let data = serde_json::json!({ "session_id": sid, "events": evs });
+        let _ = tokio::fs::write(&path, data.to_string()).await;
+    }
+}
+
+/// Загрузить все истории из каталога dir (файлы <session_id>.json).
+pub async fn load_histories_from_disk(dir: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut data: HashMap<String, Vec<Event>> = HashMap::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let (Some(sid), Some(evs)) = (
+                v.get("session_id").and_then(|x| x.as_str()),
+                v.get("events").and_then(|x| x.as_array()),
+            ) {
+                let events: Vec<Event> = evs
+                    .iter()
+                    .filter_map(|e| value_to_event(e).ok())
+                    .collect();
+                data.insert(sid.to_string(), events);
+            }
+        }
+    }
+    history_load(data).await;
+}
+
+/// Event -> JSON (WIT record Event не имеет serde derive, конвертируем вручную).
+fn event_to_value(ev: &Event) -> serde_json::Value {
+    serde_json::json!({
+        "request_id": ev.request_id,
+        "session_id": ev.session_id,
+        "source": ev.source,
+        "target": ev.target,
+        "topic": ev.topic,
+        "payload": ev.payload,
+    })
+}
+
+/// JSON -> Event.
+fn value_to_event(v: &serde_json::Value) -> anyhow::Result<Event> {
+    Ok(Event {
+        request_id: v.get("request_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        session_id: v.get("session_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        source: v.get("source").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        target: v.get("target").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        topic: v.get("topic").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        payload: v.get("payload").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+    })
+}
+
 /// Проверка права плагина на вывод текста в консоль (console_print).
 /// Возвращает true, если среди прав есть `ConsolePrint(max_size)` и длина <= max_size.
 /// Выделено для юнит-тестирования (без состояния хоста).
@@ -256,6 +425,32 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
         // Хост сигналит его в signal_response() при приходе topic:"response".
         let notify = register_wait_response(request_id).await;
         notify.notified().await;
+    }
+
+    async fn get_session_history(
+        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        session_id: String,
+    ) -> Vec<crate::ai::host::types::Event> {
+        history_get(&session_id).await
+    }
+
+    async fn clear_session(
+        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        session_id: String,
+    ) {
+        history_clear(&session_id).await;
+    }
+
+    async fn new_session_id(
+        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+    ) -> String {
+        new_session_id()
+    }
+
+    async fn get_current_session_id(
+        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+    ) -> String {
+        get_or_create_current_session(current_session_file()).await
     }
 }
 
