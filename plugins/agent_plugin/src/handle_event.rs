@@ -307,7 +307,13 @@ fn build_tools_json() -> serde_json::Value {
     ])
 }
 
-/// Сформировать событие-ответ для отправки в консоль.
+/// Сформировать событие-ответ и вернуть его.
+///
+/// target ставим = orig.source (конкретный фронт-источник запроса), а НЕ "*"
+/// (broadcast). Так ответ HTTP-запроса уходит только во front:http и НЕ
+/// дублируется в консольном фронтенде; ответ консольного запроса — только в
+/// front:console. Консольный wait_for_response работает по request_id
+/// (host-control.signal_response), поэтому на target он не завязан.
 fn response_event(
     config: &crate::AgentPluginConfig,
     orig: &Event,
@@ -317,20 +323,22 @@ fn response_event(
         request_id: orig.request_id.clone(),
         session_id: orig.session_id.clone(),
         source: format!("{}:{}", PLUGIN_CLASS, config.name),
-        target: "*".to_string(),
+        target: orig.source.clone(),
         topic: "response".to_string(),
         payload: content.to_string(),
     }
 }
 
 /// Опубликовать событие прогресса (topic:"status") с тем же request_id,
-/// чтобы консоль могла показать текущий этап обработки запроса.
+/// чтобы фронт-источник мог показать текущий этап обработки запроса.
+/// target = orig.source (как в response_event): прогресс HTTP-запроса не
+/// должен видеть консольный фронтенд.
 fn publish_status(orig: &Event, config: &crate::AgentPluginConfig, msg: &str) {
     publish_event(&Event {
         request_id: orig.request_id.clone(),
         session_id: orig.session_id.clone(),
         source: format!("{}:{}", PLUGIN_CLASS, config.name),
-        target: "*".to_string(),
+        target: orig.source.clone(),
         topic: "status".to_string(),
         payload: msg.to_string(),
     });

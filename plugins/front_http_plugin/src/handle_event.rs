@@ -97,6 +97,12 @@ pub async fn handle_event(ev: Event) {
         return;
     }
 
+    // События прогресса (status) от агента front:http не обрабатывает —
+    // они нужны только консольному фронтенду. Игнорируем тихо.
+    if ev.topic == "status" {
+        return;
+    }
+
     log_warn!("[WASM] front:http: неизвестный ивент topic={} source={}", ev.topic, ev.source);
 }
 
