@@ -384,6 +384,10 @@ async fn dispatch_event(
     // на этот request_id (консоль в режимах wait/queue), И отдаём ответ
     // HTTP-серверу (transparent transport), если он его ждёт.
     if event.topic == "response" {
+        // Сохраняем payload для агента (take-response-payload), т.к. wasmtime
+        // сериализует handle_event: агент, ожидающий ответ, не может обработать
+        // входящий response в своём же handle_event.
+        crate::plugin::engine::store_response_payload(&event.request_id, &event.payload).await;
         // Сначала пробуем HTTP-сервер (по request_id). Если обработано — пропускаем
         // консольный сигнал (HTTP-ответ не предназначен консоли).
         let handled_by_http = crate::host::http_server::deliver_http_response(

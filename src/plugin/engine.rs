@@ -100,6 +100,26 @@ pub async fn signal_response(request_id: &str) {
     }
 }
 
+/// Payload последнего response по request_id. Сохраняется хостом при приходе
+/// response (для tool-вызовов), читается агентом через take-response-payload.
+/// Нужно, т.к. wasmtime сериализует handle_event: агент, ожидающий ответ в
+/// wait-for-response-timeout, не может обработать входящий response.
+static RESPONSE_PAYLOADS: OnceLock<tokio::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn response_payloads() -> &'static tokio::sync::Mutex<HashMap<String, String>> {
+    RESPONSE_PAYLOADS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+/// Сохранить payload response по request_id (вызывается из bus.rs при response).
+pub async fn store_response_payload(request_id: &str, payload: &str) {
+    response_payloads().lock().await.insert(request_id.to_string(), payload.to_string());
+}
+
+/// Забрать payload ответа (после wait). Возвращает None, если нет.
+pub async fn take_response_payload(request_id: &str) -> Option<String> {
+    response_payloads().lock().await.remove(request_id)
+}
+
 /// Глобальное хранилище историй сессий (вариант A).
 /// session_id -> упорядоченные диалоговые события (request/response).
 /// RwLock: много читателей (агент history_get, saver-снимок), редкие короткие
@@ -666,6 +686,13 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
         tokio::time::timeout(duration, notify.notified()).await.is_ok()
     }
 
+    async fn take_response_payload(
+        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        request_id: String,
+    ) -> Option<String> {
+        take_response_payload(&request_id).await
+    }
+
     async fn get_session_history(
         _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
         session_id: String,
@@ -813,6 +840,36 @@ impl crate::ai::host::ws_server::HostWithStore<ChoirHostState> for ChoirHostStat
     }
 }
 
+// Реализация mcp-transport: плагин mcp:client просит хост открыть stdio-
+// подпроцесс MCP-сервера и обменяться JSON-RPC. Хост — только транспорт.
+impl crate::ai::host::mcp_transport::Host for ChoirHostState {}
+
+impl crate::ai::host::mcp_transport::HostWithStore<ChoirHostState> for ChoirHostState {
+    async fn stdio_open(
+        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        command: String,
+        args: Vec<String>,
+    ) -> String {
+        crate::host::mcp_transport::stdio_open(&command, &args).await
+    }
+
+    async fn request(
+        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        transport_id: String,
+        jsonrpc: String,
+        timeout_ms: u64,
+    ) -> Option<String> {
+        crate::host::mcp_transport::request(&transport_id, &jsonrpc, timeout_ms).await
+    }
+
+    async fn close(
+        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        transport_id: String,
+    ) {
+        crate::host::mcp_transport::close(&transport_id).await;
+    }
+}
+
 impl WasiView for ChoirHostState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
@@ -866,6 +923,10 @@ pub fn create_linker(engine: &Engine) -> anyhow::Result<Linker<ChoirHostState>> 
         |state| state,
     )?;
     crate::ai::host::ws_server::add_to_linker::<ChoirHostState, ChoirHostState>(
+        &mut linker,
+        |state| state,
+    )?;
+    crate::ai::host::mcp_transport::add_to_linker::<ChoirHostState, ChoirHostState>(
         &mut linker,
         |state| state,
     )?;

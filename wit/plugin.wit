@@ -84,6 +84,13 @@ interface host-control {
   // инструмент не отвечает (ошибка/молчание).
   wait-for-response-timeout: async func(request-id: string, timeout-ms: u64) -> bool;
 
+  // Забрать payload ответа на request-id (после wait-for-response-timeout).
+  // Хост сохраняет payload последнего response по request-id при его приходе.
+  // Возвращает None, если ответа нет. Нужно, т.к. wasmtime сериализует
+  // handle_event: агент, ожидающий ответ, не может обработать входящий response
+  // в своём же handle_event, поэтому payload хранится на хосте.
+  take-response-payload: async func(request-id: string) -> option<string>;
+
   // Вернуть историю диалоговых событий сессии (request/response),
   // сохранённую хостом. Пустой список, если сессии нет.
   get-session-history: async func(session-id: string) -> list<event>;
@@ -148,6 +155,24 @@ interface ws-server {
   get-listeners: async func() -> list<ws-listener>;
 }
 
+// Транспорт для MCP-клиента. Плагин mcp:client реализует ЛОГИКУ MCP
+// (initialize, tools/list, tools/call, сессии, протокол JSON-RPC), а хост
+// предоставляет только транспорт: спавнит stdio-подпроцесс сервера / держит
+// HTTP-соединение, гоняет JSON-RPC строки. Плагин не имеет прямого сетевого
+// доступа (песочница), поэтому транспорт — на стороне хоста.
+interface mcp-transport {
+  // Открыть stdio-подпроцесс MCP-сервера. Возвращает transport-id (или "-" при ошибке).
+  stdio-open: async func(command: string, args: list<string>) -> string;
+
+  // Отправить JSON-RPC строку и дождаться ответа с совпадающим id.
+  // Возвращает ответ (строка JSON-RPC) или none при таймауте/ошибке.
+  // timeout-ms — максимальное время ожидания ответа.
+  request: async func(transport-id: string, jsonrpc: string, timeout-ms: u64) -> option<string>;
+
+  // Закрыть транспорт (убить подпроцесс/закрыть соединение).
+  close: async func(transport-id: string);
+}
+
 interface plugin-lifecycle {
   use types.{event};
 
@@ -164,5 +189,6 @@ world host-plugin {
   import host-control;
   import http-server;
   import ws-server;
+  import mcp-transport;
   export plugin-lifecycle;
 }

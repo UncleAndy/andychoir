@@ -18,14 +18,20 @@
         rustDev = pkgs.stdenv.mkDerivation {
           name = "andychoir-rust-dev";
 
-          nativeBuildInputs = with pkgs; [
-            rustup
-            gcc          # C-линковщик (cc) для нативных крейтов хоста
-            binutils     # as/ld для линковки (collect2 spawn)
-            gnumake      # make
-            pkg-config
-            openssl      # для нативных зависимостей (wasmtime, rustyline, tokio)
-            wasm-tools   # сборка/валидация wasm-компонентов
+          nativeBuildInputs = [
+            pkgs.rustup
+            pkgs.gcc          # C-линковщик (cc) для нативных крейтов хоста
+            pkgs.binutils     # as/ld для линковки (collect2 spawn)
+            pkgs.gnumake      # make
+            pkgs.pkg-config
+            pkgs.openssl      # для нативных зависимостей (wasmtime, rustyline, tokio)
+            pkgs.wasm-tools   # сборка/валидация wasm-компонентов
+            pkgs.mcp-nixos
+            pkgs.mcp-server-time
+            pkgs.mcp-server-filesystem
+            pkgs.github-mcp-server
+            pkgs.mcp-server-sequential-thinking
+            pkgs.open-websearch
           ];
 
           # Кастомизируем оболочку: ставим toolchain stable + target wasm32-wasip2

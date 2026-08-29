@@ -1,0 +1,90 @@
+plugins:
+  - file: "plugins/front_console_plugin/target/wasm32-wasip2/debug/front_console_plugin.wasm"
+    name: "front:console"
+    access:
+      - !console_input "prompt>"
+      - !console_print 102400
+    config:
+      subscriptions:
+        - "system:info"
+        - "system:error"
+      targets:
+        - "system:info"
+      mode: "wait"
+    allow_background: true
+
+  # HTTP-фронт для неинтерактивного теста.
+  - file: "plugins/front_http_plugin/target/wasm32-wasip2/debug/front_http_plugin.wasm"
+    name: "front:http"
+    access: []
+    config:
+      listeners:
+        - port: 8090
+          path: "/query"
+          target: "agent:demo"
+    allow_background: true
+
+  # MCP-клиент: обеспечивает подключение к нескольким серверам.
+  - file: "plugins/mcp_client_plugin/target/wasm32-wasip2/debug/mcp_client_plugin.wasm"
+    name: "tool:mcp"
+    access: []
+    config:
+      name: "mcp"
+      servers:
+        - name: "nixos"
+          transport: "stdio"
+          command: "mcp-nixos"
+          args: []
+        - name: "time"
+          transport: "stdio"
+          command: "mcp-server-time"
+          args: []
+        - name: "files"
+          transport: "stdio"
+          command: "mcp-server-filesystem"
+          args: ["/home/andy/projects"]
+    allow_background: true
+
+  # Агент: использует инструменты MCP (mcp:nixos:*).
+  - file: "plugins/agent_plugin/target/wasm32-wasip2/debug/agent_plugin.wasm"
+    name: "agent:demo"
+    access: []
+    config:
+      name: "demo"
+      model:
+        model_name: "gemma4:cloud"
+        api_url: "http://localhost:11434/v1"
+        api_key: null
+      system_prompt: "You are a helpful assistant."
+      tools: ["mcp:*"]
+    allow_background: true
+
+metrics:
+  enabled: false
+  host: "127.0.0.1"
+  port: 9090
+  update_interval_secs: 15
+  location: "/metrics"
+
+startup:
+  timeout_secs: 20
+
+logger:
+  log_level: "debug"
+  logs_directory: "./logs"
+  file_base_name: "andychoir"
+  max_file_size_bytes: 1048576
+  days_to_keep: 3
+
+history:
+  max_events_per_session: 100
+  dir: "./.andychour/sessions"
+  current_session_file: "~/.andychour/current_session.json"
+  session_ttl_secs: 604800
+  save_period_secs: 1
+
+net:
+  node_id: "host-local"
+  listen_port: 0
+  token: []
+  remotes: []
