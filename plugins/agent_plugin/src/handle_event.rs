@@ -243,9 +243,34 @@ pub async fn handle_event(ev: Event) {
                     .and_then(|c| c.get("message"))
                     .and_then(|m| m.get("content"))
                     .and_then(|c| c.as_str())
-                    .unwrap_or("(пусто)")
+                    .unwrap_or("")
                     .to_string();
-                content
+                // Если повторный ответ пуст (LLM снова запросил tool или не дал
+                // текст) — показываем пользователю последнюю ошибку инструмента,
+                // а не пустоту. Ищем в messages последний role:"tool".
+                if content.trim().is_empty() {
+                    let tool_err = messages
+                        .iter()
+                        .rev()
+                        .filter_map(|m| {
+                            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                            if role == "tool" {
+                                m.get("content").and_then(|c| c.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    if !tool_err.trim().is_empty() {
+                        format!("(ошибка инструмента) {}", tool_err)
+                    } else {
+                        "(пусто)".to_string()
+                    }
+                } else {
+                    content
+                }
             } else {
                 format!("Ошибка LLM при обработке результата инструмента: status {}", s2)
             };

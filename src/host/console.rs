@@ -21,9 +21,13 @@ struct ConsoleState {
 
 pub fn print_line(args: fmt::Arguments<'_>) {
     let mut console = CONSOLE.lock().unwrap();
+    // print_line() должен печатать ИМЕННО строку: с завершающим переводом.
+    // rustyline ExternalPrinter печатает без \n, поэтому добавляем его сами —
+    // иначе следующая строка (например промпт) затирает конец вывода.
+    let text = format!("{}\n", args);
 
     if let Some(printer) = &mut console.active_printer {
-        if let Err(err) = printer.print(format!("{}", args)) {
+        if let Err(err) = printer.print(text) {
             eprintln!("[Хост] Ошибка обновления консоли: {:?}", err);
         }
     } else {
