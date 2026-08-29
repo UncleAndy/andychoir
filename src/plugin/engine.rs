@@ -710,7 +710,13 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
     async fn new_session_id(
         _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
     ) -> String {
-        new_session_id()
+        // Генерируем новый id И СРАЗУ сохраняем его в current_session.json.
+        // Иначе при команде /new новый session_id живёт только в памяти плагина,
+        // и после Ctrl-C при следующем входе восстанавливается старый (файл
+        // хранит прежний id).
+        let id = new_session_id();
+        save_current_session(current_session_file(), &id).await;
+        id
     }
 
     async fn get_current_session_id(

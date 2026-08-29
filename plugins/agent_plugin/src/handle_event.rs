@@ -212,14 +212,30 @@ pub async fn handle_event(ev: Event) {
                     format!("(ошибка: таймаут ожидания ответа от инструмента {})", name)
                 };
 
-                log_debug!("[WASM] Результат {} для {}: {}", name, tool_call_id, result);
+                log_debug!("[WASM] Результат {} для {}: {} байт", name, tool_call_id, result.len());
+
+                // Лимит размера результата инструмента (в байтах), который
+                // допускается передавать LLM. По умолчанию 100 КБ.
+                const MAX_TOOL_RESULT_BYTES: usize = 100 * 1024;
+                let result_content = if result.len() > MAX_TOOL_RESULT_BYTES {
+                    // Результат превысил лимит — НЕ передаём его содержимое LLM
+                    // (он раздувает messages и валит ollama), а вместо него
+                    // отправляем уведомление о том, что результат слишком большой.
+                    format!(
+                        "(Результат выполнения инструмента слишком большой: {} байт, лимит {} байт. Содержимое не передано модели.)",
+                        result.len(),
+                        MAX_TOOL_RESULT_BYTES
+                    )
+                } else {
+                    result.clone()
+                };
 
                 // Добавляем в messages пару: уже есть assistant с tool_calls,
                 // теперь role:"tool" с результатом.
                 messages.push(serde_json::json!({
                     "role": "tool",
                     "tool_call_id": tool_call_id,
-                    "content": result
+                    "content": result_content
                 }));
             }
 
@@ -231,7 +247,17 @@ pub async fn handle_event(ev: Event) {
                 "tools": tools_json,
                 "tool_choice": "auto"
             });
-            let (s2, b2) = http::post_json(url.clone(), second_req.to_string()).await;
+            let second_req_str = second_req.to_string();
+            // Логируем тело повторного запроса (для диагностики HTTP 500/ошибок
+            // ollama). Запрос может быть большим — усекаем до лимита.
+            const MAX_LOG_CHARS: usize = 3000;
+            if second_req_str.chars().count() > MAX_LOG_CHARS {
+                let truncated: String = second_req_str.chars().take(MAX_LOG_CHARS).collect();
+                log_debug!("[WASM] LLM повторный запрос (обрезан, {} символов): {}", second_req_str.chars().count(), truncated);
+            } else {
+                log_debug!("[WASM] LLM повторный запрос: {}", second_req_str);
+            }
+            let (s2, b2) = http::post_json(url.clone(), second_req_str).await;
             log_debug!("[WASM] LLM повторный ответ status={} body={}", s2, b2);
 
             let content = if s2 == 200 {
@@ -246,10 +272,10 @@ pub async fn handle_event(ev: Event) {
                     .unwrap_or("")
                     .to_string();
                 // Если повторный ответ пуст (LLM снова запросил tool или не дал
-                // текст) — показываем пользователю последнюю ошибку инструмента,
-                // а не пустоту. Ищем в messages последний role:"tool".
+                // текст) — показываем пользователю последний результат/ошибку
+                // инструмента, а не пустоту. Ищем в messages последний role:"tool".
                 if content.trim().is_empty() {
-                    let tool_err = messages
+                    let tool_last = messages
                         .iter()
                         .rev()
                         .filter_map(|m| {
@@ -263,8 +289,15 @@ pub async fn handle_event(ev: Event) {
                         .next()
                         .unwrap_or("")
                         .to_string();
-                    if !tool_err.trim().is_empty() {
-                        format!("(ошибка инструмента) {}", tool_err)
+                    if !tool_last.trim().is_empty() {
+                        // Если результат инструмента — реальная ошибка (плагин
+                        // пометил её префиксом "(ошибка"), помечаем явно. Иначе —
+                        // это успешный результат, показываем как есть, без ярлыка.
+                        if tool_last.trim_start().starts_with("(ошибка") {
+                            format!("(ошибка инструмента) {}", tool_last)
+                        } else {
+                            tool_last
+                        }
                     } else {
                         "(пусто)".to_string()
                     }
