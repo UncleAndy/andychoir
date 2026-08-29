@@ -1,5 +1,7 @@
 # Architectural Description: Descriptive GUI based on an Event Bus using WebAssembly (WASI Preview 2)
 
+> **Language:** English · [Русский](GUI-concept.ru.md)
+
 ### 1. Conceptual Overview (High-Level Idea)
 The system is a native Rust host application whose logic and interface are
 extended by isolated plugins compiled for the `wasm32-wasip2` target (Wasm

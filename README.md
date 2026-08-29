@@ -1,6 +1,8 @@
 # AndyChoir
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
+> **Language:** English · [Русский](README.ru.md)
+
 Universal constructor for AI agents and orchestrators.
 
 ## Architecture
@@ -44,7 +46,3 @@ This project is dual-licensed under **MIT OR Apache-2.0** (your choice):
 - [Apache License 2.0](LICENSE-APACHE)
 
 You may use the project under whichever license suits you best.
-
-## Russian documentation
-
-Русскоязычная версия документации доступна в [README.ru.md](README.ru.md).

@@ -1,5 +1,7 @@
 # Contributing to AndyChoir
 
+> **Language:** English · [Русский](CONTRIBUTING.ru.md)
+
 Thank you for your interest in the project! Below is how to build, test, and
 make changes.
 
