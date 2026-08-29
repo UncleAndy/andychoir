@@ -10,6 +10,10 @@ pub enum PluginAccess {
     Filesystem(String, String, String), // path, dir_perms, file_perms ("ro", "rw")
     #[serde(rename = "network")]
     Network(Vec<(String, u16)>),
+    // Белый список путей, которые плагин может читать через host-control.read-file.
+    // Каждый элемент — путь к файлу или префикс каталога (все файлы под ним).
+    #[serde(rename = "read_file")]
+    ReadFile(Vec<String>),
 }
 
 #[derive(Deserialize, Clone)]

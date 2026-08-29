@@ -547,6 +547,49 @@ pub(crate) fn can_plugin_read_console(perms: &[PluginAccess], prompt: &str) -> b
     })
 }
 
+/// Привести путь к абсолютному каноническому виду.
+/// Если файл существует — `fs::canonicalize` (резолвит symlink и `..`).
+/// Если нет — канонизируем родительский каталог и джойним имя (чтобы
+/// относительный путь/`..` не могли обойти белый список до создания файла).
+fn canonical_abs(path: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(path);
+    if let Ok(c) = p.canonicalize() {
+        return Some(c);
+    }
+    if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
+        if let Ok(cp) = parent.canonicalize() {
+            return Some(cp.join(name));
+        }
+    }
+    None
+}
+
+/// Проверка права плагина на чтение файла (read_file).
+/// И запрошенный путь, и каждый путь из белого списка приводятся к
+/// абсолютному каноническому виду перед сравнением. Разрешённый путь,
+/// являющийся каталогом, открывает доступ ко всем файлам под ним; путь-файл
+/// требует точного совпадения.
+pub(crate) fn can_plugin_read_file(perms: &[PluginAccess], path: &str) -> bool {
+    let Some(canon) = canonical_abs(path) else { return false };
+    perms.iter().any(|p| {
+        if let PluginAccess::ReadFile(allowed) = p {
+            allowed.iter().any(|a| {
+                if let Some(ca) = canonical_abs(a) {
+                    if ca.is_dir() {
+                        canon.starts_with(&ca)
+                    } else {
+                        canon == ca
+                    }
+                } else {
+                    false
+                }
+            })
+        } else {
+            false
+        }
+    })
+}
+
 impl crate::ai::host::event_bus::Host for ChoirHostState {
     fn publish_event(&mut self, event: Event) -> () {
         info!("[Хост] Новое входящее событие: {:?}.", event);
@@ -774,6 +817,39 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
             access.get().plugin_config.clone().unwrap_or_else(|| "{}".to_string())
         });
         cfg
+    }
+
+    async fn read_file(
+        accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        path: String,
+    ) -> Result<String, String> {
+        // Проверяем право плагина на чтение этого пути (белый список read_file).
+        let has_access = accessor.with(|mut access| {
+            let host_state = access.get();
+            host_state
+                .current_plugin_permissions
+                .as_ref()
+                .map(|perms| can_plugin_read_file(perms, &path))
+                .unwrap_or(false)
+        });
+        if !has_access {
+            return Err(format!("read_file: доступ к '{}' запрещён (нет права read_file)", path));
+        }
+        // Лимит размера файла — защита от чтения гигантских файлов.
+        const MAX_FILE_BYTES: u64 = 1024 * 1024; // 1 МБ
+        let meta = std::fs::metadata(&path)
+            .map_err(|e| format!("read_file: не удалось прочитать метаданные '{}': {}", path, e))?;
+        if !meta.is_file() {
+            return Err(format!("read_file: '{}' не является файлом", path));
+        }
+        if meta.len() > MAX_FILE_BYTES {
+            return Err(format!(
+                "read_file: файл '{}' слишком большой ({} байт, лимит {} байт)",
+                path, meta.len(), MAX_FILE_BYTES
+            ));
+        }
+        std::fs::read_to_string(&path)
+            .map_err(|e| format!("read_file: ошибка чтения '{}': {}", path, e))
     }
 }
 
@@ -1260,5 +1336,85 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
         history_clear("stale").await;
         history_clear("fresh").await;
+    }
+
+    // --- can_plugin_read_file (нормализация путей) -------------------------
+
+    #[test]
+    fn read_file_exact_path_allowed() {
+        // Создаём реальный файл, чтобы canonical_abs резолвил его.
+        let dir = "./.test_readfile_a";
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let f = format!("{}/prompt.md", dir);
+        std::fs::write(&f, "hi").unwrap();
+
+        // Право на тот же файл (абсолютный путь).
+        let abs = std::fs::canonicalize(&f).unwrap().to_string_lossy().to_string();
+        let perms = vec![PluginAccess::ReadFile(vec![abs.clone()])];
+        assert!(can_plugin_read_file(&perms, &abs));
+
+        // Относительный путь к тому же файлу — тоже должен пройти (нормализация).
+        assert!(can_plugin_read_file(&perms, &f));
+
+        // Другой файл — запрещён.
+        let other = format!("{}/other.md", dir);
+        std::fs::write(&other, "x").unwrap();
+        assert!(!can_plugin_read_file(&perms, &other));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_file_dir_prefix_allowed() {
+        let dir = "./.test_readfile_b";
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let f1 = format!("{}/a.md", dir);
+        let f2 = format!("{}/sub/b.md", dir);
+        std::fs::create_dir_all(format!("{}/sub", dir)).unwrap();
+        std::fs::write(&f1, "1").unwrap();
+        std::fs::write(&f2, "2").unwrap();
+
+        // Право на каталог — доступны все файлы под ним.
+        let abs_dir = std::fs::canonicalize(dir).unwrap().to_string_lossy().to_string();
+        let perms = vec![PluginAccess::ReadFile(vec![abs_dir])];
+        assert!(can_plugin_read_file(&perms, &f1));
+        assert!(can_plugin_read_file(&perms, &f2));
+
+        // Файл вне каталога — запрещён (нормализация не даёт обойти через ..).
+        let outside = "./.test_readfile_outside.md";
+        std::fs::write(outside, "x").unwrap();
+        assert!(!can_plugin_read_file(&perms, outside));
+
+        let _ = std::fs::remove_file(outside);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_file_relative_whitelist_matches_absolute_request() {
+        let dir = "./.test_readfile_c";
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let f = format!("{}/prompt.md", dir);
+        std::fs::write(&f, "hi").unwrap();
+
+        // Право задано ОТНОСИТЕЛЬНЫМ путём, запрос — абсолютным (и наоборот).
+        let perms = vec![PluginAccess::ReadFile(vec![f.clone()])];
+        let abs = std::fs::canonicalize(&f).unwrap().to_string_lossy().to_string();
+        assert!(can_plugin_read_file(&perms, &abs));
+
+        let perms_abs = vec![PluginAccess::ReadFile(vec![abs])];
+        assert!(can_plugin_read_file(&perms_abs, &f));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_file_denied_no_perm() {
+        let perms: Vec<PluginAccess> = vec![];
+        assert!(!can_plugin_read_file(&perms, "./README.md"));
+        let perms2 = vec![PluginAccess::ConsolePrint(100)];
+        assert!(!can_plugin_read_file(&perms2, "./README.md"));
     }
 }

@@ -11,6 +11,8 @@ pub struct AgentPluginConfig {
     pub name: String, // Имя агента (например, его роль)
     pub model: ModelConfig, // Только имя модели (определяется в конфиге плагина модели)
     pub system_prompt: String,
+    #[serde(default)]
+    pub system_prompt_file: Option<String>, // путь к файлу с промптом (через host-control.read-file)
     pub tools: Vec<String>, // Только имена инструментов
 }
 

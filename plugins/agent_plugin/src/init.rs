@@ -19,6 +19,7 @@ pub async fn init(config_json: String) -> Vec<String> {
                 api_key: None,
             },
             system_prompt: "".to_string(),
+            system_prompt_file: None,
             tools: vec![],
         });
 

@@ -60,8 +60,17 @@ pub async fn handle_event(ev: Event) {
         // Подмешиваем историю сессии (request от front -> user, response от
         // agent -> assistant), чтобы модель помнила предыдущий диалог.
         let history = crate::ai::host::host_control::get_session_history(ev.session_id.clone()).await;
+        // Системный промпт: из файла (system_prompt_file) или из конфига.
+        // Файл читается через host-control.read-file (с проверкой прав на хосте).
+        let system_prompt = if let Some(ref path) = config.system_prompt_file {
+            crate::ai::host::host_control::read_file(path.clone())
+                .await
+                .unwrap_or_else(|e| format!("(ошибка чтения system_prompt_file '{}': {})", path, e))
+        } else {
+            config.system_prompt.clone()
+        };
         let mut messages = vec![
-            serde_json::json!({ "role": "system", "content": config.system_prompt }),
+            serde_json::json!({ "role": "system", "content": system_prompt }),
         ];
         for hev in &history {
             // Классифицируем событие по источнику, чтобы правильно построить
