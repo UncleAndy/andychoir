@@ -944,13 +944,19 @@ pub async fn load_plugins(
     let mut background_handles = Vec::new();
 
     for plugin in config.plugins.iter() {
+        // Основной экземпляр: init() вызывается ОДИН раз (для подписок и
+        // обработки событий).
         let (subscriptions, lifecycle, store) =
-            load_and_init_plugin(engine, linker, plugin, tx.clone()).await?;
+            load_and_init_plugin(engine, linker, plugin, tx.clone(), true).await?;
         let store = Arc::new(Mutex::new(store));
 
         let background_handle = if plugin.allow_background {
+            // Фоновый экземпляр: нужен ТОЛЬКО для run() (параллельный цикл).
+            // init() НЕ вызываем повторно — иначе плагин (например mcp:client)
+            // повторно спавнит серверы, и появляются дублирующиеся side-эффекты
+            // (заставка MCP-сервера печатается несколько раз).
             let (_, background_lifecycle, background_store) =
-                load_and_init_plugin(engine, linker, plugin, tx.clone()).await?;
+                load_and_init_plugin(engine, linker, plugin, tx.clone(), false).await?;
             Some(run_plugin_in_background(
                 plugin.name.clone(),
                 background_lifecycle,
@@ -1018,6 +1024,7 @@ pub async fn load_and_init_plugin(
     linker: &Linker<ChoirHostState>,
     plugin_config: &PluginConfig,
     event_sender: mpsc::Sender<Event>,
+    call_init: bool,
 ) -> anyhow::Result<(Vec<String>, Guest, Store<ChoirHostState>)> {
     let mut store = new_plugin_store(engine, plugin_config, event_sender).await?;
 
@@ -1026,6 +1033,11 @@ pub async fn load_and_init_plugin(
 
     let plugin = HostPlugin::instantiate_async(&mut store, &component, linker).await?;
     let lifecycle = plugin.ai_host_plugin_lifecycle().clone();
+
+    if !call_init {
+        // Фоновый экземпляр: init() не вызываем (уже вызван в основном).
+        return Ok((Vec::new(), lifecycle, store));
+    }
 
     info!("[Хост] Вызов метода init...");
 

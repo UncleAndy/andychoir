@@ -43,7 +43,9 @@ pub async fn stdio_open(command: &str, args: &[String]) -> String {
     cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit()); // stderr сервера идёт в лог хоста
+        // stderr MCP-сервера отбрасываем: FastMCP печатает туда ASCII-заставку
+        // и логи, которые не должны загрязнять консоль хоста.
+        .stderr(Stdio::null());
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
