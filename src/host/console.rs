@@ -36,6 +36,28 @@ pub fn print_line(args: fmt::Arguments<'_>) {
     }
 }
 
+/// Напечатать Markdown с форматированием (через termimad → ANSI). Вызывается
+/// хостом, когда front:console хочет показать ответ как Markdown.
+/// Рендерим в ANSI-строку и выводим через тот же путь, что print_line
+/// (rustyline ExternalPrinter, если консоль активна; иначе stdout) — чтобы
+/// форматированный вывод не ломал отрисовку промпта.
+pub fn print_markdown(markdown: &str) {
+    // term_text возвращает FmtText (тип с Display) — конвертируем в String.
+    let text = termimad::MadSkin::default_dark().term_text(markdown).to_string();
+    crate::info!(
+        "[Хост] Console: вывод Markdown через termimad ({} байт)",
+        text.len()
+    );
+    let mut console = CONSOLE.lock().unwrap();
+    if let Some(printer) = &mut console.active_printer {
+        if let Err(err) = printer.print(text) {
+            crate::error!("[Хост] Ошибка обновления консоли: {:?}", err);
+        }
+    } else {
+        std_println!("{}", text);
+    }
+}
+
 pub async fn read_prompted_line(prompt: String) -> Option<String> {
     let read_result = tokio::task::spawn_blocking(move || read_line_with_editor(prompt)).await;
 

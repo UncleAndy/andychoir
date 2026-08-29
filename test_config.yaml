@@ -11,6 +11,7 @@ plugins:
       targets:
         - "system:info"
       mode: "wait"
+      markdown: false
     allow_background: true
 
   - file: "plugins/front_http_plugin/target/wasm32-wasip2/debug/front_http_plugin.wasm"

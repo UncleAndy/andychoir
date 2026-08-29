@@ -570,6 +570,21 @@ impl crate::ai::host::console::Host for ChoirHostState {
 
         crate::host::console::print_line(format_args!("{}", line));
     }
+
+    fn print_markdown(&mut self, markdown: String) -> () {
+        // Проверяем права плагина на работу с консолью.
+        let has_access = self
+            .current_plugin_permissions
+            .as_ref()
+            .map(|perms| can_plugin_print(perms, &markdown))
+            .unwrap_or(false);
+        if !has_access {
+            error!("[Хост] Плагин не имеет доступа к выводу консоли с таким размером текста.");
+            return ();
+        }
+
+        crate::host::console::print_markdown(&markdown);
+    }
 }
 
 impl crate::ai::host::log::Host for ChoirHostState {
@@ -607,7 +622,14 @@ impl crate::ai::host::http::HostWithStore<ChoirHostState> for ChoirHostState {
     ) -> (u16, String) {
         // TODO(P1): здесь можно добавить проверку прав плагина на сетевой
         // доступ (PluginAccess::Network) — fail-closed, как для консоли.
-        match reqwest::Client::new()
+        // Таймаут: если LLM/ollama не отвечает (или обрабатывает очень большой
+        // запрос), без таймаута .send() может висеть бесконечно, блокируя агента
+        // (и Ctrl-C не сработает, т.к. былm-нити занят).
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap_or_default();
+        match client
             .post(&url)
             .header("Content-Type", "application/json")
             .body(json_body)
@@ -1054,10 +1076,13 @@ pub async fn load_and_init_plugin(
     let subscriptions_res = store
         .run_concurrent(async |accessor| lifecycle.call_init(accessor, config_str).await)
         .await;
-    let subscriptions = subscriptions_res.and_then(|res| res).unwrap_or_else(|err| {
-        error!("[Хост] Ошибка при вызове метода init: {:?}", err);
-        Vec::<String>::new()
-    });
+    // Если init плагина упал (былm trap, напр. panic при парсинге конфига) —
+    // НЕ продолжаем запуск с пустыми подписками, а прерываем весь запуск с
+    // точной ошибкой. Пользователь должен видеть причину, а не молчаливый
+    // fallback с неправильной конфигурацией плагина.
+    let subscriptions = subscriptions_res
+        .and_then(|res| res)
+        .map_err(|err| anyhow::anyhow!("Плагин {} не смог инициализироваться: {:?}", plugin_config.name, err))?;
 
     info!(
         "[Хост] Плагин успешно загружен. Его подписки: {:?}",

@@ -413,7 +413,23 @@ async fn dispatch_event(
     // Ограничиваем длину (FIFO-вытеснение).
     let is_serving = event.topic == "status" || event.topic == "print";
     if event.session_id != "-" && !is_serving {
-        crate::plugin::engine::history_append(&event.session_id, &event, max_events_per_session)
+        // Усекаем огромные payload (напр. результат инструмента list_directory
+        // в МБ), чтобы они не раздували историю сессии: иначе при следующем
+        // запросе агент подтянет их в контекст LLM, и ollama зависнет.
+        const MAX_HISTORY_PAYLOAD: usize = 4096;
+        let mut hist_ev = event.clone();
+        if hist_ev.payload.len() > MAX_HISTORY_PAYLOAD {
+            // Обрезаем безопасно (по границе символа UTF-8).
+            let total = hist_ev.payload.len();
+            let cut = hist_ev
+                .payload
+                .char_indices()
+                .take_while(|(i, _)| *i < MAX_HISTORY_PAYLOAD)
+                .map(|(_, c)| c)
+                .collect::<String>();
+            hist_ev.payload = format!("{}... [payload усечён в истории: {} байт]", cut, total);
+        }
+        crate::plugin::engine::history_append(&event.session_id, &hist_ev, max_events_per_session)
             .await;
     }
 

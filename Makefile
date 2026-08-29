@@ -15,3 +15,9 @@ all: host plugins
 
 clean:
 	cargo clean
+	cd plugins/front_console_plugin && cargo clean
+	cd plugins/front_http_plugin && cargo clean
+	cd plugins/front_ws_plugin && cargo clean
+	cd plugins/tool_calculator_plugin && cargo clean
+	cd plugins/agent_plugin && cargo clean
+	cd plugins/mcp_client_plugin && cargo clean

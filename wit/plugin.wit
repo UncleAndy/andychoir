@@ -46,6 +46,9 @@ interface event-bus {
 
 interface console {
   print-line: func(line: string);
+  // Напечатать Markdown с форматированием (терминал): хост рендерит через
+  // termimad в ANSI (жирный/курсив/цвет/код-блоки).
+  print-markdown: func(markdown: string);
   read-line: async func(prompt: string) -> option<string>;
 }
 

@@ -12,7 +12,10 @@ use uuid::Uuid;
 struct FrontConsolePluginConfig {
     // Плагин может принимать из конфига топики, которые ему нужно слушать
     subscriptions: Vec<String>,
-    // Кому плагин будет отправлять сообщения
+    // Кому плагин будет отправлять сообщения.
+    // В конфиге ключ называется "targets" (мн.ч.); алиас + default, чтобы
+    // поле не было обязательным и не ломало парсинг остальных полей.
+    #[serde(default, alias = "targets")]
     #[allow(dead_code)]
     target: Vec<String>,
     // Режим управления промптом/чтением ввода:
@@ -21,10 +24,17 @@ struct FrontConsolePluginConfig {
     //   "direct" — ввод всегда доступен, запросы уходят сразу (параллельно).
     #[serde(default = "default_mode")]
     mode: String,
+    // Если true — пришедший ответ выводить с форматированием Markdown.
+    #[serde(default = "default_markdown")]
+    markdown: bool,
 }
 
 fn default_mode() -> String {
     "wait".to_string()
+}
+
+fn default_markdown() -> bool {
+    false
 }
 
 const PLUGIN_NAME: &str = "front:console";
@@ -73,18 +83,18 @@ struct FrontConsolePluginImplementation;
 impl Guest for FrontConsolePluginImplementation {
     async fn init(config_json: String) -> Vec<String> {
         // 1. Парсим конфигурацию
-        let parsed_config: FrontConsolePluginConfig = serde_json::from_str(&config_json)
-            .unwrap_or_else(|_| FrontConsolePluginConfig {
-                subscriptions: vec![
-                    PLUGIN_NAME.to_string(),
-                    "info".to_string(),
-                    "error".to_string(),
-                ],
-                target: vec!["choir".to_string()],
-                mode: default_mode(),
-            });
-
+        let parsed_result = serde_json::from_str::<FrontConsolePluginConfig>(&config_json);
+        let parsed_config: FrontConsolePluginConfig = match parsed_result {
+            Ok(c) => c,
+            Err(e) => {
+                // НЕ молча падаем в fallback: ошибка конфига должна остановить
+                // запуск хоста (былm trap -> хост прерывает запуск с ошибкой).
+                panic!("[WASM] front:console: неверный конфиг плагина: {}; raw={}", e, config_json);
+            }
+        };
+        // Диагностика (полезно в логе): инициализация с реальными настройками.
         let topics_to_subscribe = parsed_config.subscriptions.clone();
+        let md_enabled = parsed_config.markdown;
 
         // 2. Инициализируем стейт
         {
@@ -96,9 +106,10 @@ impl Guest for FrontConsolePluginImplementation {
         }
 
         info!(
-            "[WASM] Плагин {} инициализирован. Запрошено подписок: {}",
+            "[WASM] Плагин {} инициализирован. Запрошено подписок: {}, markdown={}",
             PLUGIN_NAME,
-            topics_to_subscribe.len()
+            topics_to_subscribe.len(),
+            md_enabled
         );
 
         // Сообщаем хосту о готовности (хост агрегирует и публикует host:"ready").
@@ -160,13 +171,8 @@ impl Guest for FrontConsolePluginImplementation {
         let mut queue: VecDeque<String> = VecDeque::new();
 
         loop {
-            // Флаг: ждём ли мы ответ на отправленный запрос.
-            // В wait/queue он true после отправки, в direct — всегда false.
-            let mut awaiting = false;
-            let mut pending_request_id = String::new();
-
-            // 1) Читаем ввод (промпт показываем, только если готовы принять).
-            //    В wait/queue после отправки сюда не вернёмся до ответа.
+            // 1) Читаем ввод (промпт показываем всегда; в wait/queue после
+            //    отправки мы не возвращаемся сюда до ответа).
             let line = ai::host::console::read_line(PROMPT.to_string()).await;
             match line {
                 None => {
@@ -188,30 +194,16 @@ impl Guest for FrontConsolePluginImplementation {
                         publish_request(&trimmed).await;
                         continue;
                     }
-                    // wait/queue: если уже ждём ответ — копим в очередь (queue)
-                    // либо игнорируем (wait не читает ввод, поэтому сюда
-                    // попадём только в queue-итерации — см. ниже).
-                    if awaiting {
-                        queue.push_back(trimmed);
-                        continue;
-                    }
-                    // Отправляем первый запрос.
-                    pending_request_id = publish_request(&trimmed).await;
-                    awaiting = true;
-                }
-            }
-
-            // 2) В wait/queue ждём ответ на отправленный запрос (async, не
-            //    блокирует wasm). Пока ждём — ввод НЕ читается (нет промпта).
-            if awaiting && mode != "direct" {
-                crate::ai::host::host_control::wait_for_response(pending_request_id).await;
-                awaiting = false;
-                // queue: если есть накопленное — отправляем следующее.
-                if mode == "queue" {
-                    while let Some(next) = queue.pop_front() {
-                        pending_request_id = publish_request(&next).await;
-                        crate::ai::host::host_control::wait_for_response(pending_request_id)
-                            .await;
+                    // wait/queue: отправляем запрос и ждём ответ (async, не
+                    // блокирует wasm). Пока ждём — ввод НЕ читается (нет промпта).
+                    let pending = publish_request(&trimmed).await;
+                    crate::ai::host::host_control::wait_for_response(pending).await;
+                    // queue: если есть накопленное — отправляем следующее.
+                    if mode == "queue" {
+                        while let Some(next) = queue.pop_front() {
+                            let qprid = publish_request(&next).await;
+                            crate::ai::host::host_control::wait_for_response(qprid).await;
+                        }
                     }
                 }
             }
@@ -236,7 +228,24 @@ impl Guest for FrontConsolePluginImplementation {
 
         // Если это про печать в консоль - выводим
         if ev.topic == "print" || ev.topic == "response" {
-            println!("{}", ev.payload);
+            // Форматирование Markdown: если включено в конфиге, просим ХОСТ
+            // отрендерить Markdown через termimad (ANSI) вместо сырого текста.
+            let md = CONFIG
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|c| c.markdown)
+                .unwrap_or(false);
+            info!(
+                "[WASM] front:console вывод response: markdown={} len={}",
+                md,
+                ev.payload.len()
+            );
+            if md {
+                crate::ai::host::console::print_markdown(&ev.payload);
+            } else {
+                println!("{}", ev.payload);
+            }
         }
 
         // NOTE: эхо введённой строки (topic == "request") намеренно убрано —
@@ -292,3 +301,4 @@ async fn handle_command(cmd: &str) {
         }
     }
 }
+

@@ -14,6 +14,12 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
+        fixRights = pkgs.writeShellScriptBin "fixr" ''
+          mkdir -p target
+          sudo chown -R andy:hermes ./
+          sudo chmod -R g+wX ./
+        '';
+
         # Rust toolchain через rustup (stable + wasm32-wasip2 target).
         rustDev = pkgs.stdenv.mkDerivation {
           name = "andychoir-rust-dev";
@@ -31,7 +37,9 @@
             pkgs.mcp-server-filesystem
             pkgs.github-mcp-server
             pkgs.mcp-server-sequential-thinking
-            pkgs.open-websearch
+            pkgs.mcp-server-fetch
+            pkgs.mcp-server-git
+            fixRights
           ];
 
           # Кастомизируем оболочку: ставим toolchain stable + target wasm32-wasip2

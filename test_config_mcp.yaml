@@ -11,6 +11,7 @@ plugins:
       targets:
         - "system:info"
       mode: "wait"
+      markdown: true
     allow_background: true
 
   # HTTP-фронт для неинтерактивного теста.
@@ -47,6 +48,13 @@ plugins:
           transport: "stdio"
           command: "mcp-server-sequential-thinking"
           args: []
+        - name: "fetch"
+          transport: "stdio"
+          command: "mcp-server-fetch"
+          args: []
+        - name: "github"
+          transport: "stdio"
+          command: "mcp-server-fetch"
     allow_background: true
 
   # Агент: использует инструменты MCP (mcp:nixos:*).
@@ -84,7 +92,7 @@ history:
   max_events_per_session: 100
   dir: "./.andychour/sessions"
   current_session_file: "~/.andychour/current_session.json"
-  session_ttl_secs: 604800
+  session_ttl_secs: 86400
   save_period_secs: 1
 
 net:

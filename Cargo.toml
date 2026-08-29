@@ -24,6 +24,7 @@ uuid = { version = "1", features = ["v4"] }
 axum = { version = "0.7", features = ["ws"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
+termimad = "0.31"
 
 [dev-dependencies]
 filetime = "0.2"
