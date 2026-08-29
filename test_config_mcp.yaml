@@ -43,6 +43,10 @@ plugins:
           transport: "stdio"
           command: "mcp-server-filesystem"
           args: ["/home/andy/projects"]
+        - name: "thinking"
+          transport: "stdio"
+          command: "mcp-server-sequential-thinking"
+          args: []
     allow_background: true
 
   # Агент: использует инструменты MCP (mcp:nixos:*).

@@ -38,7 +38,9 @@ fn next_id() -> String {
 }
 
 /// Открыть stdio-подпроцесс MCP-сервера. Возвращает transport-id или "-" при ошибке.
-pub async fn stdio_open(command: &str, args: &[String]) -> String {
+/// `env` — переменные окружения (пары ключ-значение), добавляются поверх
+/// окружения хоста. ЗНАЧЕНИЯ env НЕ логируются (могут содержать секреты).
+pub async fn stdio_open(command: &str, args: &[String], env: &[(String, String)]) -> String {
     let mut cmd = tokio::process::Command::new(command);
     cmd.args(args)
         .stdin(Stdio::piped())
@@ -46,6 +48,10 @@ pub async fn stdio_open(command: &str, args: &[String]) -> String {
         // stderr MCP-сервера отбрасываем: FastMCP печатает туда ASCII-заставку
         // и логи, которые не должны загрязнять консоль хоста.
         .stderr(Stdio::null());
+    // Применяем env. Никакие значения не логируем (могут быть секретами).
+    if !env.is_empty() {
+        cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -197,7 +203,7 @@ mod tests {
             "-c".to_string(),
             "while IFS= read -r line; do printf '%s\\n' \"$line\"; done".to_string(),
         ];
-        let tid = stdio_open("bash", &args).await;
+        let tid = stdio_open("bash", &args, &[]).await;
         assert_ne!(tid, "-", "stdio-open должен вернуть id");
 
         let req = r#"{"jsonrpc":"2.0","id":"1","method":"ping"}"#.to_string();

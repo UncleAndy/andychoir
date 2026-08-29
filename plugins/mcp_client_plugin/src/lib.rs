@@ -23,6 +23,10 @@ pub struct McpServerConfig {
     /// Аргументы для stdio-транспорта.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Переменные окружения для запуска подпроцесса (пары ключ-значение).
+    /// Добавляются поверх окружения хоста. Значения не логируются.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
 }
 
 fn default_transport() -> String {

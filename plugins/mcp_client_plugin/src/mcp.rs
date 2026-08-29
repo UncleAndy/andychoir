@@ -16,9 +16,15 @@ fn jsonrpc_request(id: u64, method: &str, params: serde_json::Value) -> String {
 
 /// Открыть stdio-подпроцесс сервера через хост.
 pub async fn open(server: &McpServerConfig) -> Result<String, String> {
+    let env: Vec<(String, String)> = server
+        .env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     let tid = crate::ai::host::mcp_transport::stdio_open(
         server.command.clone(),
         server.args.clone(),
+        env,
     )
     .await;
     if tid == "-" {

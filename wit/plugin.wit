@@ -162,7 +162,9 @@ interface ws-server {
 // доступа (песочница), поэтому транспорт — на стороне хоста.
 interface mcp-transport {
   // Открыть stdio-подпроцесс MCP-сервера. Возвращает transport-id (или "-" при ошибке).
-  stdio-open: async func(command: string, args: list<string>) -> string;
+  // env — переменные окружения (пары ключ-значение), добавляются/переопределяют
+  // окружение хоста при запуске подпроцесса.
+  stdio-open: async func(command: string, args: list<string>, env: list<tuple<string, string>>) -> string;
 
   // Отправить JSON-RPC строку и дождаться ответа с совпадающим id.
   // Возвращает ответ (строка JSON-RPC) или none при таймауте/ошибке.

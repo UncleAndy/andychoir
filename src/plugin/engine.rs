@@ -849,8 +849,9 @@ impl crate::ai::host::mcp_transport::HostWithStore<ChoirHostState> for ChoirHost
         _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
         command: String,
         args: Vec<String>,
+        env: Vec<(String, String)>,
     ) -> String {
-        crate::host::mcp_transport::stdio_open(&command, &args).await
+        crate::host::mcp_transport::stdio_open(&command, &args, &env).await
     }
 
     async fn request(
