@@ -53,6 +53,10 @@ pub struct ChoirHostState {
     table: ResourceTable,
     event_sender: mpsc::Sender<Event>,
     pub current_plugin_permissions: Option<Vec<PluginAccess>>,
+    /// JSON-конфиг текущего плагина (для get_plugin_config). Доступен в любом
+    /// инстансе (основном и фоновом), т.к. static-данные былm-инстанса
+    /// различаются, а конфиг должен быть одинаковым для run() и handle_event.
+    pub plugin_config: Option<String>,
 }
 
 /// Глобальный сигнал готовности: хост сигналит, когда все плагины готовы
@@ -760,6 +764,17 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
             })
             .collect()
     }
+
+    async fn get_plugin_config(
+        accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+    ) -> String {
+        // Конфиг текущего плагина (хранится на хосте в ChoirHostState).
+        // Доступен в любом инстансе (основном и фоновом).
+        let cfg = accessor.with(|mut access| {
+            access.get().plugin_config.clone().unwrap_or_else(|| "{}".to_string())
+        });
+        cfg
+    }
 }
 
 // Реализация http-server: регистрация/снятие HTTP-слушателей, которые
@@ -1104,6 +1119,7 @@ pub async fn new_plugin_store(
         table: Default::default(),
         event_sender,
         current_plugin_permissions: Some(config.access.clone()),
+        plugin_config: Some(config.config.to_string()),
     };
     let store = Store::new(engine, host_state);
 

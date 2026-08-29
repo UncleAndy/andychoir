@@ -47,6 +47,18 @@ static CURRENT_SESSION: Mutex<Option<String>> = Mutex::new(None);
 
 const PROMPT: &str = "prompt>";
 
+/// Получить флаг `markdown` из конфига плагина, читая его с ХОСТА
+/// (get_plugin_config), а не из static CONFIG. Нужно потому, что для
+/// allow_background:true плагин живёт в двух былm-инстансах (основной init и
+/// фоновый run) с разными static-данными; конфиг же должен быть одинаковым.
+/// Хост хранит конфиг и отдаёт его любому инстансу.
+async fn markdown_enabled() -> bool {
+    let cfg_json = crate::ai::host::host_control::get_plugin_config().await;
+    serde_json::from_str::<FrontConsolePluginConfig>(&cfg_json)
+        .map(|c| c.markdown)
+        .unwrap_or(false)
+}
+
 macro_rules! println {
     ($($arg:tt)*) => {
         crate::ai::host::console::print_line(&format!($($arg)*))
@@ -147,12 +159,24 @@ impl Guest for FrontConsolePluginImplementation {
             drop(cur);
 
             // Показываем предыдущую историю сессии (если есть).
+            // response из истории тоже форматируем как Markdown, если включено.
+            let md = markdown_enabled().await;
             let history = crate::ai::host::host_control::get_session_history(sid.clone()).await;
+            info!(
+                "[WASM] front:console: восстановление сессии {}: событий={}, markdown={}",
+                sid,
+                history.len(),
+                md
+            );
             for ev in &history {
                 if ev.topic == "request" {
                     println!("> {}", ev.payload);
                 } else if ev.topic == "response" {
-                    println!("{}", ev.payload);
+                    if md {
+                        crate::ai::host::console::print_markdown(&ev.payload);
+                    } else {
+                        println!("{}", ev.payload);
+                    }
                 }
             }
         }
@@ -230,12 +254,7 @@ impl Guest for FrontConsolePluginImplementation {
         if ev.topic == "print" || ev.topic == "response" {
             // Форматирование Markdown: если включено в конфиге, просим ХОСТ
             // отрендерить Markdown через termimad (ANSI) вместо сырого текста.
-            let md = CONFIG
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|c| c.markdown)
-                .unwrap_or(false);
+            let md = markdown_enabled().await;
             info!(
                 "[WASM] front:console вывод response: markdown={} len={}",
                 md,
