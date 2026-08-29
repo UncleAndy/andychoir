@@ -126,7 +126,7 @@ pub async fn handle_event(ev: Event) {
         }
 
         // Парсим ответ
-        let parsed: serde_json::Value = match serde_json::from_str(&body) {
+        let mut parsed: serde_json::Value = match serde_json::from_str(&body) {
             Ok(v) => v,
             Err(e) => {
                 let err_ev = response_event(&config, &ev, &format!("LLM parse error: {}", e));
@@ -136,7 +136,7 @@ pub async fn handle_event(ev: Event) {
         };
 
         // Есть ли tool_calls?
-        let tool_calls = parsed
+        let mut tool_calls = parsed
             .get("choices")
             .and_then(|c| c.get(0))
             .and_then(|c| c.get("message"))
@@ -145,11 +145,34 @@ pub async fn handle_event(ev: Event) {
             .cloned()
             .unwrap_or_default();
 
-        if !tool_calls.is_empty() {
+        // Цикл tool-calling: выполняем инструменты и переспрашиваем LLM, пока
+        // он возвращает tool_calls (а не итоговый текст). Это позволяет модели
+        // использовать НЕСКОЛЬКО инструментов подряд (напр. после «результат
+        // слишком большой» — попробовать другой инструмент), а не обрываться
+        // после первого tool_calls. Защитный лимит итераций — от бесконечного
+        // цикла (когда модель бесконечно просит инструменты).
+        const MAX_TOOL_ITERATIONS: usize = 10;
+        let mut iterations = 0;
+
+        loop {
+            if tool_calls.is_empty() {
+                break;
+            }
+            iterations += 1;
+            if iterations > MAX_TOOL_ITERATIONS {
+                log_warn!("[WASM] Превышен лимит итераций tool-calling ({}), прерываем", MAX_TOOL_ITERATIONS);
+                let resp_ev = response_event(
+                    &config,
+                    &ev,
+                    "(Превышено максимальное число шагов работы с инструментами.)",
+                );
+                publish_event(&resp_ev);
+                return;
+            }
+
             log_debug!("[WASM] LLM вернул {} tool_calls, вызываем инструменты", tool_calls.len());
             publish_status(&ev, &config, "Вызываю инструменты...");
 
-            // Выполняем инструмент(ы) и собираем результаты.
             // Первый tool_calls принадлежит сообщению assistant — добавим его
             // в messages, затем для каждого вызова добавим role:"tool".
             let assistant_msg = parsed
@@ -248,8 +271,7 @@ pub async fn handle_event(ev: Event) {
                 "tool_choice": "auto"
             });
             let second_req_str = second_req.to_string();
-            // Логируем тело повторного запроса (для диагностики HTTP 500/ошибок
-            // ollama). Запрос может быть большим — усекаем до лимита.
+            // Логируем тело повторного запроса (для диагностики). Усекаем.
             const MAX_LOG_CHARS: usize = 3000;
             if second_req_str.chars().count() > MAX_LOG_CHARS {
                 let truncated: String = second_req_str.chars().take(MAX_LOG_CHARS).collect();
@@ -260,60 +282,39 @@ pub async fn handle_event(ev: Event) {
             let (s2, b2) = http::post_json(url.clone(), second_req_str).await;
             log_debug!("[WASM] LLM повторный ответ status={} body={}", s2, b2);
 
-            let content = if s2 == 200 {
-                let parsed2: Option<serde_json::Value> = serde_json::from_str(&b2).ok();
-                let content = parsed2
-                    .as_ref()
-                    .and_then(|v| v.get("choices"))
-                    .and_then(|c| c.get(0))
-                    .and_then(|c| c.get("message"))
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                // Если повторный ответ пуст (LLM снова запросил tool или не дал
-                // текст) — показываем пользователю последний результат/ошибку
-                // инструмента, а не пустоту. Ищем в messages последний role:"tool".
-                if content.trim().is_empty() {
-                    let tool_last = messages
-                        .iter()
-                        .rev()
-                        .filter_map(|m| {
-                            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                            if role == "tool" {
-                                m.get("content").and_then(|c| c.as_str())
-                            } else {
-                                None
-                            }
-                        })
-                        .next()
-                        .unwrap_or("")
-                        .to_string();
-                    if !tool_last.trim().is_empty() {
-                        // Если результат инструмента — реальная ошибка (плагин
-                        // пометил её префиксом "(ошибка"), помечаем явно. Иначе —
-                        // это успешный результат, показываем как есть, без ярлыка.
-                        if tool_last.trim_start().starts_with("(ошибка") {
-                            format!("(ошибка инструмента) {}", tool_last)
-                        } else {
-                            tool_last
-                        }
-                    } else {
-                        "(пусто)".to_string()
-                    }
-                } else {
-                    content
-                }
-            } else {
-                format!("Ошибка LLM при обработке результата инструмента: status {}", s2)
-            };
+            if s2 != 200 {
+                let resp_ev = response_event(
+                    &config,
+                    &ev,
+                    &format!("Ошибка LLM при обработке результата инструмента: status {}", s2),
+                );
+                publish_event(&resp_ev);
+                return;
+            }
 
-            let resp_ev = response_event(&config, &ev, &content);
-            publish_event(&resp_ev);
-        } else {
-            // Нет tool_calls — возвращаем content напрямую
-            let content = parsed
-                .get("choices")
+            // Разбираем повторный ответ: есть ли снова tool_calls.
+            let parsed2: Option<serde_json::Value> = serde_json::from_str(&b2).ok();
+            let new_tool_calls = parsed2
+                .as_ref()
+                .and_then(|v| v.get("choices"))
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("tool_calls"))
+                .and_then(|t| t.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            if !new_tool_calls.is_empty() {
+                // Модель снова просит инструменты — продолжаем цикл.
+                tool_calls = new_tool_calls;
+                parsed = parsed2.unwrap_or(parsed);
+                continue;
+            }
+
+            // Итоговый текстовый ответ (нет tool_calls).
+            let content = parsed2
+                .as_ref()
+                .and_then(|v| v.get("choices"))
                 .and_then(|c| c.get(0))
                 .and_then(|c| c.get("message"))
                 .and_then(|m| m.get("content"))
@@ -322,7 +323,20 @@ pub async fn handle_event(ev: Event) {
                 .to_string();
             let resp_ev = response_event(&config, &ev, &content);
             publish_event(&resp_ev);
+            return;
         }
+
+        // Первый ответ не содержал tool_calls — возвращаем content напрямую.
+        let content = parsed
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("(пусто)")
+            .to_string();
+        let resp_ev = response_event(&config, &ev, &content);
+        publish_event(&resp_ev);
     }
 }
 
