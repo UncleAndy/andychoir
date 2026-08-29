@@ -3,6 +3,9 @@ name = "tool_calculator_plugin"
 version = "0.1.0"
 edition = "2024"
 description = "Tool calculator"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/UncleAndy/andychoir"
+authors = ["Andrey Velikoredchanin"]
 resolver = "2"
 
 [lib]

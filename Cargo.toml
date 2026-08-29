@@ -2,6 +2,11 @@
 name = "andychoir"
 version = "0.1.0"
 edition = "2024"
+description = "Universal constructor for AI agents and orchestrators (wasm plugin host)"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/UncleAndy/andychoir"
+repository = "https://github.com/UncleAndy/andychoir"
+authors = ["Andrey Velikoredchanin"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

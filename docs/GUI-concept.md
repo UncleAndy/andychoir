@@ -1,24 +1,39 @@
-# Архитектурное описание: Дескриптивный GUI на базе шины событий с использованием WebAssembly (WASI Preview 2)
+# Architectural Description: Descriptive GUI based on an Event Bus using WebAssembly (WASI Preview 2)
 
-### 1. Концептуальный обзор (High-Level Idea)
-Система представляет собой нативное хост-приложение на Rust, логика и интерфейс которого расширяются с помощью изолированных плагинов, скомпилированных под таргет `wasm32-wasip2` (Wasm Component Model). 
+### 1. Conceptual Overview (High-Level Idea)
+The system is a native Rust host application whose logic and interface are
+extended by isolated plugins compiled for the `wasm32-wasip2` target (Wasm
+Component Model).
 
-Вся архитектура построена на принципах **EDA (Event-Driven Architecture)**. Плагины не имеют прямого доступа к графическому контексту, операционной системе или видеокарте. Вместо этого хост предоставляет декларативное API для описания интерфейса, а взаимодействие между GUI-движком хоста и WASM-плагинами полностью инкапсулировано внутри **Системной шины событий (Event Bus)**.
-
----
-
-### 2. Ключевые компоненты системы
-
-1. **Нативный Хост (Rust Engine):** Core-приложение, управляющее жизненным циклом плагинов через рантайм `wasmtime` с включенной поддержкой Component Model (`wasm_component_model(true)`).
-2. **Шина событий (System Event Bus):** Центральный хаб для маршрутизации сообщений (например, на базе каналов `tokio::sync::broadcast`, `crossbeam` или кастомной Event Bus). Обеспечивает асинхронность и слабую связанность компонентов.
-3. **GUI-модуль (Хост):** Нативный графический движок (рекомендуется `egui` для простоты динамической отрисовки или `Slint` / `Dioxus` для декларативности). Он является **продюсером** событий ввода и **консьюмером** команд отрисовки.
-4. **WASM-плагины (`wasm32-wasip2`):** Изолированные компоненты, которые подписываются на события пользовательского ввода, обрабатывают их и отправляют обратно команды на изменение состояния интерфейса.
+The entire architecture is built on the principles of **EDA (Event-Driven
+Architecture)**. Plugins have no direct access to the graphics context, the
+operating system, or the GPU. Instead, the host provides a declarative API for
+describing the interface, and all interaction between the host's GUI engine and
+the WASM plugins is fully encapsulated inside the **System Event Bus**.
 
 ---
 
-### 3. Спецификация интерфейса (WIT - Wasm Interface Type)
+### 2. Key System Components
 
-Взаимодействие строго типизировано на уровне контракта Component Model. Пример описания интерфейса (`interface.wit`):
+1. **Native Host (Rust Engine):** The core application managing the plugin
+   lifecycle through the `wasmtime` runtime with Component Model support
+   (`wasm_component_model(true)`).
+2. **System Event Bus:** The central hub for routing messages (e.g., based on
+   `tokio::sync::broadcast` channels, `crossbeam`, or a custom Event Bus).
+   Provides asynchrony and loose coupling between components.
+3. **GUI Module (Host):** A native graphics engine (recommended `egui` for
+   dynamic rendering simplicity, or `Slint` / `Dioxus` for declarativeness).
+   It is a **producer** of input events and a **consumer** of drawing commands.
+4. **WASM plugins (`wasm32-wasip2`):** Isolated components that subscribe to
+   user input events, process them, and send back commands to change the UI
+   state.
+
+---
+
+### 3. Interface Specification (WIT - Wasm Interface Type)
+
+Interaction is strictly typed at the Component Model contract level. Example
+interface definition (`interface.wit`):
 
 ```wit
 package my-app:plugin;
@@ -30,7 +45,7 @@ interface gui-types {
         hover
     }
 
-    // Событие от GUI к плагину
+    // Event from GUI to plugin
     record gui-event {
         window-id: u32,
         element-id: u32,
@@ -38,7 +53,7 @@ interface gui-types {
         value: string,
     }
 
-    // Команда от плагина к GUI
+    // Command from plugin to GUI
     record gui-command {
         window-id: u32,
         element-id: u32,
@@ -49,46 +64,67 @@ interface gui-types {
 world plugin-world {
     use gui-types.{gui-event, gui-command};
 
-    // Плагин вызывает эту функцию, чтобы отправить команду изменения GUI в шину хоста
+    // Plugin calls this function to send a GUI change command to the host bus
     import send-gui-command: func(cmd: gui-command);
 
-    // Хост вызывает эту функцию, чтобы передать событие из шины внутрь плагина
+    // Host calls this function to deliver a bus event into the plugin
     export on-system-event: func(event: gui-event);
 }
 ```
 
 ---
 
-### 4. Жизненный цикл и потоки данных (Data Flow)
+### 4. Lifecycle and Data Flow
 
-#### Этап А: Инициализация и построение UI
-1. Хост загружает `.wasm` компонент.
-2. Плагин при старте генерирует декларативное описание своего интерфейса (дерево виджетов с ID) и отправляет его хосту через импортированную функцию (или стартовое событие).
-3. Хост (GUI-модуль) сохраняет это дерево элементов локально в памяти.
+#### Stage A: Initialization and UI construction
+1. The host loads the `.wasm` component.
+2. On startup, the plugin generates a declarative description of its interface
+   (widget tree with IDs) and sends it to the host through an imported function
+   (or a startup event).
+3. The host (GUI module) stores this element tree locally in memory.
 
-#### Этап Б: Обработка ввода (Поток событий)
-1. **Пользователь взаимодействует с интерфейсом** (например, кликает по кнопке с `element_id: 10` в окне `window_id: 1`).
-2. **GUI-модуль хоста** перехватывает это действие, формирует структуру `Event::GuiInput` и публикует её в **Шину событий**.
-3. **Шина событий** асинхронно перенаправляет это сообщение диспетчеру плагинов.
-4. **Диспетчер** вызывает экспортированную плагином функцию `on-system-event(event)`.
-5. **Плагин** внутри своей изолированной памяти обрабатывает бизнес-логику (например, инкрементирует счетчик).
-6. Чтобы обновить экран, piлагин вызывает импортированную функцию `send-gui-command(cmd)` (например, «изменить текст на лейбле с `id: 11`»).
-7. Эта команда пападает в **Шину событий** как `Event::GuiCommand`.
-8. **GUI-модуль хоста**, подписанный на этот тип событий, принимает его, мгновенно обновляет локальное состояние виджета и перерисовывает экран на следующем кадре.
+#### Stage B: Input handling (Event flow)
+1. **The user interacts with the interface** (e.g., clicks a button with
+   `element_id: 10` in window `window_id: 1`).
+2. **The host GUI module** intercepts the action, forms an `Event::GuiInput`
+   structure, and publishes it to the **Event Bus**.
+3. **The Event Bus** asynchronously forwards the message to the plugin
+   dispatcher.
+4. **The dispatcher** calls the plugin's exported function `on-system-event(event)`.
+5. **The plugin** processes the business logic inside its isolated memory
+   (e.g., increments a counter).
+6. To update the screen, the plugin calls the imported function
+   `send-gui-command(cmd)` (e.g., "change the text on the label with `id: 11`").
+7. This command enters the **Event Bus** as `Event::GuiCommand`.
+8. **The host GUI module**, subscribed to this event type, receives it,
+   immediately updates the widget's local state, and redraws the screen on the
+   next frame.
 
 ---
 
-### 5. Преимущества для реализации агентом
-* **Изоляция таргетов:** Таргет `wasm32-unknown-unknown` полностью исключен. Мы полагаемся исключительно на `wasm32-wasip2`. Никакого ручного управления памятью, аллокаторов (`alloc`/`free`) и unsafe-передачи сырых указателей байт. `wasmtime` выполняет маршалинг типов автоматически на основе WIT.
-* **Слабая связанность (Loose Coupling):** GUI-модуль нативного хоста изолирован от WASM-рантайма. Он взаимодействует только со структурами данных своего `HashMap` и системными каналами Rust. Это позволяет разрабатывать и тестировать GUI отдельно от плагинной системы.
-* **Асинхронность (Thread Safety):** Длительные вычисления или сетевые запросы внутри плагинов не блокируют поток отрисовки хоста (Render Thread). Хост сохраняет высокий FPS, так как обмен сообщениями происходит через неблокирующие очереди.
+### 5. Benefits for Agent Implementation
+* **Target isolation:** The `wasm32-unknown-unknown` target is completely
+  excluded. We rely exclusively on `wasm32-wasip2`. No manual memory
+  management, allocators (`alloc`/`free`), or unsafe raw byte-pointer passing.
+  `wasmtime` performs type marshalling automatically based on WIT.
+* **Loose coupling:** The native host's GUI module is isolated from the WASM
+  runtime. It interacts only with its own data structures (`HashMap`) and Rust
+  system channels. This allows the GUI to be developed and tested separately
+  from the plugin system.
+* **Asynchrony (thread safety):** Long computations or network requests inside
+  plugins do not block the host's render thread. The host maintains high FPS
+  because message exchange happens through non-blocking queues.
 
 ---
 
-### Инструкции для реализации (План действий для агента):
-1. Развернуть базовый хост на Rust, подключить `wasmtime` и `wasmtime-wasi`.
-2. Создать файл `interface.wit`, описывающий структуры событий ввода и команд интерфейса.
-3. Сгенерировать биндинги с помощью `wit-bindgen`.
-4. Реализовать асинхронную шину событий на базе каналов (например, `tokio::sync::broadcast` или `crossbeam`).
-5. Интегрировать GUI-фреймворк (например, `egui`) на хосте, настроить подписку графического потока на события изменения UI от плагина.
-6. Написать демонстрационный WASM-плагин, реализующий реактивный счетчик (кнопка + текстовое поле).
+### Implementation Instructions (Action plan for an agent):
+1. Set up a basic Rust host, wire up `wasmtime` and `wasmtime-wasi`.
+2. Create the `interface.wit` file describing the input event and interface
+   command structures.
+3. Generate bindings using `wit-bindgen`.
+4. Implement an asynchronous event bus based on channels (e.g.,
+   `tokio::sync::broadcast` or `crossbeam`).
+5. Integrate a GUI framework (e.g., `egui`) on the host and set up the graphics
+   thread's subscription to UI-change events from the plugin.
+6. Write a demo WASM plugin implementing a reactive counter (button + text
+   field).
