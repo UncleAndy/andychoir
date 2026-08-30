@@ -65,16 +65,37 @@ pub struct NetHandle {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum NetMessage {
-    /// Событие шины.
+    /// Событие шины (упаковано для передачи по сети).
+    /// P1: добавлены поля для mesh-маршрутизации и dedup:
+    /// - source_id: node_id отправителя (UUID хоста)
+    /// - event_id: уникальный UUID события (для Bloom-фильтра dedup)
+    /// - ttl: счетчик времени жизни (защита от петель)
     Event {
-        origin: String,
+        origin: String,      // обратная совместимость: node_id отправителя
+        source_id: String,   // node_id отправителя (mesh-маршрутизация)
+        event_id: String,    // UUID события (dedup)
+        ttl: u8,              // time-to-live
         hop: u8,
         event: serde_json::Value,
     },
     /// Анонс локальных инструментов хоста (шлётся при подключении).
+    /// P1: добавлены neighbors (список известных соседей) для LSDB.
     Capabilities {
         origin: String,
+        source_id: String,   // node_id анонсирующего хоста
+        neighbors: Vec<String>, // известные соседи (для LSDB)
         tools: Vec<crate::plugin::engine::ToolDef>,
+    },
+    /// Приветствие (discovery): анонс node_id + соседей + инструменты.
+    /// Flooding по сети для построения полной топологии (LSDB).
+    Hello {
+        source_id: String,
+        neighbors: Vec<String>,
+        tools: Vec<crate::plugin::engine::ToolDef>,
+    },
+    /// Уведомление об уходе хоста (graceful shutdown).
+    Bye {
+        source_id: String,
     },
 }
 
@@ -103,9 +124,15 @@ fn value_to_event(v: &serde_json::Value) -> Option<Event> {
 }
 
 /// Упаковать событие в сетевое сообщение.
+/// P1: генерирует event_id (UUID v4) и ttl (16), source_id = node_id отправителя.
 fn pack_event(origin: &str, hop: u8, ev: &Event) -> String {
+    let event_id = uuid::Uuid::new_v4().to_string();
+    let ttl: u8 = 16;
     let msg = NetMessage::Event {
         origin: origin.to_string(),
+        source_id: origin.to_string(),
+        event_id,
+        ttl,
         hop,
         event: event_to_value(ev),
     };
@@ -113,9 +140,12 @@ fn pack_event(origin: &str, hop: u8, ev: &Event) -> String {
 }
 
 /// Упаковать анонс возможностей (локальные инструменты хоста).
+/// P1: добавлены source_id и neighbors (из LSDB, пока пустой — заполняется в P3).
 fn pack_capabilities(origin: &str, tools: Vec<crate::plugin::engine::ToolDef>) -> String {
     let msg = NetMessage::Capabilities {
         origin: origin.to_string(),
+        source_id: origin.to_string(),
+        neighbors: Vec::new(), // P3: заполняется из LSDB
         tools,
     };
     serde_json::to_string(&msg).unwrap_or_default()
@@ -216,7 +246,7 @@ async fn handle_incoming(inner: Arc<NetInner>, socket: WebSocket) {
         let Ok(axum::extract::ws::Message::Text(text)) = msg else { continue };
         let Some(netmsg) = unpack_message(&text) else { continue };
         match netmsg {
-            NetMessage::Capabilities { origin, tools } => {
+            NetMessage::Capabilities { origin, source_id: _, neighbors: _, tools } => {
                 if origin == inner.cfg.node_id {
                     continue;
                 }
@@ -231,7 +261,15 @@ async fn handle_incoming(inner: Arc<NetInner>, socket: WebSocket) {
                 let caps = pack_capabilities(&inner.cfg.node_id, my_tools);
                 let _ = out_tx.try_send(caps);
             }
-            NetMessage::Event { origin, hop: _hop, event } => {
+            // P1: Hello (discovery) — обрабатывается в P3.
+            NetMessage::Hello { source_id: _, neighbors: _, tools: _ } => {
+                // TODO P3: обновить LSDB, переслать соседям.
+            }
+            // P1: Bye (graceful leave) — обрабатывается в P6.
+            NetMessage::Bye { source_id: _ } => {
+                // TODO P6: удалить из LSDB, очистить каналы.
+            }
+            NetMessage::Event { origin, source_id: _, event_id: _, ttl: _, hop: _hop, event } => {
                 if origin == inner.cfg.node_id {
                     continue;
                 }
@@ -318,14 +356,20 @@ async fn run_outbound_loop(inner: Arc<NetInner>, remote: NetRemote) {
                 {
                     let Some(netmsg) = unpack_message(&text) else { continue };
                     match netmsg {
-                        NetMessage::Capabilities { origin, tools } => {
+                        NetMessage::Capabilities { origin, source_id: _, neighbors: _, tools } => {
                             if origin == inner.cfg.node_id {
                                 continue;
                             }
                             info!("[Хост] Net: возможности {}: {:?}", origin, tools.len());
                             inner.origin_tools.write().await.insert(origin, tools);
                         }
-                        NetMessage::Event { origin, hop: _hop, event } => {
+                        NetMessage::Hello { source_id: _, neighbors: _, tools: _ } => {
+                            // TODO P3: LSDB.
+                        }
+                        NetMessage::Bye { source_id: _ } => {
+                            // TODO P6: удалить из LSDB.
+                        }
+                        NetMessage::Event { origin, source_id: _, event_id: _, ttl: _, hop: _hop, event } => {
                             if origin == inner.cfg.node_id {
                                 continue;
                             }
@@ -446,12 +490,15 @@ mod tests {
     #[test]
     fn pack_unpack_roundtrip() {
         let ev = make_event("tool:calculator", "sess-1");
-        let s = pack_event("host-a", 0, &ev);
+        let s = pack_event("00000000-0000-0000-0000-0000000000a1", 0, &ev);
         let msg = unpack_message(&s).unwrap();
         match msg {
-            NetMessage::Event { origin, hop, event } => {
+            NetMessage::Event { origin, source_id, event_id, ttl, hop, event } => {
                 let ev2 = value_to_event(&event).unwrap();
-                assert_eq!(origin, "host-a");
+                assert_eq!(origin, "00000000-0000-0000-0000-0000000000a1");
+                assert_eq!(source_id, "00000000-0000-0000-0000-0000000000a1");
+                assert!(!event_id.is_empty(), "event_id должен быть сгенерирован");
+                assert_eq!(ttl, 16, "ttl по умолчанию 16");
                 assert_eq!(hop, 0);
                 assert_eq!(ev2.target, "tool:calculator");
                 assert_eq!(ev2.session_id, "sess-1");
@@ -469,11 +516,13 @@ mod tests {
             description: "calc".into(),
             parameters_json: "{}".into(),
         }];
-        let s = pack_capabilities("host-a", tools.clone());
+        let s = pack_capabilities("00000000-0000-0000-0000-0000000000a1", tools.clone());
         let msg = unpack_message(&s).unwrap();
         match msg {
-            NetMessage::Capabilities { origin, tools: t } => {
-                assert_eq!(origin, "host-a");
+            NetMessage::Capabilities { origin, source_id, neighbors, tools: t } => {
+                assert_eq!(origin, "00000000-0000-0000-0000-0000000000a1");
+                assert_eq!(source_id, "00000000-0000-0000-0000-0000000000a1");
+                assert!(neighbors.is_empty(), "neighbors пустой до P3");
                 assert_eq!(t.len(), 1);
                 assert_eq!(t[0].name, "calculator");
             }
@@ -501,13 +550,13 @@ mod tests {
     // origin == self отбрасывается (защита от циклов).
     #[test]
     fn self_origin_rejected() {
-        let node_id = "host-a";
-        let s = pack_event("host-a", 0, &make_event("x", "s"));
+        let node_id = "00000000-0000-0000-0000-0000000000a1";
+        let s = pack_event("00000000-0000-0000-0000-0000000000a1", 0, &make_event("x", "s"));
         match unpack_message(&s).unwrap() {
             NetMessage::Event { origin, .. } => assert_eq!(origin == node_id, true),
             _ => panic!(),
         }
-        let s2 = pack_event("host-b", 0, &make_event("x", "s"));
+        let s2 = pack_event("00000000-0000-0000-0000-0000000000b2", 0, &make_event("x", "s"));
         match unpack_message(&s2).unwrap() {
             NetMessage::Event { origin, .. } => assert_eq!(origin == node_id, false),
             _ => panic!(),
