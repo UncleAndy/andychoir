@@ -45,7 +45,7 @@ static SESSIONS: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 /// при чистом старте без сохранённой сессии или по команде /new).
 static CURRENT_SESSION: Mutex<Option<String>> = Mutex::new(None);
 
-const PROMPT: &str = "prompt>";
+const PROMPT: &str = "prompt> ";
 
 /// Получить флаг `markdown` из конфига плагина, читая его с ХОСТА
 /// (get_plugin_config), а не из static CONFIG. Нужно потому, что для
@@ -57,6 +57,16 @@ async fn markdown_enabled() -> bool {
     serde_json::from_str::<FrontConsolePluginConfig>(&cfg_json)
         .map(|c| c.markdown)
         .unwrap_or(false)
+}
+
+/// Печать двойной разделительной линии `═` для визуального выделения ответа.
+const DIVIDER_LEN: usize = 60;
+fn print_divider() {
+    // ВАЖНО: здесь НЕЛЬЗЯ использовать локальный макрос println! — он объявлен
+    // ниже в этом файле (macro_rules! println), а макросы доступны только после
+    // объявления. Поэтому println! здесь резолвился бы в std::println! -> stdout
+    // былm (не подключён к консоли хоста). Используем прямой WIT-импорт.
+    crate::ai::host::console::print_line(&format!("{}", "═".repeat(DIVIDER_LEN)));
 }
 
 macro_rules! println {
@@ -170,13 +180,19 @@ impl Guest for FrontConsolePluginImplementation {
             );
             for ev in &history {
                 if ev.topic == "request" {
-                    println!("> {}", ev.payload);
+                    // Запрос пользователя — жёлтым (ANSII).
+                    crate::ai::host::console::print_line(
+                        &format!("\x1b[33m> {}\x1b[0m", ev.payload),
+                    );
                 } else if ev.topic == "response" {
+                    // Выделяем восстановленный ответ двойной линией.
+                    print_divider();
                     if md {
                         crate::ai::host::console::print_markdown(&ev.payload);
                     } else {
                         println!("{}", ev.payload);
                     }
+                    print_divider();
                 }
             }
         }
@@ -260,11 +276,14 @@ impl Guest for FrontConsolePluginImplementation {
                 md,
                 ev.payload.len()
             );
+            // Выделяем ответ двойной линией сверху и снизу.
+            print_divider();
             if md {
                 crate::ai::host::console::print_markdown(&ev.payload);
             } else {
                 println!("{}", ev.payload);
             }
+            print_divider();
         }
 
         // NOTE: эхо введённой строки (topic == "request") намеренно убрано —

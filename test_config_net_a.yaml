@@ -4,7 +4,7 @@ plugins:
   - file: "plugins/front_console_plugin/target/wasm32-wasip2/debug/front_console_plugin.wasm"
     name: "front:console"
     access:
-      - !console_input "prompt>"
+      - !console_input "prompt> "
       - !console_print 102400
     config:
       subscriptions: ["system:info", "system:error"]

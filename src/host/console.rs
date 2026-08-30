@@ -4,14 +4,18 @@ use std::sync::Mutex;
 use std::{println as std_println};
 
 use rustyline::error::ReadlineError;
-use rustyline::{DefaultEditor, ExternalPrinter};
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::history::DefaultHistory;
+use rustyline::validate::Validator;
+use rustyline::{Editor, ExternalPrinter, Helper, Result as RlResult};
 use tokio::sync::Notify;
 
 static CONSOLE: Mutex<ConsoleState> = Mutex::new(ConsoleState {
     active_printer: None,
 });
 
-static EDITOR: Mutex<Option<DefaultEditor>> = Mutex::new(None);
+static EDITOR: Mutex<Option<Editor<YellowHelper, DefaultHistory>>> = Mutex::new(None);
 
 static INTERRUPT: Notify = Notify::const_new();
 
@@ -51,12 +55,19 @@ pub fn print_markdown(markdown: &str) {
         text.len()
     );
     let mut console = CONSOLE.lock().unwrap();
+    // Добавляем завершающий перевод строки (как print_line): rustyline
+    // ExternalPrinter печатает без \n, иначе следующая строка (разделитель,
+    // промпт) склеивается/затирает конец вывода.
+    let mut line = text;
+    if !line.ends_with('\n') {
+        line.push('\n');
+    }
     if let Some(printer) = &mut console.active_printer {
-        if let Err(err) = printer.print(text) {
+        if let Err(err) = printer.print(line) {
             crate::error!("[Хост] Ошибка обновления консоли: {:?}", err);
         }
     } else {
-        std_println!("{}", text);
+        std_println!("{}", line);
     }
 }
 
@@ -268,7 +279,9 @@ pub async fn wait_for_interrupt() {
 fn read_line_with_editor(prompt: String) -> rustyline::Result<String> {
     let mut editor_lock = EDITOR.lock().unwrap();
     if editor_lock.is_none() {
-        *editor_lock = Some(DefaultEditor::new()?);
+        let mut ed = Editor::<YellowHelper, DefaultHistory>::new()?;
+        ed.set_helper(Some(YellowHelper));
+        *editor_lock = Some(ed);
     }
 
     let editor = editor_lock.as_mut().unwrap();
@@ -277,6 +290,9 @@ fn read_line_with_editor(prompt: String) -> rustyline::Result<String> {
         console.active_printer = Some(Box::new(editor.create_external_printer()?));
     }
 
+    // Промпт передаём БЕЗ ANSI-окраски: ширину с ANSI-кодами rustyline считает
+    // неверно (коды воспринимаются как символы), из-за чего строка ввода не
+    // рисуется. Окраску делаем через Highlighter::highlight_prompt ниже.
     let line = editor.readline(&prompt)?;
 
     if !line.trim().is_empty() {
@@ -284,6 +300,59 @@ fn read_line_with_editor(prompt: String) -> rustyline::Result<String> {
     }
 
     Ok(format!("{}\n", line))
+}
+
+/// Rustyline-хелпер: подсвечивает вводимый пользователем текст жёлтым.
+#[derive(Clone)]
+struct YellowHelper;
+impl Helper for YellowHelper {}
+impl rustyline::completion::Completer for YellowHelper {
+    type Candidate = String;
+    fn complete(
+        &self,
+        _line: &str,
+        _pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> RlResult<(usize, Vec<Self::Candidate>)> {
+        Ok((0, vec![]))
+    }
+}
+impl Validator for YellowHelper {
+    fn validate(&self, _ctx: &mut rustyline::validate::ValidationContext) -> RlResult<rustyline::validate::ValidationResult> {
+        Ok(rustyline::validate::ValidationResult::Valid(None))
+    }
+}
+impl Hinter for YellowHelper {
+    type Hint = String;
+}
+impl Highlighter for YellowHelper {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> std::borrow::Cow<'l, str> {
+        // Для пустой строки (момент показа промпта) не добавляем ANSI: иначе
+        // rustyline посчитает escape-коды за символы и строка ввода не отрисуется.
+        if line.is_empty() {
+            return std::borrow::Cow::Borrowed(line);
+        }
+        std::borrow::Cow::Owned(yellow(line))
+    }
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        _default: bool,
+    ) -> std::borrow::Cow<'b, str> {
+        std::borrow::Cow::Owned(yellow(prompt))
+    }
+    fn highlight_char(&self, _line: &str, _pos: usize, _kind: rustyline::highlight::CmdKind) -> bool {
+        // Возвращаем true, чтобы при вводе каждого символа вызывался highlight()
+        // (иначе вводимый текст не перекрашивается в жёлтый).
+        true
+    }
+}
+
+/// Обернуть строку в ANSI-жёлтый (для промпта и запросов пользователя).
+const YELLOW: &str = "\x1b[33m";
+const RESET: &str = "\x1b[0m";
+pub(crate) fn yellow(s: &str) -> String {
+    format!("{}{}{}", YELLOW, s, RESET)
 }
 
 #[cfg(test)]
