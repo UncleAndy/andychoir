@@ -57,7 +57,7 @@ history:
 # сам сеть не слушает (listen_port=0). WebSocket двунаправленный: B отвечает
 # по этому же соединению.
 net:
-  node_id: "host-a"
+  node_id: "00000000-0000-0000-0000-0000000000a1"
   listen_port: 0
   token: []
   remotes:

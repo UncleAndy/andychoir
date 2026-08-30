@@ -96,7 +96,7 @@ history:
   save_period_secs: 1
 
 net:
-  node_id: "host-local"
+  node_id: "00000000-0000-0000-0000-0000000000c3"
   listen_port: 0
   token: []
   remotes: []

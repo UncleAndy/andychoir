@@ -248,12 +248,23 @@ impl Config {
         let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("json");
 
         // 2. Десериализуем из среза байт (это быстрая операция в памяти)
-        let config: Config = match extension {
+        let mut config: Config = match extension {
             "json" => { serde_json::from_slice(&content)? }
             "toml" => { toml::from_slice(&content)? }
             "yaml" | "yml" => { serde_yaml::from_slice(&content)? }
             _ => return Err("Unsupported config file format".into())
         };
+
+        // 3. Нормализация node_id (docs/NET-concept.md §5): идентификатор хоста
+        //    должен быть UUID. Если задан пустой или невалидный UUID — генерируем
+        //    UUID v4 (с предупреждением), чтобы не ломать будущий dedup/маршрутизацию.
+        if config.net.node_id.is_empty() || uuid::Uuid::parse_str(&config.net.node_id).is_err() {
+            log::warn!(
+                "[Конфиг] node_id не задан или не является валидным UUID; сгенерирован UUID v4: {}",
+                config.net.node_id
+            );
+            config.net.node_id = uuid::Uuid::new_v4().to_string();
+        }
 
         Ok(config)
     }
