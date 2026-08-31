@@ -81,8 +81,8 @@ pub(crate) async fn handle_incoming(inner: Arc<NetInner>, socket: WebSocket) {
                 let _ = out_tx.try_send(caps);
             }
             // P1: Hello (discovery).
-            NetMessage::Hello { source_id, neighbors, tools } => {
-                handle_hello(&inner, source_id, neighbors, tools).await;
+            NetMessage::Hello { source_id, seq, neighbors, tools } => {
+                handle_hello(&inner, source_id, neighbors, tools, seq).await;
             }
             // P1: Bye (graceful leave) — обрабатывается в P6.
             NetMessage::Bye { source_id } => {

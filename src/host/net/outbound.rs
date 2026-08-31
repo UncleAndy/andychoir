@@ -4,12 +4,49 @@ use super::*;
 use super::dedup::check_dedup;
 use super::discovery::handle_hello;
 use super::message::{pack_capabilities, unpack_message, value_to_event, NetMessage};
-use crate::config::config::NetRemote;
+use crate::config::config::{DEFAULT_CONNECT_RETRY_INTERVAL_SECS, DEFAULT_CONNECT_TIMEOUT_SECS, NetRemote};
 use tokio_tungstenite;
 
 /// Исходящее персистентное соединение к одному remote (с автопереподключением).
+///
+/// Поведение retry настраивается через конфиг:
+/// - `retry_interval_secs` (remote) / `connect_retry_interval_secs` (global) —
+///   пауза между попытками (default 10с).
+/// - `connect_timeout_secs` (remote) / `connect_timeout_secs` (global) —
+///   окно попыток (default 300с = 5 мин); 0 → бесконечные попытки.
+/// Если за окно подключиться не удалось — задача завершается (remote недоступен).
 pub(crate) async fn run_outbound_loop(inner: Arc<NetInner>, remote: NetRemote) {
+    let retry_interval = if remote.retry_interval_secs > 0 {
+        remote.retry_interval_secs
+    } else if inner.cfg.connect_retry_interval_secs > 0 {
+        inner.cfg.connect_retry_interval_secs
+    } else {
+        DEFAULT_CONNECT_RETRY_INTERVAL_SECS
+    };
+    let timeout = if remote.connect_timeout_secs > 0 {
+        remote.connect_timeout_secs
+    } else if inner.cfg.connect_timeout_secs > 0 {
+        inner.cfg.connect_timeout_secs
+    } else {
+        DEFAULT_CONNECT_TIMEOUT_SECS
+    };
+    let deadline = if timeout == 0 {
+        None
+    } else {
+        Some(super::dedup::current_unix_secs().saturating_add(timeout))
+    };
+
     loop {
+        // Если задано окно — проверяем, не истекло ли оно.
+        if let Some(dl) = deadline {
+            if super::dedup::current_unix_secs() >= dl {
+                warn!(
+                    "[Хост] Net: не удалось подключиться к {} за {}с, отказываюсь",
+                    remote.url, timeout
+                );
+                return;
+            }
+        }
         // Пытаемся подключиться.
         match tokio_tungstenite::connect_async(&remote.url).await {
             Ok((ws, _resp)) => {
@@ -72,8 +109,8 @@ pub(crate) async fn run_outbound_loop(inner: Arc<NetInner>, remote: NetRemote) {
                             // P4: регистрируем node_id -> url для FIB-маршрутизации.
                             inner.node_url.write().await.insert(origin, remote.url.clone());
                         }
-                        NetMessage::Hello { source_id, neighbors, tools } => {
-                            handle_hello(&inner, source_id, neighbors, tools).await;
+                        NetMessage::Hello { source_id, seq, neighbors, tools } => {
+                            handle_hello(&inner, source_id, neighbors, tools, seq).await;
                         }
                         NetMessage::Bye { source_id } => {
                             super::discovery::handle_bye(&inner, &source_id).await;
@@ -113,7 +150,7 @@ pub(crate) async fn run_outbound_loop(inner: Arc<NetInner>, remote: NetRemote) {
             }
             Err(e) => {
                 error!("[Хост] Net: не удалось подключиться к {}: {}", remote.url, e);
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(retry_interval)).await;
             }
         }
     }

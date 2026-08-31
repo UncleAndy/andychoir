@@ -32,6 +32,7 @@ pub async fn start_net(tx: mpsc::Sender<Event>, cfg: NetConfig) -> super::NetHan
         )),
         dedup_last_reset: Arc::new(RwLock::new(super::dedup::current_unix_secs())),
         lsdb: Arc::new(RwLock::new(HashMap::new())),
+        hello_seq: Arc::new(RwLock::new(HashMap::new())),
         fib: Arc::new(RwLock::new(HashMap::new())),
         node_url: Arc::new(RwLock::new(HashMap::new())),
     });
@@ -144,8 +145,8 @@ mod tests {
     #[test]
     fn remote_matching() {
         let remotes = vec![
-            NetRemote { url: "ws://b".into(), token: "".into(), targets: vec!["tool:calculator".into()] },
-            NetRemote { url: "ws://c".into(), token: "".into(), targets: vec!["tool:file".into()] },
+            NetRemote { url: "ws://b".into(), token: "".into(), targets: vec!["tool:calculator".into()], retry_interval_secs: 0, connect_timeout_secs: 0 },
+            NetRemote { url: "ws://c".into(), token: "".into(), targets: vec!["tool:file".into()], retry_interval_secs: 0, connect_timeout_secs: 0 },
         ];
         // tool:calculator -> хост b
         let r = remotes.iter().find(|r| r.targets.iter().any(|t| {
@@ -183,13 +184,15 @@ mod tests {
         }];
         let msg = NetMessage::Hello {
             source_id: "00000000-0000-0000-0000-0000000000a1".into(),
+            seq: 1,
             neighbors: vec!["00000000-0000-0000-0000-0000000000b2".into()],
             tools: tools.clone(),
         };
         let s = serde_json::to_string(&msg).unwrap();
         match super::message::unpack_message(&s).unwrap() {
-            NetMessage::Hello { source_id, neighbors, tools: t } => {
+            NetMessage::Hello { source_id, seq, neighbors, tools: t } => {
                 assert_eq!(source_id, "00000000-0000-0000-0000-0000000000a1");
+                assert_eq!(seq, 1, "seq должен сохраняться в сообщении");
                 assert_eq!(neighbors, vec!["00000000-0000-0000-0000-0000000000b2"]);
                 assert_eq!(t.len(), 1);
             }
@@ -311,6 +314,7 @@ mod tests {
             "00000000-0000-0000-0000-0000000000b2".into(),
             vec!["00000000-0000-0000-0000-0000000000c3".into()],
             tools.clone(),
+            0,
         )
         .await;
         // LSDB содержит узел b2 с соседом c3.
@@ -328,7 +332,7 @@ mod tests {
     async fn p3_hello_ignores_self() {
         let inner = NetInner::new_test();
         let my_id = inner.cfg.node_id.clone();
-        super::discovery::handle_hello(&inner, my_id.clone(), vec![], vec![]).await;
+        super::discovery::handle_hello(&inner, my_id.clone(), vec![], vec![], 0).await;
         assert!(inner.lsdb.read().await.get(&my_id).is_none(), "свой node_id не должен попасть в LSDB");
     }
 
@@ -337,8 +341,8 @@ mod tests {
     async fn p3_lsdb_update_replaces_neighbors() {
         let inner = NetInner::new_test();
         let id = "00000000-0000-0000-0000-0000000000b2".to_string();
-        super::discovery::handle_hello(&inner, id.clone(), vec!["c3".into()], vec![]).await;
-        super::discovery::handle_hello(&inner, id.clone(), vec!["c3".into(), "d4".into()], vec![]).await;
+        super::discovery::handle_hello(&inner, id.clone(), vec!["c3".into()], vec![], 1).await;
+        super::discovery::handle_hello(&inner, id.clone(), vec!["c3".into(), "d4".into()], vec![], 2).await;
         let lsdb = inner.lsdb.read().await;
         let (neighbors, _ts) = lsdb.get(&id).unwrap();
         // Должны быть оба соседа, без дублей c3.
@@ -352,7 +356,7 @@ mod tests {
     async fn p3_lsdb_timestamp_recorded() {
         let inner = NetInner::new_test();
         let before = super::dedup::current_unix_secs();
-        super::discovery::handle_hello(&inner, "b2".into(), vec![], vec![]).await;
+        super::discovery::handle_hello(&inner, "b2".into(), vec![], vec![], 0).await;
         let after = super::dedup::current_unix_secs();
         let lsdb = inner.lsdb.read().await;
         let (_n, ts) = lsdb.get("b2").unwrap();
@@ -407,7 +411,7 @@ mod tests {
     async fn p4_fib_direct_neighbor() {
         let inner = NetInner::new_test();
         // A (my_id) видит Hello от B с соседями [A].
-        super::discovery::handle_hello(&inner, "00000000-0000-0000-0000-0000000000b2".into(), vec![inner.cfg.node_id.clone()], vec![]).await;
+        super::discovery::handle_hello(&inner, "00000000-0000-0000-0000-0000000000b2".into(), vec![inner.cfg.node_id.clone()], vec![], 0).await;
         let fib = inner.fib.read().await;
         assert_eq!(
             fib.get("00000000-0000-0000-0000-0000000000b2").map(|s| s.as_str()),
@@ -436,7 +440,7 @@ mod tests {
     #[tokio::test]
     async fn p4_rebuild_fib_builds_routes() {
         let inner = NetInner::new_test();
-        super::discovery::handle_hello(&inner, "00000000-0000-0000-0000-0000000000b2".into(), vec![inner.cfg.node_id.clone()], vec![]).await;
+        super::discovery::handle_hello(&inner, "00000000-0000-0000-0000-0000000000b2".into(), vec![inner.cfg.node_id.clone()], vec![], 0).await;
         let fib = inner.fib.read().await;
         assert!(fib.contains_key("00000000-0000-0000-0000-0000000000b2"), "FIB содержит маршрут до B");
     }
@@ -447,7 +451,7 @@ mod tests {
         let inner = NetInner::new_test();
         let my = inner.cfg.node_id.clone();
         // Сосед B знает нас.
-        super::discovery::handle_hello(&inner, "00000000-0000-0000-0000-0000000000b2".into(), vec![my.clone()], vec![]).await;
+        super::discovery::handle_hello(&inner, "00000000-0000-0000-0000-0000000000b2".into(), vec![my.clone()], vec![], 0).await;
         assert!(inner.fib.read().await.get(&my).is_none(), "свой node_id не в FIB");
     }
 
@@ -478,7 +482,7 @@ mod tests {
         // Имитируем получение Capabilities от B (исходящее соединение на ws://b).
         inner.node_url.write().await.insert(b.clone(), "ws://host-b:8092/net".to_string());
         // B — прямой сосед.
-        super::discovery::handle_hello(&inner, b.clone(), vec![inner.cfg.node_id.clone()], vec![]).await;
+        super::discovery::handle_hello(&inner, b.clone(), vec![inner.cfg.node_id.clone()], vec![], 0).await;
         // next-hop для B = B, и для него есть url.
         let hop = super::lsdb::route_next_hop(&inner, &b).await.unwrap();
         let url = inner.node_url.read().await.get(&hop).cloned();
@@ -492,7 +496,7 @@ mod tests {
         let b = "00000000-0000-0000-0000-0000000000b2".to_string();
         let url = "ws://host-b:8092/net".to_string();
         // FIB: B — прямой сосед (next-hop = B).
-        super::discovery::handle_hello(&inner, b.clone(), vec![inner.cfg.node_id.clone()], vec![]).await;
+        super::discovery::handle_hello(&inner, b.clone(), vec![inner.cfg.node_id.clone()], vec![], 0).await;
         // node_url: B -> url исходящего соединения.
         inner.node_url.write().await.insert(b.clone(), url.clone());
         // Исходящий канал к url.
@@ -532,6 +536,8 @@ mod tests {
                 url: url.clone(),
                 token: "".into(),
                 targets: vec!["tool:pinned".into()],
+                retry_interval_secs: 0,
+                connect_timeout_secs: 0,
             });
             c
         };
@@ -624,7 +630,7 @@ mod tests {
         let b = "00000000-0000-0000-0000-0000000000b2".to_string();
         let url = "ws://host-b/net".to_string();
         // B — прямой сосед (FIB), node_url известен.
-        super::discovery::handle_hello(&inner, b.clone(), vec![inner.cfg.node_id.clone()], vec![]).await;
+        super::discovery::handle_hello(&inner, b.clone(), vec![inner.cfg.node_id.clone()], vec![], 0).await;
         inner.node_url.write().await.insert(b.clone(), url.clone());
         // НО outbound[url] НЕТ — должно буферизоваться.
         // (set_inner не нужен: forward_inner берёт inner явно)
@@ -645,7 +651,7 @@ mod tests {
         let inner = NetInner::new_test();
         let b = "00000000-0000-0000-0000-0000000000b2".to_string();
         let url = "ws://host-b/net".to_string();
-        super::discovery::handle_hello(&inner, b.clone(), vec![inner.cfg.node_id.clone()], vec![]).await;
+        super::discovery::handle_hello(&inner, b.clone(), vec![inner.cfg.node_id.clone()], vec![], 0).await;
         inner.node_url.write().await.insert(b.clone(), url.clone());
         let (tx, mut rx) = mpsc::channel::<String>(8);
         inner.outbound.write().await.insert(url.clone(), tx);
@@ -677,7 +683,7 @@ mod tests {
     async fn p6_handle_bye_removes_from_lsdb() {
         let inner = NetInner::new_test();
         let b = "00000000-0000-0000-0000-0000000000b2".to_string();
-        super::discovery::handle_hello(&inner, b.clone(), vec![inner.cfg.node_id.clone()], vec![]).await;
+        super::discovery::handle_hello(&inner, b.clone(), vec![inner.cfg.node_id.clone()], vec![], 0).await;
         assert!(inner.lsdb.read().await.contains_key(&b), "B в LSDB");
         assert!(inner.fib.read().await.contains_key(&b), "B в FIB");
         super::discovery::handle_bye(&inner, &b).await;
@@ -771,9 +777,9 @@ mod tests {
         let b = "00000000-0000-0000-0000-0000000000b2".to_string();
         let c = "00000000-0000-0000-0000-0000000000c3".to_string();
         // B анонсирует соседей A и C (flooding от B).
-        super::discovery::handle_hello(&inner, b.clone(), vec![my.clone(), c.clone()], vec![]).await;
+        super::discovery::handle_hello(&inner, b.clone(), vec![my.clone(), c.clone()], vec![], 0).await;
         // C анонсирует соседа B (flooding от C).
-        super::discovery::handle_hello(&inner, c.clone(), vec![b.clone()], vec![]).await;
+        super::discovery::handle_hello(&inner, c.clone(), vec![b.clone()], vec![], 0).await;
         // LSDB A содержит B и C (сходимость: A знает всю цепочку).
         assert!(inner.lsdb.read().await.contains_key(&b), "B в LSDB A");
         assert!(inner.lsdb.read().await.contains_key(&c), "C в LSDB A");
@@ -799,11 +805,11 @@ mod tests {
         let b = "00000000-0000-0000-0000-0000000000b2".to_string();
         let c = "00000000-0000-0000-0000-0000000000c3".to_string();
         // Сначала только B известен (прямой сосед).
-        super::discovery::handle_hello(&inner, b.clone(), vec![my.clone()], vec![]).await;
+        super::discovery::handle_hello(&inner, b.clone(), vec![my.clone()], vec![], 1).await;
         // До появления C: маршрута к C нет.
         assert!(super::lsdb::route_next_hop(&inner, &c).await.is_none(), "C ещё недостижим");
         // B анонсирует C как соседа (flooding).
-        super::discovery::handle_hello(&inner, b.clone(), vec![my.clone(), c.clone()], vec![]).await;
+        super::discovery::handle_hello(&inner, b.clone(), vec![my.clone(), c.clone()], vec![], 2).await;
         // Теперь C достижим через B.
         assert_eq!(
             super::lsdb::route_next_hop(&inner, &c).await.as_deref(),
@@ -821,8 +827,8 @@ mod tests {
         let b = "00000000-0000-0000-0000-0000000000b2".to_string();
         let c = "00000000-0000-0000-0000-0000000000c3".to_string();
         // Топология: B видит A и C (B — транзит).
-        super::discovery::handle_hello(&inner, b.clone(), vec![my.clone(), c.clone()], vec![]).await;
-        super::discovery::handle_hello(&inner, c.clone(), vec![b.clone()], vec![]).await;
+        super::discovery::handle_hello(&inner, b.clone(), vec![my.clone(), c.clone()], vec![], 0).await;
+        super::discovery::handle_hello(&inner, c.clone(), vec![b.clone()], vec![], 0).await;
         // node_url: B → исходящий канал к B.
         let url_b = "ws://host-b/net".to_string();
         inner.node_url.write().await.insert(b.clone(), url_b.clone());
@@ -840,5 +846,64 @@ mod tests {
             }
             _ => panic!("expected Event"),
         }
+    }
+
+    // P3: anti-loop — повторный Hello с тем же/меньшим seq игнорируется
+    // (не обновляет LSDB, не флудит). Защита от петель flooding в циклах.
+    #[tokio::test]
+    async fn p3_hello_seq_anti_loop() {
+        let inner = NetInner::new_test();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        // Первый Hello (seq=5) принимается.
+        super::discovery::handle_hello(&inner, b.clone(), vec!["c3".into()], vec![], 5).await;
+        assert!(inner.lsdb.read().await.contains_key(&b), "первый Hello принят");
+        // Повторный с тем же seq — игнорируется (не перезаписывает).
+        super::discovery::handle_hello(&inner, b.clone(), vec!["x9".into()], vec![], 5).await;
+        let nb = inner.lsdb.read().await.get(&b).unwrap().0.clone();
+        assert_eq!(nb, vec!["c3".to_string()], "повтор с тем же seq не меняет соседей");
+        // С меньшим seq — тоже игнорируется.
+        super::discovery::handle_hello(&inner, b.clone(), vec!["y7".into()], vec![], 3).await;
+        let nb2 = inner.lsdb.read().await.get(&b).unwrap().0.clone();
+        assert_eq!(nb2, vec!["c3".to_string()], "меньший seq не меняет соседей");
+        // С бОльшим seq — принимается (обновление).
+        super::discovery::handle_hello(&inner, b.clone(), vec!["d4".into()], vec![], 7).await;
+        let nb3 = inner.lsdb.read().await.get(&b).unwrap().0.clone();
+        assert_eq!(nb3, vec!["d4".to_string()], "больший seq обновляет соседей");
+    }
+
+    // P3: pack_hello сообщает соседей по node_id (из node_url/incoming), а не по url.
+    // Критично для mesh-циклов: граф строится по node_id, не по url.
+    #[tokio::test]
+    async fn p3_pack_hello_neighbors_are_node_ids() {
+        let inner = NetInner::new_test();
+        // Прямой сосед B известен по node_id (как при Capabilities/Hello).
+        inner.node_url.write().await.insert("00000000-0000-0000-0000-0000000000b2".to_string(), "ws://b/net".to_string());
+        let s = super::discovery::pack_hello(&inner).await;
+        match super::message::unpack_message(&s).unwrap() {
+            NetMessage::Hello { neighbors, .. } => {
+                // Сосед = node_id, НЕ url.
+                assert!(neighbors.contains(&"00000000-0000-0000-0000-0000000000b2".to_string()),
+                    "сосед в Hello — node_id, а не url");
+                assert!(!neighbors.iter().any(|n| n.starts_with("ws://")),
+                    "url не должен попадать в соседи");
+            }
+            _ => panic!("expected Hello"),
+        }
+    }
+
+    // P3: flooding в цикле A→B→C→A не зацикливается — второй проход того же
+    // Hello (тот же seq) не вызывает повторной пересылки (проверяем по hello_seq).
+    #[tokio::test]
+    async fn p3_flooding_loop_stops() {
+        let inner = NetInner::new_test();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        // Имитируем получение Hello от B (seq=10). Должен записать seq и обновить LSDB.
+        super::discovery::handle_hello(&inner, b.clone(), vec![], vec![], 10).await;
+        assert_eq!(inner.hello_seq.read().await.get(&b).copied(), Some(10));
+        // Повторный приход того же Hello (seq=10, например по циклу обратно) — игнорируется.
+        super::discovery::handle_hello(&inner, b.clone(), vec!["c3".into()], vec![], 10).await;
+        // neighbors не изменились (не было повторной обработки).
+        let nb = inner.lsdb.read().await.get(&b).unwrap().0.clone();
+        assert!(nb.is_empty(), "повторный flood с тем же seq не перезаписывает");
     }
 }

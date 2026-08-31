@@ -215,7 +215,18 @@ pub struct NetConfig {
     pub token: Vec<String>,
     /// Удалённые хосты (персистентные исходящие WS-соединения).
     pub remotes: Vec<NetRemote>,
+    /// Интервал между попытками (пере)подключения к remote (секунды).
+    /// 0 → использовать значение по умолчанию (10с).
+    pub connect_retry_interval_secs: u64,
+    /// Окно попыток подключения (секунды). После его истечения remote
+    /// считается недоступным и задача завершается. 0 → бесконечные попытки.
+    pub connect_timeout_secs: u64,
 }
+
+/// Значение по умолчанию для интервала retry (если 0 в конфиге).
+pub(crate) const DEFAULT_CONNECT_RETRY_INTERVAL_SECS: u64 = 10;
+/// Значение по умолчанию для окна подключения (если 0 в конфиге). 5 минут.
+pub(crate) const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 300;
 
 /// Один удалённый хост, к которому мост держит персистентное соединение.
 #[derive(Deserialize, Clone)]
@@ -227,6 +238,10 @@ pub struct NetRemote {
     pub token: String,
     /// Какие target обслуживает удалённый хост (напр. ["tool:calculator"]).
     pub targets: Vec<String>,
+    /// Интервал retry для этого remote (секунды). 0 → из NetConfig.connect_retry_interval_secs.
+    pub retry_interval_secs: u64,
+    /// Окно подключения для этого remote (секунды). 0 → из NetConfig.connect_timeout_secs.
+    pub connect_timeout_secs: u64,
 }
 
 impl Default for NetRemote {
@@ -235,6 +250,8 @@ impl Default for NetRemote {
             url: String::new(),
             token: String::new(),
             targets: Vec::new(),
+            retry_interval_secs: 0,
+            connect_timeout_secs: 0,
         }
     }
 }

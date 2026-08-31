@@ -35,8 +35,12 @@ history:
 net:
   node_id: "00000000-0000-0000-0000-0000000000c3"
   listen_port: 0
+  connect_retry_interval_secs: 10   # пауза между попытками (default 10)
+  connect_timeout_secs: 300         # окно отказа 5 мин; 0 = вечно
   token: []
   remotes:
     - url: "ws://127.0.0.1:8091/net"
       token: "secret-c"
       targets: []
+      retry_interval_secs: 0
+      connect_timeout_secs: 0

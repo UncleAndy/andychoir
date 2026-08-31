@@ -31,8 +31,10 @@ pub(crate) enum NetMessage {
     },
     /// Приветствие (discovery): анонс node_id + соседей + инструменты.
     /// Flooding по сети для построения полной топологии (LSDB).
+    /// seq — монотонный счётчик источника (защита от петель flooding в циклах).
     Hello {
         source_id: String,
+        seq: u64,
         neighbors: Vec<String>,
         tools: Vec<ToolDef>,
     },

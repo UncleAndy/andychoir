@@ -62,6 +62,8 @@ pub(crate) struct NetInner {
     /// P3: Link-State Database — полная топология сети.
     /// node_id -> (список соседей node_id, время последнего Hello).
     pub(crate) lsdb: Arc<RwLock<HashMap<String, (Vec<String>, u64)>>>,
+    /// P3: последний виденный seq Hello по source_id (защита от петель flooding).
+    pub(crate) hello_seq: Arc<RwLock<HashMap<String, u64>>>,
     /// P4: FIB (Forwarding Information Base) — таблица маршрутизации.
     /// target_node_id -> next_hop_node_id (через кого слать).
     pub(crate) fib: Arc<RwLock<HashMap<String, String>>>,
@@ -94,6 +96,7 @@ impl NetInner {
             )),
             dedup_last_reset: Arc::new(RwLock::new(dedup::current_unix_secs())),
             lsdb: Arc::new(RwLock::new(HashMap::new())),
+            hello_seq: Arc::new(RwLock::new(HashMap::new())),
             fib: Arc::new(RwLock::new(HashMap::new())),
             node_url: Arc::new(RwLock::new(HashMap::new())),
         })

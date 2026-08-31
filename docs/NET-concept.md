@@ -285,3 +285,38 @@ No manual `targets`, no central server — pure link-state mesh.
   is dropped. Shortest-path routing on a static LSDB snapshot is loop-free;
   TTL is the safety net during convergence.
 
+### 8.5 Retry, timeouts, and loop-safe discovery
+
+**Outbound connection retry (configurable).** Each `remotes` entry (and the global
+`NetConfig`) accepts retry knobs:
+
+```yaml
+net:
+  connect_retry_interval_secs: 10   # pause between attempts (default 10)
+  connect_timeout_secs: 300        # give-up window (default 300 = 5 min); 0 = retry forever
+  remotes:
+    - url: "ws://127.0.0.1:8091/net"
+      token: "secret-b"
+      retry_interval_secs: 0        # 0 → inherit from NetConfig (10)
+      connect_timeout_secs: 0       # 0 → inherit from NetConfig (300)
+```
+
+This lets a 3-host ring converge even if hosts start at different times: the
+outbound task keeps retrying (default every 10s, up to 5 min) until the peer is
+reachable. `0` for `connect_timeout_secs` means "retry forever" (useful for
+long-lived mesh links behind unreliable networks).
+
+**Loop-safe discovery (mesh cycles).** The mesh supports topology cycles
+(A→B→C→A). Two mechanisms keep it safe:
+
+1. **Neighbors are advertised by `node_id`, not URL.** `Hello.neighbors` carries
+   the `node_id`s of direct links (from `node_url` / `incoming_senders`), so the
+   LSDB graph is built consistently across the whole mesh — including cycles.
+2. **Monotonic `seq` on `Hello` (anti-loop flooding).** Each host stamps its
+   `Hello` with a monotonically increasing `seq`. A node ignores any `Hello`
+   whose `seq ≤` the last seen `seq` from that source — so a `Hello` that loops
+   back around the ring is dropped instead of being re-flooded forever.
+
+Combined with the Dijkstra FIB (shortest path) and per-hop `ttl` decrement,
+events route correctly through cycles without infinite flooding or routing loops.
+

@@ -43,6 +43,8 @@ history:
 net:
   node_id: "00000000-0000-0000-0000-0000000000b2"
   listen_port: 8091
+  connect_retry_interval_secs: 10   # default; здесь remotes пуст, не используется
+  connect_timeout_secs: 300
   token:
     - "secret-b"
     - "secret-c"
