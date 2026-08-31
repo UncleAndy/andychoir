@@ -24,7 +24,16 @@ pub(crate) const GRAPH_EDGE_WEIGHT: u32 = 1;
 pub(crate) async fn rebuild_fib(inner: &Arc<NetInner>) {
     let lsdb = inner.lsdb.read().await;
     // Собираем множество всех узлов и рёбер.
+    // Узлы = ключи LSDB + self + ВСЕ соседи, упомянутые в LSDB (узел может быть
+    // достижим через next-hop даже до того, как сам анонсировал Hello — mesh).
     let mut nodes: Vec<String> = lsdb.keys().cloned().collect();
+    for (_node, (neighbors, _)) in lsdb.iter() {
+        for nb in neighbors {
+            if !nodes.contains(nb) {
+                nodes.push(nb.clone());
+            }
+        }
+    }
     nodes.push(inner.cfg.node_id.clone());
     nodes.sort();
     nodes.dedup();

@@ -761,4 +761,84 @@ mod tests {
         // И B больше нет в FIB.
         assert!(!inner.fib.read().await.contains_key(&b), "B удалён из FIB");
     }
+
+    // P7: сходимость LSDB через HELLO flooding (в памяти, без сети).
+    // A видит B, B видит C → после Hello от B и C, LSDB A содержит все 3 узла.
+    #[tokio::test]
+    async fn p7_hello_flooding_convergence() {
+        let inner = NetInner::new_test();
+        let my = inner.cfg.node_id.clone();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        let c = "00000000-0000-0000-0000-0000000000c3".to_string();
+        // B анонсирует соседей A и C (flooding от B).
+        super::discovery::handle_hello(&inner, b.clone(), vec![my.clone(), c.clone()], vec![]).await;
+        // C анонсирует соседа B (flooding от C).
+        super::discovery::handle_hello(&inner, c.clone(), vec![b.clone()], vec![]).await;
+        // LSDB A содержит B и C (сходимость: A знает всю цепочку).
+        assert!(inner.lsdb.read().await.contains_key(&b), "B в LSDB A");
+        assert!(inner.lsdb.read().await.contains_key(&c), "C в LSDB A");
+        // A знает, что B видит C (транзитивность через flooding).
+        {
+            let guard = inner.lsdb.read().await;
+            let b_neighbors = &guard.get(&b).unwrap().0;
+            assert!(b_neighbors.contains(&c), "A знает, что B видит C");
+        }
+        // FIB построен: A→C идёт через B.
+        assert_eq!(
+            super::lsdb::route_next_hop(&inner, &c).await.as_deref(),
+            Some(b.as_str()),
+            "FIB: A→C через B"
+        );
+    }
+
+    // P7: FIB пересчитывается при появлении нового соседа (маршрут к C появляется).
+    #[tokio::test]
+    async fn p7_fib_recomputes_on_new_neighbor() {
+        let inner = NetInner::new_test();
+        let my = inner.cfg.node_id.clone();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        let c = "00000000-0000-0000-0000-0000000000c3".to_string();
+        // Сначала только B известен (прямой сосед).
+        super::discovery::handle_hello(&inner, b.clone(), vec![my.clone()], vec![]).await;
+        // До появления C: маршрута к C нет.
+        assert!(super::lsdb::route_next_hop(&inner, &c).await.is_none(), "C ещё недостижим");
+        // B анонсирует C как соседа (flooding).
+        super::discovery::handle_hello(&inner, b.clone(), vec![my.clone(), c.clone()], vec![]).await;
+        // Теперь C достижим через B.
+        assert_eq!(
+            super::lsdb::route_next_hop(&inner, &c).await.as_deref(),
+            Some(b.as_str()),
+            "после Hello от B маршрут к C появился"
+        );
+    }
+
+    // P7: end-to-end mesh-маршрутизация A→B→C (в памяти).
+    // A пересылает host:C:tool → сообщение уходит в канал B (next-hop), не в C напрямую.
+    #[tokio::test]
+    async fn p7_end_to_end_mesh_routing() {
+        let inner = NetInner::new_test();
+        let my = inner.cfg.node_id.clone();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        let c = "00000000-0000-0000-0000-0000000000c3".to_string();
+        // Топология: B видит A и C (B — транзит).
+        super::discovery::handle_hello(&inner, b.clone(), vec![my.clone(), c.clone()], vec![]).await;
+        super::discovery::handle_hello(&inner, c.clone(), vec![b.clone()], vec![]).await;
+        // node_url: B → исходящий канал к B.
+        let url_b = "ws://host-b/net".to_string();
+        inner.node_url.write().await.insert(b.clone(), url_b.clone());
+        let (tx_b, mut rx_b) = mpsc::channel::<String>(8);
+        inner.outbound.write().await.insert(url_b.clone(), tx_b);
+
+        let ev = make_event("host:00000000-0000-0000-0000-0000000000c3:tool:calculator", "sess-x");
+        let sent = forward_inner(&inner, &ev).await;
+        assert!(sent, "событие A→C ушло по сети");
+        let msg = rx_b.try_recv().expect("сообщение ушло в канал next-hop B");
+        match super::message::unpack_message(&msg).unwrap() {
+            NetMessage::Event { event, .. } => {
+                let ev2 = super::message::value_to_event(&event).unwrap();
+                assert_eq!(ev2.target, "host:00000000-0000-0000-0000-0000000000c3:tool:calculator");
+            }
+            _ => panic!("expected Event"),
+        }
+    }
 }
