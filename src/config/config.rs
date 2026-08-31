@@ -346,4 +346,35 @@ mod tests {
         let cfg = load_temp("yaml", "logger: {}\nplugins: []\nnet:\n  node_id: \" host-a \"\n").await;
         assert!(uuid::Uuid::parse_str(&cfg.net.node_id).is_ok(), "node_id с пробелами → UUID, получено: {}", cfg.net.node_id);
     }
+
+    // Ring: 3 кольцевых конфига (A→B→C→A) парсятся корректно и образуют кольцо.
+    // A — фронт-терминал, B — агент, C — калькулятор. Каждый dial-ит следующего.
+    #[tokio::test]
+    async fn ring_configs_form_closed_loop() {
+        let a = Config::new_from_file(PathBuf::from("test_ring_a.yaml")).await.unwrap();
+        let b = Config::new_from_file(PathBuf::from("test_ring_b.yaml")).await.unwrap();
+        let c = Config::new_from_file(PathBuf::from("test_ring_c.yaml")).await.unwrap();
+        // node_id корректны.
+        assert_eq!(a.net.node_id, "00000000-0000-0000-0000-0000000000a1");
+        assert_eq!(b.net.node_id, "00000000-0000-0000-0000-0000000000b2");
+        assert_eq!(c.net.node_id, "00000000-0000-0000-0000-0000000000c3");
+        // Каждый слушает свой порт.
+        assert_eq!(a.net.listen_port, 8092);
+        assert_eq!(b.net.listen_port, 8093);
+        assert_eq!(c.net.listen_port, 8094);
+        // Кольцо: A dials B:8093, B dials C:8094, C dials A:8092.
+        assert_eq!(a.net.remotes.len(), 1);
+        assert_eq!(a.net.remotes[0].url, "ws://127.0.0.1:8093/net");
+        assert_eq!(b.net.remotes[0].url, "ws://127.0.0.1:8094/net");
+        assert_eq!(c.net.remotes[0].url, "ws://127.0.0.1:8092/net");
+        // Замыкание кольца: A→B→C→A.
+        let next = |cfg: &Config| cfg.net.remotes[0].url.clone();
+        let a_next = next(&a);
+        let b_next = next(&b);
+        let c_next = next(&c);
+        // B — это a_next, C — это b_next, A — это c_next.
+        assert!(a_next.contains(&b.net.listen_port.to_string()));
+        assert!(b_next.contains(&c.net.listen_port.to_string()));
+        assert!(c_next.contains(&a.net.listen_port.to_string()));
+    }
 }

@@ -1,0 +1,55 @@
+plugins:
+  # Нода B: ТОЛЬКО агент (LLM). Без локальных инструментов/фронта.
+  # Агент использует calculator, который живёт на ноде C (через сеть).
+  - file: "plugins/agent_plugin/target/wasm32-wasip2/debug/agent_plugin.wasm"
+    name: "agent:demo"
+    access: []
+    config:
+      name: "demo"
+      model:
+        model_name: "gemma4:cloud"
+        api_url: "http://localhost:11434/v1"
+        api_key: null
+      system_prompt: "You are a helpful assistant."
+      tools: ["calculator"]   # разрешён; реально вызывается на ноде C через host:C:tool:calculator
+    allow_background: true
+
+metrics:
+  enabled: false
+  host: "127.0.0.1"
+  port: 9091
+  update_interval_secs: 15
+  location: "/metrics"
+
+startup:
+  timeout_secs: 20
+
+logger:
+  log_level: "debug"
+  logs_directory: "./logs"
+  file_base_name: "andychoir"
+  max_file_size_bytes: 1048576
+  days_to_keep: 3
+
+history:
+  max_events_per_session: 100
+  dir: "./.andychour/sessions"
+  current_session_file: "~/.andychour/current_session.json"
+  session_ttl_secs: 604800
+  save_period_secs: 1
+
+# Нода B (агент): слушает 8093, подключается к C (8094).
+# Кольцо: A -> B -> C -> A.
+net:
+  node_id: "00000000-0000-0000-0000-0000000000b2"
+  listen_port: 8093
+  connect_retry_interval_secs: 10
+  connect_timeout_secs: 300
+  token:
+    - "secret-b"
+  remotes:
+    - url: "ws://127.0.0.1:8094/net"   # следующая нода в кольце: C
+      token: "secret-c"
+      targets: []
+      retry_interval_secs: 0
+      connect_timeout_secs: 0
