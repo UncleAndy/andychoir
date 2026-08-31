@@ -74,6 +74,7 @@ mod tests {
     use fastbloom::BloomFilter;
     use super::dedup::reset_dedup;
     use super::discovery::broadcast_to_neighbors;
+    use super::super::set_inner;
 
     fn make_event(target: &str, session: &str) -> Event {
         Event {
@@ -473,5 +474,77 @@ mod tests {
         let hop = super::lsdb::route_next_hop(&inner, &b).await.unwrap();
         let url = inner.node_url.read().await.get(&hop).cloned();
         assert_eq!(url.as_deref(), Some("ws://host-b:8092/net"));
+    }
+
+    // P5: forward маршрутизирует host:<node_id>:<tool> через FIB (next_hop → url).
+    #[tokio::test]
+    async fn p5_forward_routes_via_fib() {
+        let inner = NetInner::new_test();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        let url = "ws://host-b:8092/net".to_string();
+        // FIB: B — прямой сосед (next-hop = B).
+        super::discovery::handle_hello(&inner, b.clone(), vec![inner.cfg.node_id.clone()], vec![]).await;
+        // node_url: B -> url исходящего соединения.
+        inner.node_url.write().await.insert(b.clone(), url.clone());
+        // Исходящий канал к url.
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        inner.outbound.write().await.insert(url.clone(), tx);
+        // Устанавливаем global inner.
+        set_inner(inner.clone());
+
+        let ev = make_event("host:00000000-0000-0000-0000-0000000000b2:tool:calculator", "sess-x");
+        let sent = forward(&ev).await;
+        assert!(sent, "событие должно уйти по сети");
+        let msg = rx.try_recv().expect("сообщение ушло в канал");
+        // Сообщение — Event с правильным target.
+        match super::message::unpack_message(&msg).unwrap() {
+            NetMessage::Event { event, .. } => {
+                let ev2 = super::message::value_to_event(&event).unwrap();
+                assert_eq!(ev2.target, "host:00000000-0000-0000-0000-0000000000b2:tool:calculator");
+            }
+            _ => panic!("expected Event"),
+        }
+    }
+
+    // P5: локальный tool (без host:) НЕ форвардится (forward возвращает false).
+    #[tokio::test]
+    async fn p5_forward_local_tool_not_routed() {
+        let inner = NetInner::new_test();
+        set_inner(inner.clone());
+        let ev = make_event("tool:calculator", "sess-x");
+        let sent = forward(&ev).await;
+        assert!(!sent, "локальный tool не форвардится");
+    }
+
+    // P5: fallback на ручной pinned-routing (targets) при отсутствии FIB-маршрута.
+    #[tokio::test]
+    async fn p5_forward_fallback_targets() {
+        let url = "ws://pinned-host/net".to_string();
+        let cfg = {
+            let mut c = NetConfig::default();
+            c.remotes.push(NetRemote {
+                url: url.clone(),
+                token: "".into(),
+                targets: vec!["tool:pinned".into()],
+            });
+            c
+        };
+        let inner = NetInner::new_test_with_cfg(cfg);
+        // Исходящий канал к url.
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        inner.outbound.write().await.insert(url.clone(), tx);
+        set_inner(inner.clone());
+
+        let ev = make_event("tool:pinned", "sess-x");
+        let sent = forward(&ev).await;
+        assert!(sent, "pinned target должен форвардиться");
+        let msg = rx.try_recv().expect("сообщение ушло в канал");
+        match super::message::unpack_message(&msg).unwrap() {
+            NetMessage::Event { event, .. } => {
+                let ev2 = super::message::value_to_event(&event).unwrap();
+                assert_eq!(ev2.target, "tool:pinned");
+            }
+            _ => panic!("expected Event"),
+        }
     }
 }

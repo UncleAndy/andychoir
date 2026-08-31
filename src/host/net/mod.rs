@@ -69,15 +69,20 @@ pub(crate) struct NetInner {
     pub(crate) node_url: Arc<RwLock<HashMap<String, String>>>,
 }
 
-static INNER: std::sync::OnceLock<Arc<NetInner>> = std::sync::OnceLock::new();
+static INNER: std::sync::Mutex<Option<Arc<NetInner>>> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
 impl NetInner {
     /// Тестовый конструктор (минимальный, без сетевых соединений).
     pub(crate) fn new_test() -> Arc<NetInner> {
+        Self::new_test_with_cfg(NetConfig::default())
+    }
+
+    /// Тестовый конструктор с заданным конфигом (remotes и т.п.).
+    pub(crate) fn new_test_with_cfg(cfg: NetConfig) -> Arc<NetInner> {
         Arc::new(NetInner {
             tx: mpsc::channel(1).0,
-            cfg: NetConfig::default(),
+            cfg,
             session_origin: Arc::new(RwLock::new(HashMap::new())),
             request_origin: Arc::new(RwLock::new(HashMap::new())),
             outbound: Arc::new(RwLock::new(HashMap::new())),
@@ -96,11 +101,11 @@ impl NetInner {
 }
 
 pub(crate) fn set_inner(inner: Arc<NetInner>) {
-    let _ = INNER.set(inner);
+    *INNER.lock().unwrap() = Some(inner);
 }
 
 pub(crate) fn get_inner() -> Option<Arc<NetInner>> {
-    INNER.get().cloned()
+    INNER.lock().unwrap().clone()
 }
 
 /// Handle для сетевого моста.
