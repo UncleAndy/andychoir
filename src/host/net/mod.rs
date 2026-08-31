@@ -113,4 +113,18 @@ pub(crate) fn get_inner() -> Option<Arc<NetInner>> {
 pub struct NetHandle {
     pub(crate) server: tokio::task::JoinHandle<()>,
     pub(crate) outbound: Vec<tokio::task::JoinHandle<()>>,
+    pub(crate) inner: Arc<NetInner>,
+}
+
+/// P6: graceful shutdown — при drop моста рассылаем Bye всем соседям.
+impl Drop for NetHandle {
+    fn drop(&mut self) {
+        let inner = self.inner.clone();
+        // Fire-and-forget: отправляем Bye асинхронно (Drop не может быть async).
+        tokio::spawn(async move {
+            let bye = discovery::pack_bye(&inner).await;
+            discovery::broadcast_to_neighbors(&inner, &bye, "").await;
+            crate::info!("[Хост] Net: мост остановлен, разослан Bye соседям");
+        });
+    }
 }

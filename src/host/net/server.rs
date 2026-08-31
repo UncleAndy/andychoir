@@ -85,8 +85,8 @@ pub(crate) async fn handle_incoming(inner: Arc<NetInner>, socket: WebSocket) {
                 handle_hello(&inner, source_id, neighbors, tools).await;
             }
             // P1: Bye (graceful leave) — обрабатывается в P6.
-            NetMessage::Bye { source_id: _ } => {
-                // TODO P6: удалить из LSDB, очистить каналы.
+            NetMessage::Bye { source_id } => {
+                super::discovery::handle_bye(&inner, &source_id).await;
             }
             NetMessage::Event { origin, source_id: _, event_id, ttl: _, hop: _hop, event } => {
                 if origin == inner.cfg.node_id {

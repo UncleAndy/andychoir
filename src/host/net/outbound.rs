@@ -75,8 +75,8 @@ pub(crate) async fn run_outbound_loop(inner: Arc<NetInner>, remote: NetRemote) {
                         NetMessage::Hello { source_id, neighbors, tools } => {
                             handle_hello(&inner, source_id, neighbors, tools).await;
                         }
-                        NetMessage::Bye { source_id: _ } => {
-                            // TODO P6: удалить из LSDB.
+                        NetMessage::Bye { source_id } => {
+                            super::discovery::handle_bye(&inner, &source_id).await;
                         }
                         NetMessage::Event { origin, source_id: _, event_id, ttl: _, hop: _hop, event } => {
                             if origin == inner.cfg.node_id {

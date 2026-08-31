@@ -11,7 +11,7 @@
 //! - `forward`   — маршрутизация событий (forward)
 
 use super::*;
-use super::discovery::run_discovery_loop;
+use super::discovery::{run_discovery_loop, run_lsdb_cleanup_loop};
 use super::outbound::run_outbound_loop;
 use super::server::run_incoming_server;
 use crate::config::config::NetConfig;
@@ -63,7 +63,16 @@ pub async fn start_net(tx: mpsc::Sender<Event>, cfg: NetConfig) -> super::NetHan
     });
     outbound.push(discovery);
 
-    super::NetHandle { server, outbound }
+    // P6: задача очистки LSDB от устаревших узлов (failure detection).
+    let cleanup = tokio::spawn({
+        let inner = inner.clone();
+        async move {
+            run_lsdb_cleanup_loop(inner).await;
+        }
+    });
+    outbound.push(cleanup);
+
+    super::NetHandle { server, outbound, inner }
 }
 
 #[cfg(test)]
@@ -74,7 +83,7 @@ mod tests {
     use fastbloom::BloomFilter;
     use super::dedup::reset_dedup;
     use super::discovery::broadcast_to_neighbors;
-    use super::super::set_inner;
+    use crate::host::net::forward::forward_inner;
 
     fn make_event(target: &str, session: &str) -> Event {
         Event {
@@ -489,11 +498,9 @@ mod tests {
         // Исходящий канал к url.
         let (tx, mut rx) = mpsc::channel::<String>(8);
         inner.outbound.write().await.insert(url.clone(), tx);
-        // Устанавливаем global inner.
-        set_inner(inner.clone());
 
         let ev = make_event("host:00000000-0000-0000-0000-0000000000b2:tool:calculator", "sess-x");
-        let sent = forward(&ev).await;
+        let sent = forward_inner(&inner, &ev).await;
         assert!(sent, "событие должно уйти по сети");
         let msg = rx.try_recv().expect("сообщение ушло в канал");
         // Сообщение — Event с правильным target.
@@ -510,9 +517,8 @@ mod tests {
     #[tokio::test]
     async fn p5_forward_local_tool_not_routed() {
         let inner = NetInner::new_test();
-        set_inner(inner.clone());
         let ev = make_event("tool:calculator", "sess-x");
-        let sent = forward(&ev).await;
+        let sent = forward_inner(&inner, &ev).await;
         assert!(!sent, "локальный tool не форвардится");
     }
 
@@ -533,10 +539,10 @@ mod tests {
         // Исходящий канал к url.
         let (tx, mut rx) = mpsc::channel::<String>(8);
         inner.outbound.write().await.insert(url.clone(), tx);
-        set_inner(inner.clone());
+        // (set_inner не нужен: forward_inner берёт inner явно)
 
         let ev = make_event("tool:pinned", "sess-x");
-        let sent = forward(&ev).await;
+        let sent = forward_inner(&inner, &ev).await;
         assert!(sent, "pinned target должен форвардиться");
         let msg = rx.try_recv().expect("сообщение ушло в канал");
         match super::message::unpack_message(&msg).unwrap() {
@@ -576,10 +582,10 @@ mod tests {
         inner.node_url.write().await.insert(b.clone(), url_b.clone());
         let (tx_b, mut rx_b) = mpsc::channel::<String>(8);
         inner.outbound.write().await.insert(url_b.clone(), tx_b);
-        set_inner(inner.clone());
+        // (set_inner не нужен: forward_inner берёт inner явно)
 
         let ev = make_event("host:00000000-0000-0000-0000-0000000000c3:tool:calculator", "sess-x");
-        let sent = forward(&ev).await;
+        let sent = forward_inner(&inner, &ev).await;
         assert!(sent, "событие должно уйти по сети");
         // Сообщение пришло в канал B (next-hop), а не в C напрямую.
         let msg = rx_b.try_recv().expect("сообщение ушло в канал B (next-hop)");
@@ -602,11 +608,11 @@ mod tests {
         inner.request_origin.write().await.insert("r1".into(), (origin.clone(), "0".to_string()));
         let (tx, mut rx) = mpsc::channel::<String>(8);
         inner.incoming_senders.write().await.insert(origin.clone(), tx);
-        set_inner(inner.clone());
+        // (set_inner не нужен: forward_inner берёт inner явно)
 
         let mut ev = make_event("tool:result", "sess-x");
         ev.request_id = "r1".into();
-        let sent = forward(&ev).await;
+        let sent = forward_inner(&inner, &ev).await;
         assert!(sent, "ответ должен уйти по входящему соединению origin");
         let _ = rx.try_recv().expect("сообщение ушло в incoming_senders[origin]");
     }
@@ -621,10 +627,10 @@ mod tests {
         super::discovery::handle_hello(&inner, b.clone(), vec![inner.cfg.node_id.clone()], vec![]).await;
         inner.node_url.write().await.insert(b.clone(), url.clone());
         // НО outbound[url] НЕТ — должно буферизоваться.
-        set_inner(inner.clone());
+        // (set_inner не нужен: forward_inner берёт inner явно)
 
         let ev = make_event("host:00000000-0000-0000-0000-0000000000b2:tool:x", "sess-x");
-        let sent = forward(&ev).await;
+        let sent = forward_inner(&inner, &ev).await;
         assert!(sent, "буферизация считается успехом");
         let pending = inner.pending_outbound.read().await;
         assert!(
@@ -643,10 +649,10 @@ mod tests {
         inner.node_url.write().await.insert(b.clone(), url.clone());
         let (tx, mut rx) = mpsc::channel::<String>(8);
         inner.outbound.write().await.insert(url.clone(), tx);
-        set_inner(inner.clone());
+        // (set_inner не нужен: forward_inner берёт inner явно)
 
         let ev = make_event("host:00000000-0000-0000-0000-0000000000b2:tool:x", "sess-x");
-        forward(&ev).await;
+        forward_inner(&inner, &ev).await;
         let msg = rx.try_recv().expect("сообщение ушло");
         match super::message::unpack_message(&msg).unwrap() {
             NetMessage::Event { ttl, .. } => {
@@ -660,9 +666,49 @@ mod tests {
     #[tokio::test]
     async fn p5_forward_unknown_host_returns_false() {
         let inner = NetInner::new_test();
-        set_inner(inner.clone());
+        // (set_inner не нужен: forward_inner берёт inner явно)
         let ev = make_event("host:99999999-0000-0000-0000-000000000099:tool:x", "sess-x");
-        let sent = forward(&ev).await;
+        let sent = forward_inner(&inner, &ev).await;
         assert!(!sent, "неизвестный хост без маршрута → не форвардим");
+    }
+
+    // P6: handle_bye удаляет узел из LSDB и пересчитывает FIB.
+    #[tokio::test]
+    async fn p6_handle_bye_removes_from_lsdb() {
+        let inner = NetInner::new_test();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        super::discovery::handle_hello(&inner, b.clone(), vec![inner.cfg.node_id.clone()], vec![]).await;
+        assert!(inner.lsdb.read().await.contains_key(&b), "B в LSDB");
+        assert!(inner.fib.read().await.contains_key(&b), "B в FIB");
+        super::discovery::handle_bye(&inner, &b).await;
+        assert!(!inner.lsdb.read().await.contains_key(&b), "B удалён из LSDB после Bye");
+        assert!(!inner.fib.read().await.contains_key(&b), "FIB пересчитан (B нет)");
+        assert!(inner.origin_tools.read().await.get(&b).is_none(), "инструменты B удалены");
+        assert!(inner.node_url.read().await.get(&b).is_none(), "node_url B удалён");
+    }
+
+    // P6: cleanup удаляет узел с устаревшим timestamp (>LSDB_TIMEOUT_SECS).
+    #[tokio::test]
+    async fn p6_cleanup_removes_expired_node() {
+        let inner = NetInner::new_test();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        // Регистрируем B с давним timestamp (старше таймаута).
+        let old = super::dedup::current_unix_secs().saturating_sub(super::discovery::LSDB_TIMEOUT_SECS + 10);
+        inner.lsdb.write().await.insert(b.clone(), (vec![], old));
+        super::lsdb::rebuild_fib(&inner).await;
+        assert!(inner.lsdb.read().await.contains_key(&b), "B в LSDB до cleanup");
+        super::discovery::cleanup_expired_once(&inner).await;
+        assert!(!inner.lsdb.read().await.contains_key(&b), "B удалён как устаревший");
+    }
+
+    // P6: cleanup НЕ удаляет свежий узел (timestamp в окне).
+    #[tokio::test]
+    async fn p6_cleanup_keeps_fresh_node() {
+        let inner = NetInner::new_test();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        let fresh = super::dedup::current_unix_secs();
+        inner.lsdb.write().await.insert(b.clone(), (vec![], fresh));
+        super::discovery::cleanup_expired_once(&inner).await;
+        assert!(inner.lsdb.read().await.contains_key(&b), "свежий B сохранён");
     }
 }

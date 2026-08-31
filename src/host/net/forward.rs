@@ -17,7 +17,14 @@ pub async fn forward(ev: &Event) -> bool {
     let Some(inner) = super::get_inner() else {
         return false;
     };
+    forward_inner(&inner, ev).await
+}
 
+/// Внутренняя логика форварда с явным `inner` (без обращения к глобальному
+/// состоянию). Удобно для тестирования: тест передаёт подготовленный
+/// `NetInner` напрямую, без гонки за глобальный `INNER` между параллельными
+/// тестами.
+pub(crate) async fn forward_inner(inner: &Arc<NetInner>, ev: &Event) -> bool {
     // Определяем origin_host для этого события (откуда пришёл запрос/сессия).
     let origin_host = {
         let r = inner.request_origin.read().await;
@@ -34,7 +41,7 @@ pub async fn forward(ev: &Event) -> bool {
     if let Some(node_id) = target.strip_prefix("host:") {
         // Извлекаем <node_id> (до следующего ':').
         let target_node = node_id.split(':').next().unwrap_or(node_id);
-        if let Some(next_hop) = route_next_hop(&inner, target_node).await {
+        if let Some(next_hop) = route_next_hop(inner, target_node).await {
             // next_hop -> url исходящего соединения (P4: node_url мапа).
             let node_url_map = inner.node_url.read().await;
             if let Some(url) = node_url_map.get(&next_hop) {
