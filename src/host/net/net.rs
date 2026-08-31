@@ -547,4 +547,122 @@ mod tests {
             _ => panic!("expected Event"),
         }
     }
+
+    // P5: multi-hop forward — host:C достижим через next-hop B (A→B→C).
+    // Сообщение должно уйти в канал B (next-hop), а не напрямую в C.
+    #[tokio::test]
+    async fn p5_forward_multi_hop_via_next_hop() {
+        let inner = NetInner::new_test();
+        let my = inner.cfg.node_id.clone();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        let c = "00000000-0000-0000-0000-0000000000c3".to_string();
+        // Топология: B видит A и C; C видит B.
+        inner.lsdb.write().await.insert(
+            b.clone(),
+            (vec![my.clone(), c.clone()], super::dedup::current_unix_secs()),
+        );
+        inner.lsdb.write().await.insert(
+            c.clone(),
+            (vec![b.clone()], super::dedup::current_unix_secs()),
+        );
+        super::lsdb::rebuild_fib(&inner).await;
+        assert_eq!(
+            super::lsdb::route_next_hop(&inner, &c).await.as_deref(),
+            Some(b.as_str()),
+            "A→C идёт через B (next-hop = B)"
+        );
+        // node_url: B -> url исходящего соединения B.
+        let url_b = "ws://host-b/net".to_string();
+        inner.node_url.write().await.insert(b.clone(), url_b.clone());
+        let (tx_b, mut rx_b) = mpsc::channel::<String>(8);
+        inner.outbound.write().await.insert(url_b.clone(), tx_b);
+        set_inner(inner.clone());
+
+        let ev = make_event("host:00000000-0000-0000-0000-0000000000c3:tool:calculator", "sess-x");
+        let sent = forward(&ev).await;
+        assert!(sent, "событие должно уйти по сети");
+        // Сообщение пришло в канал B (next-hop), а не в C напрямую.
+        let msg = rx_b.try_recv().expect("сообщение ушло в канал B (next-hop)");
+        match super::message::unpack_message(&msg).unwrap() {
+            NetMessage::Event { event, .. } => {
+                let ev2 = super::message::value_to_event(&event).unwrap();
+                // Target не меняется — B продолжит пересылку дальше.
+                assert_eq!(ev2.target, "host:00000000-0000-0000-0000-0000000000c3:tool:calculator");
+            }
+            _ => panic!("expected Event"),
+        }
+    }
+
+    // P5: возврат ответа по входящему соединению (origin из request_origin).
+    #[tokio::test]
+    async fn p5_forward_response_via_incoming() {
+        let inner = NetInner::new_test();
+        let origin = "00000000-0000-0000-0000-0000000000b2".to_string();
+        // Событие — ответ на запрос, пришедший с origin.
+        inner.request_origin.write().await.insert("r1".into(), (origin.clone(), "0".to_string()));
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        inner.incoming_senders.write().await.insert(origin.clone(), tx);
+        set_inner(inner.clone());
+
+        let mut ev = make_event("tool:result", "sess-x");
+        ev.request_id = "r1".into();
+        let sent = forward(&ev).await;
+        assert!(sent, "ответ должен уйти по входящему соединению origin");
+        let _ = rx.try_recv().expect("сообщение ушло в incoming_senders[origin]");
+    }
+
+    // P5: буферизация, когда FIB-маршрут есть, но outbound-канала ещё нет.
+    #[tokio::test]
+    async fn p5_forward_buffers_when_no_outbound() {
+        let inner = NetInner::new_test();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        let url = "ws://host-b/net".to_string();
+        // B — прямой сосед (FIB), node_url известен.
+        super::discovery::handle_hello(&inner, b.clone(), vec![inner.cfg.node_id.clone()], vec![]).await;
+        inner.node_url.write().await.insert(b.clone(), url.clone());
+        // НО outbound[url] НЕТ — должно буферизоваться.
+        set_inner(inner.clone());
+
+        let ev = make_event("host:00000000-0000-0000-0000-0000000000b2:tool:x", "sess-x");
+        let sent = forward(&ev).await;
+        assert!(sent, "буферизация считается успехом");
+        let pending = inner.pending_outbound.read().await;
+        assert!(
+            pending.get(&url).is_some_and(|v| !v.is_empty()),
+            "сообщение в буфере pending_outbound[url]"
+        );
+    }
+
+    // P5: TTL декрементируется при пересылке (16 → 15, защита от петель).
+    #[tokio::test]
+    async fn p5_forward_applies_ttl_decrement() {
+        let inner = NetInner::new_test();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        let url = "ws://host-b/net".to_string();
+        super::discovery::handle_hello(&inner, b.clone(), vec![inner.cfg.node_id.clone()], vec![]).await;
+        inner.node_url.write().await.insert(b.clone(), url.clone());
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        inner.outbound.write().await.insert(url.clone(), tx);
+        set_inner(inner.clone());
+
+        let ev = make_event("host:00000000-0000-0000-0000-0000000000b2:tool:x", "sess-x");
+        forward(&ev).await;
+        let msg = rx.try_recv().expect("сообщение ушло");
+        match super::message::unpack_message(&msg).unwrap() {
+            NetMessage::Event { ttl, .. } => {
+                assert_eq!(ttl, 15, "TTL должен декрементироваться 16 → 15");
+            }
+            _ => panic!("expected Event"),
+        }
+    }
+
+    // P5: неизвестный хост без маршрута/targets/origin → не форвардим (false).
+    #[tokio::test]
+    async fn p5_forward_unknown_host_returns_false() {
+        let inner = NetInner::new_test();
+        set_inner(inner.clone());
+        let ev = make_event("host:99999999-0000-0000-0000-000000000099:tool:x", "sess-x");
+        let sent = forward(&ev).await;
+        assert!(!sent, "неизвестный хост без маршрута → не форвардим");
+    }
 }
