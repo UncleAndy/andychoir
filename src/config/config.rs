@@ -269,3 +269,57 @@ impl Config {
         Ok(config)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Записать конфиг во временный файл и загрузить через new_from_file.
+    async fn load_temp(ext: &str, body: &str) -> Config {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("andychoir-test-{}.{}", uuid::Uuid::new_v4(), ext));
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        drop(f);
+        let cfg = Config::new_from_file(path.to_path_buf()).await.unwrap();
+        let _ = std::fs::remove_file(&path);
+        cfg
+    }
+
+    // P0: пустой node_id -> генерируется валидный UUID v4.
+    #[tokio::test]
+    async fn p0_empty_node_id_generates_uuid() {
+        let cfg = load_temp("yaml", "logger: {}\nplugins: []\nnet:\n  node_id: \"\"\n").await;
+        assert!(uuid::Uuid::parse_str(&cfg.net.node_id).is_ok(), "node_id должен быть UUID, получено: {}", cfg.net.node_id);
+    }
+
+    // P0: невалидный node_id (строка) -> генерируется UUID v4.
+    #[tokio::test]
+    async fn p0_invalid_node_id_generates_uuid() {
+        let cfg = load_temp("yaml", "logger: {}\nplugins: []\nnet:\n  node_id: \"host-a\"\n").await;
+        assert!(uuid::Uuid::parse_str(&cfg.net.node_id).is_ok(), "node_id должен быть UUID, получено: {}", cfg.net.node_id);
+    }
+
+    // P0: валидный UUID сохраняется без изменений.
+    #[tokio::test]
+    async fn p0_valid_uuid_preserved() {
+        let valid = "00000000-0000-0000-0000-0000000000a1";
+        let body = format!("logger: {{}}\nplugins: []\nnet:\n  node_id: \"{}\"\n", valid);
+        let cfg = load_temp("yaml", &body).await;
+        assert_eq!(cfg.net.node_id, valid);
+    }
+
+    // P0: node_id для всех поддерживаемых форматов (json/toml/yaml).
+    #[tokio::test]
+    async fn p0_uuid_across_formats() {
+        for (ext, body) in [
+            ("json", "{\"logger\":{},\"plugins\":[],\"net\":{\"node_id\":\"\"}}"),
+            ("toml", "logger = {}\nplugins = []\n[net]\nnode_id = \"\"\n"),
+            ("yaml", "logger: {}\nplugins: []\nnet:\n  node_id: \"\"\n"),
+        ] {
+            let cfg = load_temp(ext, body).await;
+            assert!(uuid::Uuid::parse_str(&cfg.net.node_id).is_ok(), "{}: node_id должен быть UUID", ext);
+        }
+    }
+}

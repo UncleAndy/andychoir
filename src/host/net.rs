@@ -562,4 +562,57 @@ mod tests {
             _ => panic!(),
         }
     }
+
+    // P1: Hello (discovery) упаковывается и распаковывается с source_id/neighbors.
+    #[test]
+    fn hello_roundtrip() {
+        let tools = vec![crate::plugin::engine::ToolDef {
+            name: "calculator".into(),
+            description: "calc".into(),
+            parameters_json: "{}".into(),
+        }];
+        let msg = NetMessage::Hello {
+            source_id: "00000000-0000-0000-0000-0000000000a1".into(),
+            neighbors: vec!["00000000-0000-0000-0000-0000000000b2".into()],
+            tools: tools.clone(),
+        };
+        let s = serde_json::to_string(&msg).unwrap();
+        match unpack_message(&s).unwrap() {
+            NetMessage::Hello { source_id, neighbors, tools: t } => {
+                assert_eq!(source_id, "00000000-0000-0000-0000-0000000000a1");
+                assert_eq!(neighbors, vec!["00000000-0000-0000-0000-0000000000b2"]);
+                assert_eq!(t.len(), 1);
+            }
+            _ => panic!("expected Hello message"),
+        }
+    }
+
+    // P1: Bye (graceful leave) упаковывается и распаковывается с source_id.
+    #[test]
+    fn bye_roundtrip() {
+        let msg = NetMessage::Bye {
+            source_id: "00000000-0000-0000-0000-0000000000a1".into(),
+        };
+        let s = serde_json::to_string(&msg).unwrap();
+        match unpack_message(&s).unwrap() {
+            NetMessage::Bye { source_id } => {
+                assert_eq!(source_id, "00000000-0000-0000-0000-0000000000a1");
+            }
+            _ => panic!("expected Bye message"),
+        }
+    }
+
+    // P1: Event содержит уникальный event_id при каждой упаковке (для dedup).
+    #[test]
+    fn event_id_unique_per_pack() {
+        let ev = make_event("tool:x", "s");
+        let s1 = pack_event("00000000-0000-0000-0000-0000000000a1", 0, &ev);
+        let s2 = pack_event("00000000-0000-0000-0000-0000000000a1", 0, &ev);
+        let m1 = unpack_message(&s1).unwrap();
+        let m2 = unpack_message(&s2).unwrap();
+        let id1 = match m1 { NetMessage::Event { event_id, .. } => event_id, _ => panic!() };
+        let id2 = match m2 { NetMessage::Event { event_id, .. } => event_id, _ => panic!() };
+        assert_ne!(id1, id2, "event_id должен быть уникальным для каждой упаковки");
+        assert!(uuid::Uuid::parse_str(&id1).is_ok(), "event_id должен быть UUID");
+    }
 }
