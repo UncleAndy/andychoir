@@ -178,3 +178,110 @@ If ready-made is desired — `libp2p::swarm` + `libp2p::ping` + `libp2p::identif
 | Event ID | **`uuid`** | Already used in the project |
 
 **Additional dependencies:** only `petgraph` (if not writing graph by hand). Bloom filter and discovery are custom, no new dependencies.
+
+## 8. Configuration & Examples
+
+### 8.1 What the user configures
+
+The user configures **only direct links** (`remotes`) — never the full topology.
+Every host discovers the rest of the mesh automatically via HELLO flooding and
+builds its own LSDB + FIB.
+
+`NetConfig` (in `src/config/config.rs`):
+
+```yaml
+net:
+  node_id: "00000000-0000-0000-0000-0000000000a1"  # UUID v4/v7 (auto-generated if invalid)
+  listen_port: 8090        # 0 = do not listen (client-only host behind NAT)
+  token: []                # tokens accepted on INCOMING connections
+  remotes:                 # persistent OUTGOING WS connections (direct links only)
+    - url: "ws://127.0.0.1:8091/net"
+      token: "secret-b"
+      targets: []          # optional pinned routing (FIB has priority)
+```
+
+- `remotes` is the list of **direct neighbors** you dial out to. You do **not**
+  list every host in the mesh here — only the ones you have a direct link to.
+- `targets` on a remote is **optional**. If empty, routing is purely by FIB
+  (shortest path). If set, it provides explicit pinned routing as a fallback.
+- `listen_port: 0` means "I don't accept incoming connections" (e.g. a host
+  behind a NAT/router). It still connects outbound, and replies come back over
+  that same WebSocket (bidirectional).
+
+### 8.2 Event target format
+
+To address a tool/agent on a **remote** host, the target uses the `host:` prefix:
+
+```
+host:<node_id>:<tool>
+```
+
+Examples:
+- `host:00000000-0000-0000-0000-0000000000c3:tool:calculator` → run `tool:calculator`
+  on host `…c3`, routed by FIB (possibly via intermediate hops).
+- `tool:calculator` (no `host:` prefix) → local plugin, **not forwarded**.
+- `agent:demo`, `mcp:…`, `session:…` → local (not forwarded).
+
+When the bridge receives an event whose target starts with `host:`, it:
+1. extracts `<node_id>`,
+2. looks up `next_hop` in the FIB,
+3. sends the event to `next_hop`'s outgoing/incoming channel.
+
+The `target` field is **preserved unchanged** along the path — intermediate hops
+re-route it the same way (store-and-forward by next-hop).
+
+### 8.3 Three-host mesh example (A → B → C)
+
+Topology: A and C both dial B directly; B is the relay. A never dials C.
+
+**Host A** (`listen_port: 0`, dials B):
+```yaml
+net:
+  node_id: "00000000-0000-0000-0000-0000000000a1"
+  listen_port: 0
+  remotes:
+    - url: "ws://127.0.0.1:8091/net"
+      token: "secret-b"
+```
+
+**Host B** (relay, listens on 8091, dials nobody):
+```yaml
+net:
+  node_id: "00000000-0000-0000-0000-0000000000b2"
+  listen_port: 8091
+  token: ["secret-b", "secret-c"]
+  remotes: []
+```
+
+**Host C** (`listen_port: 0`, dials B):
+```yaml
+net:
+  node_id: "00000000-0000-0000-0000-0000000000c3"
+  listen_port: 0
+  remotes:
+    - url: "ws://127.0.0.1:8091/net"
+      token: "secret-c"
+```
+
+Flow when A emits `host:…c3:tool:calculator`:
+1. A's HELLO (periodic) tells B "I see A". C's HELLO tells B "I see C".
+   B floods both HELLOs → A learns `B sees C`, C learns `B sees A`.
+2. A's FIB: `C → next_hop B`.
+3. A forwards the event to B (its `outbound[B]` channel).
+4. B receives it, re-routes by FIB (`C → next_hop C` — direct neighbor),
+   forwards to C.
+5. C executes `tool:calculator` locally.
+
+No manual `targets`, no central server — pure link-state mesh.
+
+### 8.4 Failure handling
+
+- **Silent failure:** if a neighbor stops sending HELLO for `LSDB_TIMEOUT_SECS`
+  (30s), it is removed from LSDB and the FIB is recomputed. Routes through it
+  disappear; alternate paths (if any) take over.
+- **Graceful leave:** on `drop()` of the bridge, a `BYE` is broadcast to all
+  neighbors, so they drop the node immediately.
+- **Loop protection:** every hop decrements `ttl` (starts at 16); at 0 the event
+  is dropped. Shortest-path routing on a static LSDB snapshot is loop-free;
+  TTL is the safety net during convergence.
+

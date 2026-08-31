@@ -1,6 +1,6 @@
 # План реализации Mesh-сети (на базе `docs/NET-concept.md`)
 
-> Статус: черновик плана. Код пока НЕ меняется — обсуждаем.
+> Статус: **ЗАВЕРШЕНО** (все фазы P0–P8 реализованы и покрыты тестами).
 > Принцип из концепта: **децентрализованно, без root-узла, без ручной топологии**;
 > пользователь настраивает только прямые линки (`remotes` в конфиге).
 
@@ -8,19 +8,20 @@
 
 ## 0. Контекст и цель
 
-Текущий `src/host/net.rs` — это «звезда»: `forward()` выбирает remote по
-ручному списку `targets` из конфига (`NetRemote.targets`). Нет автообнаружения
-соседей, нет маршрутизации к произвольному хосту, нет dedup/TTL на уровне сети.
+Текущий `src/host/net.rs` — это «звезда»: `forward()` выбирал remote по
+ручному списку `targets` из конфига (`NetRemote.targets`). Не было автообнаружения
+соседей, маршрутизации к произвольному хосту, dedup/TTL на уровне сети.
 
-Цель по `NET-concept.md`:
+Цель по `NET-concept.md` (достигнута):
 - **Discovery** — каждый хост строит LSDB (Link-State DB) через `HELLO`/`BYE`.
 - **Routing** — shortest-path (Dijkstra на LSDB), next-hop пересылка.
 - **Dedup** — `fastbloom` (окно 60с, 512 Б, фиксированная память).
 - **TTL** — 1 байт, декремент на хопе.
 - **Идентификаторы** — `source_id`/`event_id`/`node_id` = **UUID v4/v7**, не строки.
+- **Failure detection** — таймаут LSDB (30с) + graceful `BYE` на `drop()`.
 
-Архитектурное правило (не нарушать): плагины и шина НЕ знают о сети;
-вся сетевая логика живёт только в `net.rs` (мост).
+Архитектурное правило (не нарушено): плагины и шина НЕ знают о сети;
+вся сетевая логика живёт только в `src/host/net/` (мост).
 
 ---
 
@@ -217,15 +218,26 @@ enum NetMessage {
 
 ## 4. Критерии готовности
 
-- [ ] `node_id` — UUID (P0).
-- [ ] `NetMessage` имеет `Hello`/`Bye`/`event_id`/`ttl`/`source_id` (P1).
-- [ ] Bloom filter dedup + окно сброса работают (P2).
-- [ ] LSDB строится автоматически через HELLO (P3).
-- [ ] FIB считает shortest-path через Dijkstra (P4).
-- [ ] `forward()` маршрутизирует по FIB, не по ручным `targets` (P5).
-- [ ] Failure detection + BYE (P6).
-- [ ] Unit + integration тесты проходят (P7).
-- [ ] `make` сборка без ошибок и warnings.
+- [x] `node_id` — UUID (P0).
+- [x] `NetMessage` имеет `Hello`/`Bye`/`event_id`/`ttl`/`source_id` (P1).
+- [x] Bloom filter dedup + окно сброса работают (P2).
+- [x] LSDB строится автоматически через HELLO (P3).
+- [x] FIB считает shortest-path через Dijkstra (P4).
+- [x] `forward()` маршрутизирует по FIB, не по ручным `targets` (P5).
+- [x] Failure detection + BYE (P6).
+- [x] Unit + integration тесты проходят (P7, 89 unit-тестов).
+- [x] `make` сборка без ошибок и warnings.
+- [x] Документация обновлена (P8).
+
+### Итог
+
+Все фазы P0–P8 завершены. Код разбит на модули `src/host/net/`:
+`mod.rs` (типы/API), `net.rs` (оркестрация + тесты), `message.rs` (wire),
+`dedup.rs` (Bloom), `lsdb.rs` (FIB/Dijkstra), `discovery.rs` (Hello/Bye/flooding),
+`server.rs` (входящий WS), `outbound.rs` (исходящий WS), `forward.rs` (маршрутизация).
+
+Тестовое покрытие: 89 unit-тестов (P0:5, P1:5, P2:7, P3:6, P4:7, P5:8, P6:6, P7:3),
+сборка `make host` без warnings.
 
 ---
 

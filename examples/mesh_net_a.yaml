@@ -1,0 +1,53 @@
+plugins:
+  - file: "plugins/front_console_plugin/target/wasm32-wasip2/debug/front_console_plugin.wasm"
+    name: "front:console"
+    access:
+      - !console_input "prompt> "
+      - !console_print 102400
+    config:
+      subscriptions: ["system:info", "system:error"]
+      targets: ["system:info"]
+      mode: "wait"
+    allow_background: true
+
+  - file: "plugins/tool_calculator_plugin/target/wasm32-wasip2/debug/tool_calculator_plugin.wasm"
+    name: "tool:calculator"
+    access: []
+    config: {}
+    allow_background: false
+
+metrics:
+  enabled: false
+  host: "127.0.0.1"
+  port: 9090
+  update_interval_secs: 15
+  location: "/metrics"
+
+startup:
+  timeout_secs: 20
+
+logger:
+  log_level: "debug"
+  logs_directory: "./logs"
+  file_base_name: "andychoir"
+  max_file_size_bytes: 1048576
+  days_to_keep: 3
+
+history:
+  max_events_per_session: 100
+  dir: "./.andychour/sessions"
+  current_session_file: "~/.andychour/current_session.json"
+  session_ttl_secs: 604800
+  save_period_secs: 1
+
+# Host A: console + calculator. CLIENT — dials B (relay), listen_port=0
+# (behind NAT / does not accept incoming). A never dials C directly.
+# Routing to C is automatic via FIB (A->B->C). See docs/NET-concept.md §8.
+net:
+  node_id: "00000000-0000-0000-0000-0000000000a1"
+  listen_port: 0
+  token: []
+  remotes:
+    - url: "ws://127.0.0.1:8091/net"
+      token: "secret-b"
+      targets: []
