@@ -68,6 +68,7 @@ dependencies = [
  "flexi_logger",
  "futures-util",
  "log",
+ "petgraph",
  "reqwest",
  "rustyline",
  "serde",

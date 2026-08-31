@@ -32,6 +32,8 @@ futures-util = "0.3"
 termimad = "0.31"
 # P2: Bloom filter для дедупликации сетевых событий (фиксированный размер, SIMD).
 fastbloom = "0.10"
+# P4: граф топологии и кратчайший путь (Дейкстра) для маршрутизации.
+petgraph = "0.6"
 
 [dev-dependencies]
 filetime = "0.2"

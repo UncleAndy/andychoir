@@ -20,6 +20,10 @@ use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::Router;
 use fastbloom::BloomFilter;
 use futures_util::{SinkExt, StreamExt};
+use petgraph::algo::dijkstra;
+use petgraph::graph::NodeIndex;
+use petgraph::visit::EdgeRef;
+use petgraph::Graph;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -31,6 +35,8 @@ const DEDUP_BITS: usize = 4096;
 const DEDUP_WINDOW_SECS: u64 = 60;
 /// P3: интервал периодической рассылки Hello (секунды).
 const HELLO_INTERVAL_SECS: u64 = 10;
+/// P4: вес каждого ребра графа (все рёбра равны — однородная сеть).
+const GRAPH_EDGE_WEIGHT: u32 = 1;
 
 /// Внутреннее состояние сетевого моста.
 pub struct NetInner {
@@ -60,6 +66,11 @@ pub struct NetInner {
     /// P3: Link-State Database — полная топология сети.
     /// node_id -> (список соседей node_id, время последнего Hello).
     lsdb: Arc<RwLock<HashMap<String, (Vec<String>, u64)>>>,
+    /// P4: FIB (Forwarding Information Base) — таблица маршрутизации.
+    /// target_node_id -> next_hop_node_id (через кого слать).
+    fib: Arc<RwLock<HashMap<String, String>>>,
+    /// P4: мапа node_id -> ws-url исходящего соединения (для отправки по FIB).
+    node_url: Arc<RwLock<HashMap<String, String>>>,
 }
 
 static INNER: std::sync::OnceLock<Arc<NetInner>> = std::sync::OnceLock::new();
@@ -82,6 +93,8 @@ impl NetInner {
             )),
             dedup_last_reset: Arc::new(RwLock::new(current_unix_secs())),
             lsdb: Arc::new(RwLock::new(HashMap::new())),
+            fib: Arc::new(RwLock::new(HashMap::new())),
+            node_url: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 }
@@ -224,6 +237,8 @@ pub async fn start_net(tx: mpsc::Sender<Event>, cfg: NetConfig) -> NetHandle {
         )),
         dedup_last_reset: Arc::new(RwLock::new(current_unix_secs())),
         lsdb: Arc::new(RwLock::new(HashMap::new())),
+        fib: Arc::new(RwLock::new(HashMap::new())),
+        node_url: Arc::new(RwLock::new(HashMap::new())),
     });
     set_inner(inner.clone());
 
@@ -318,6 +333,8 @@ async fn handle_incoming(inner: Arc<NetInner>, socket: WebSocket) {
                 }
                 info!("[Хост] Net: получены возможности хоста {}: {:?} инструментов", origin, tools.len());
                 inner.origin_tools.write().await.insert(origin.clone(), tools);
+                // P4: регистрируем node_id -> url для FIB-маршрутизации.
+                inner.node_url.write().await.insert(origin.clone(), "incoming".to_string());
                 // Регистрируем обратный канал для этого origin (П1).
                 this_origin = Some(origin.clone());
                 inner.incoming_senders.write().await.insert(origin, out_tx.clone());
@@ -432,7 +449,9 @@ async fn run_outbound_loop(inner: Arc<NetInner>, remote: NetRemote) {
                                 continue;
                             }
                             info!("[Хост] Net: возможности {}: {:?}", origin, tools.len());
-                            inner.origin_tools.write().await.insert(origin, tools);
+                            inner.origin_tools.write().await.insert(origin.clone(), tools);
+                            // P4: регистрируем node_id -> url для FIB-маршрутизации.
+                            inner.node_url.write().await.insert(origin, remote.url.clone());
                         }
                         NetMessage::Hello { source_id, neighbors, tools } => {
                             handle_hello(&inner, source_id, neighbors, tools).await;
@@ -548,6 +567,8 @@ async fn handle_hello(inner: &Arc<NetInner>, source_id: String, neighbors: Vec<S
     // Сохраняем инструменты удалённого хоста.
     inner.origin_tools.write().await.insert(source_id.clone(), tools);
     info!("[Хост] Net: discovery от {} (соседи: {:?})", source_id, neighbors.len());
+    // P4: пересчитываем FIB из обновлённой LSDB (маршрутизация по кратчайшему пути).
+    rebuild_fib(inner).await;
     // Flooding: пересылаем Hello всем соседям, кроме источника.
     let fwd = pack_hello_from(source_id.clone(), neighbors).await;
     broadcast_to_neighbors(inner, &fwd, &source_id).await;
@@ -592,6 +613,84 @@ async fn run_discovery_loop(inner: Arc<NetInner>) {
     }
 }
 
+/// P4: Пересчитать FIB (Forwarding Information Base) из LSDB методом Дейкстры.
+///
+/// Для каждого известного узла строим граф (узлы = хосты, рёбра = соседство из LSDB),
+/// запускаем dijkstra от своего node_id и сохраняем next-hop для каждого целевого узла.
+/// Если цель — прямой сосед, next-hop = цель. Иначе — первый узел на кратчайшем пути.
+pub async fn rebuild_fib(inner: &Arc<NetInner>) {
+    let lsdb = inner.lsdb.read().await;
+    // Собираем множество всех узлов и рёбер.
+    let mut nodes: Vec<String> = lsdb.keys().cloned().collect();
+    nodes.push(inner.cfg.node_id.clone());
+    nodes.sort();
+    nodes.dedup();
+
+    let mut graph = Graph::<String, u32>::new();
+    let mut idx: HashMap<String, NodeIndex> = HashMap::new();
+    for n in &nodes {
+        idx.insert(n.clone(), graph.add_node(n.clone()));
+    }
+    for (node, (neighbors, _)) in lsdb.iter() {
+        for nb in neighbors {
+            if let (Some(&a), Some(&b)) = (idx.get(node), idx.get(nb)) {
+                // Ребро в обе стороны (directed-граф эмулирует неориентированный для Дейкстры).
+                graph.add_edge(a, b, GRAPH_EDGE_WEIGHT);
+                graph.add_edge(b, a, GRAPH_EDGE_WEIGHT);
+            }
+        }
+    }
+
+    let my_id = inner.cfg.node_id.clone();
+    let Some(&start) = idx.get(&my_id) else {
+        return;
+    };
+    let dist = dijkstra(&graph, start, None, |e| *e.weight());
+
+    let mut fib = HashMap::new();
+    for (node, &ni) in idx.iter() {
+        if node == &my_id {
+            continue;
+        }
+        if let Some(d) = dist.get(&ni) {
+            if *d == 0 {
+                continue;
+            }
+            let mut cur = ni;
+            let mut next_hop = node.clone();
+            loop {
+                let mut found = None;
+                for edge in graph.edges(cur) {
+                    let other = if edge.source() == cur { edge.target() } else { edge.source() };
+                    if let Some(od) = dist.get(&other) {
+                        if *od + GRAPH_EDGE_WEIGHT == *dist.get(&cur).unwrap_or(&u32::MAX) {
+                            found = Some(other);
+                            break;
+                        }
+                    }
+                }
+                match found {
+                    Some(parent) if parent != start => {
+                        cur = parent;
+                        next_hop = graph[parent].clone();
+                    }
+                    _ => break,
+                }
+            }
+            fib.insert(node.clone(), next_hop);
+        }
+    }
+    drop(lsdb);
+    *inner.fib.write().await = fib;
+    info!("[Хост] Net: FIB пересчитан ({} маршрутов)", inner.fib.read().await.len());
+}
+
+/// P4: Найти next-hop для target_node по FIB.
+/// Возвращает node_id следующего узла или None, если нет маршрута.
+pub async fn route_next_hop(inner: &Arc<NetInner>, target_node: &str) -> Option<String> {
+    inner.fib.read().await.get(target_node).cloned()
+}
+
 /// Форвард события на удалённый хост (вызывается из bus при пустом получателе).
 /// Возвращает true, если событие ушло по сети (иначе — не нашлось подходящего remote).
 pub async fn forward(ev: &Event) -> bool {
@@ -611,6 +710,36 @@ pub async fn forward(ev: &Event) -> bool {
 
     // Выбираем remote, который обслуживает target этого события.
     let target = ev.target.clone();
+
+    // P4: если target указывает на конкретный узел (host:<node_id>:<...>),
+    // маршрутизируем через FIB (кратчайший путь), а не через ручной targets.
+    if let Some(node_id) = target.strip_prefix("host:") {
+        if let Some((_, _tool)) = node_id.split_once(':') {
+            let target_node = node_id.split(':').next().unwrap_or(node_id);
+            if let Some(next_hop) = route_next_hop(&inner, target_node).await {
+                // next_hop -> url исходящего соединения.
+                let node_url_map = inner.node_url.read().await;
+                if let Some(url) = node_url_map.get(&next_hop) {
+                    let outbound = inner.outbound.read().await;
+                    if let Some(tx) = outbound.get(url) {
+                        let origin = origin_host.clone().unwrap_or_else(|| inner.cfg.node_id.clone());
+                        let ttl = decrement_ttl(16).unwrap_or(0);
+                        let payload = pack_event_with_ttl(&origin, 0, ev, ttl);
+                        if tx.try_send(payload).is_ok() {
+                            info!("[Хост] Net: событие {} → узел {} (next-hop {}) по FIB", ev.target, target_node, next_hop);
+                            return true;
+                        }
+                    }
+                    drop(outbound);
+                }
+                drop(node_url_map);
+                // Нет соединения — буферизуем по url (если известен).
+                // (url может быть неизвестен, если next_hop ещё не анонсировал capabilities)
+            }
+        }
+    }
+
+    // Fallback: ручной роутинг по targets из конфига (обратная совместимость).
     let remotes = inner.cfg.remotes.clone();
     let target_remote = remotes.into_iter().find(|r| {
         r.targets.iter().any(|t| {
@@ -642,7 +771,7 @@ pub async fn forward(ev: &Event) -> bool {
     let remote = target_remote.unwrap();
 
     // Собираем обёртку.
-    let origin = origin_host.unwrap_or_else(|| inner.cfg.node_id.clone());
+    let origin = origin_host.clone().unwrap_or_else(|| inner.cfg.node_id.clone());
     // P2: декремент TTL при пересылке (защита от петель).
     let ttl = decrement_ttl(16).unwrap_or(0);
     let payload = pack_event_with_ttl(&origin, 0, ev, ttl);
@@ -973,5 +1102,97 @@ mod tests {
             }
             _ => panic!("expected Hello"),
         }
+    }
+
+    // P4: FIB пуст, если нет топологии (route_next_hop → None).
+    #[tokio::test]
+    async fn p4_fib_empty_when_no_topology() {
+        let inner = NetInner::new_test();
+        rebuild_fib(&inner).await;
+        assert!(inner.fib.read().await.is_empty(), "без LSDB FIB пуст");
+        assert!(route_next_hop(&inner, "99999999-0000-0000-0000-000000000099").await.is_none());
+    }
+
+    // P4: прямой сосед → next-hop = сам сосед (без лишних хопов).
+    #[tokio::test]
+    async fn p4_fib_direct_neighbor() {
+        let inner = NetInner::new_test();
+        // A (my_id) видит Hello от B с соседями [A].
+        handle_hello(&inner, "00000000-0000-0000-0000-0000000000b2".into(), vec![inner.cfg.node_id.clone()], vec![]).await;
+        let fib = inner.fib.read().await;
+        assert_eq!(
+            fib.get("00000000-0000-0000-0000-0000000000b2").map(|s| s.as_str()),
+            Some("00000000-0000-0000-0000-0000000000b2".as_ref()),
+            "прямой сосед → next-hop = он сам"
+        );
+    }
+
+    // P4: кратчайший путь через промежуточный узел (A-B-C: route A→C даёт next-hop B).
+    #[tokio::test]
+    async fn p4_fib_shortest_path_multi_hop() {
+        let inner = NetInner::new_test();
+        let my = inner.cfg.node_id.clone();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        let c = "00000000-0000-0000-0000-0000000000c3".to_string();
+        // Строим LSDB вручную: B видит A и C; C видит B.
+        inner.lsdb.write().await.insert(b.clone(), (vec![my.clone(), c.clone()], current_unix_secs()));
+        inner.lsdb.write().await.insert(c.clone(), (vec![b.clone()], current_unix_secs()));
+        rebuild_fib(&inner).await;
+        // Маршрут до C должен идти через B (next-hop = B).
+        let hop = route_next_hop(&inner, &c).await;
+        assert_eq!(hop.as_deref(), Some(b.as_str()), "A→C идёт через B (кратчайший путь)");
+    }
+
+    // P4: rebuild_fib заполняет FIB после handle_hello.
+    #[tokio::test]
+    async fn p4_rebuild_fib_builds_routes() {
+        let inner = NetInner::new_test();
+        handle_hello(&inner, "00000000-0000-0000-0000-0000000000b2".into(), vec![inner.cfg.node_id.clone()], vec![]).await;
+        let fib = inner.fib.read().await;
+        assert!(fib.contains_key("00000000-0000-0000-0000-0000000000b2"), "FIB содержит маршрут до B");
+    }
+
+    // P4: свой node_id не должен попасть в FIB (нельзя слать самому себе).
+    #[tokio::test]
+    async fn p4_fib_excludes_self() {
+        let inner = NetInner::new_test();
+        let my = inner.cfg.node_id.clone();
+        // Сосед B знает нас.
+        handle_hello(&inner, "00000000-0000-0000-0000-0000000000b2".into(), vec![my.clone()], vec![]).await;
+        assert!(inner.fib.read().await.get(&my).is_none(), "свой node_id не в FIB");
+    }
+
+    // P4: недостижимый узел → маршрута нет (изолированный фрагмент графа).
+    #[tokio::test]
+    async fn p4_fib_unreachable_node() {
+        let inner = NetInner::new_test();
+        // B и C связаны между собой, но не с A (my_id).
+        inner.lsdb.write().await.insert(
+            "00000000-0000-0000-0000-0000000000b2".to_string(),
+            (vec!["00000000-0000-0000-0000-0000000000c3".to_string()], current_unix_secs()),
+        );
+        inner.lsdb.write().await.insert(
+            "00000000-0000-0000-0000-0000000000c3".to_string(),
+            (vec!["00000000-0000-0000-0000-0000000000b2".to_string()], current_unix_secs()),
+        );
+        rebuild_fib(&inner).await;
+        // Ни B, ни C недостижимы из A.
+        assert!(route_next_hop(&inner, "00000000-0000-0000-0000-0000000000b2").await.is_none());
+        assert!(route_next_hop(&inner, "00000000-0000-0000-0000-0000000000c3").await.is_none());
+    }
+
+    // P4: node_url регистрируется и связывает next_hop с исходящим url.
+    #[tokio::test]
+    async fn p4_node_url_mapping() {
+        let inner = NetInner::new_test();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        // Имитируем получение Capabilities от B (исходящее соединение на ws://b).
+        inner.node_url.write().await.insert(b.clone(), "ws://host-b:8092/net".to_string());
+        // B — прямой сосед.
+        handle_hello(&inner, b.clone(), vec![inner.cfg.node_id.clone()], vec![]).await;
+        // next-hop для B = B, и для него есть url.
+        let hop = route_next_hop(&inner, &b).await.unwrap();
+        let url = inner.node_url.read().await.get(&hop).cloned();
+        assert_eq!(url.as_deref(), Some("ws://host-b:8092/net"));
     }
 }
