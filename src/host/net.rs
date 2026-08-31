@@ -29,6 +29,8 @@ use tokio::sync::{mpsc, RwLock};
 const DEDUP_BITS: usize = 4096;
 /// Окно сброса Bloom-фильтра (секунды).
 const DEDUP_WINDOW_SECS: u64 = 60;
+/// P3: интервал периодической рассылки Hello (секунды).
+const HELLO_INTERVAL_SECS: u64 = 10;
 
 /// Внутреннее состояние сетевого моста.
 pub struct NetInner {
@@ -55,6 +57,9 @@ pub struct NetInner {
     dedup: Arc<RwLock<BloomFilter>>,
     /// P2: время последнего сброса Bloom-фильтра (unix-секунды).
     dedup_last_reset: Arc<RwLock<u64>>,
+    /// P3: Link-State Database — полная топология сети.
+    /// node_id -> (список соседей node_id, время последнего Hello).
+    lsdb: Arc<RwLock<HashMap<String, (Vec<String>, u64)>>>,
 }
 
 static INNER: std::sync::OnceLock<Arc<NetInner>> = std::sync::OnceLock::new();
@@ -76,6 +81,7 @@ impl NetInner {
                 BloomFilter::with_num_bits(DEDUP_BITS).expected_items(1024),
             )),
             dedup_last_reset: Arc::new(RwLock::new(current_unix_secs())),
+            lsdb: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 }
@@ -217,6 +223,7 @@ pub async fn start_net(tx: mpsc::Sender<Event>, cfg: NetConfig) -> NetHandle {
             BloomFilter::with_num_bits(DEDUP_BITS).expected_items(1024),
         )),
         dedup_last_reset: Arc::new(RwLock::new(current_unix_secs())),
+        lsdb: Arc::new(RwLock::new(HashMap::new())),
     });
     set_inner(inner.clone());
 
@@ -236,6 +243,15 @@ pub async fn start_net(tx: mpsc::Sender<Event>, cfg: NetConfig) -> NetHandle {
             run_outbound_loop(inner, remote).await;
         }));
     }
+
+    // P3: задача периодического discovery (Hello каждые HELLO_INTERVAL_SECS).
+    let discovery = tokio::spawn({
+        let inner = inner.clone();
+        async move {
+            run_discovery_loop(inner).await;
+        }
+    });
+    outbound.push(discovery);
 
     NetHandle { server, outbound }
 }
@@ -312,8 +328,8 @@ async fn handle_incoming(inner: Arc<NetInner>, socket: WebSocket) {
                 let _ = out_tx.try_send(caps);
             }
             // P1: Hello (discovery) — обрабатывается в P3.
-            NetMessage::Hello { source_id: _, neighbors: _, tools: _ } => {
-                // TODO P3: обновить LSDB, переслать соседям.
+            NetMessage::Hello { source_id, neighbors, tools } => {
+                handle_hello(&inner, source_id, neighbors, tools).await;
             }
             // P1: Bye (graceful leave) — обрабатывается в P6.
             NetMessage::Bye { source_id: _ } => {
@@ -418,8 +434,8 @@ async fn run_outbound_loop(inner: Arc<NetInner>, remote: NetRemote) {
                             info!("[Хост] Net: возможности {}: {:?}", origin, tools.len());
                             inner.origin_tools.write().await.insert(origin, tools);
                         }
-                        NetMessage::Hello { source_id: _, neighbors: _, tools: _ } => {
-                            // TODO P3: LSDB.
+                        NetMessage::Hello { source_id, neighbors, tools } => {
+                            handle_hello(&inner, source_id, neighbors, tools).await;
                         }
                         NetMessage::Bye { source_id: _ } => {
                             // TODO P6: удалить из LSDB.
@@ -504,6 +520,76 @@ pub async fn check_dedup(inner: &Arc<NetInner>, event_id: &str) -> bool {
 pub async fn reset_dedup(inner: &Arc<NetInner>) {
     inner.dedup.write().await.clear();
     *inner.dedup_last_reset.write().await = current_unix_secs();
+}
+
+/// P3: Упаковать Hello-сообщение (discovery) с текущим списком соседей.
+async fn pack_hello(inner: &Arc<NetInner>) -> String {
+    let neighbors = inner.cfg.remotes.iter().map(|r| r.url.clone()).collect::<Vec<_>>();
+    let my_tools = crate::plugin::engine::local_tools().read().await.values().cloned().collect::<Vec<_>>();
+    let msg = NetMessage::Hello {
+        source_id: inner.cfg.node_id.clone(),
+        neighbors,
+        tools: my_tools,
+    };
+    serde_json::to_string(&msg).unwrap_or_default()
+}
+
+/// P3: Обработать входящий Hello (discovery).
+/// Обновляет LSDB, пересылает соседям (flooding), сохраняет tools.
+async fn handle_hello(inner: &Arc<NetInner>, source_id: String, neighbors: Vec<String>, tools: Vec<crate::plugin::engine::ToolDef>) {
+    if source_id == inner.cfg.node_id {
+        return; // свои Hello игнорируем
+    }
+    // Обновляем LSDB: source_id -> (neighbors, now)
+    {
+        let mut lsdb = inner.lsdb.write().await;
+        lsdb.insert(source_id.clone(), (neighbors.clone(), current_unix_secs()));
+    }
+    // Сохраняем инструменты удалённого хоста.
+    inner.origin_tools.write().await.insert(source_id.clone(), tools);
+    info!("[Хост] Net: discovery от {} (соседи: {:?})", source_id, neighbors.len());
+    // Flooding: пересылаем Hello всем соседям, кроме источника.
+    let fwd = pack_hello_from(source_id.clone(), neighbors).await;
+    broadcast_to_neighbors(inner, &fwd, &source_id).await;
+}
+
+/// P3: Собрать Hello от конкретного узла (для flooding).
+async fn pack_hello_from(source_id: String, neighbors: Vec<String>) -> String {
+    let my_tools = crate::plugin::engine::local_tools().read().await.values().cloned().collect::<Vec<_>>();
+    let msg = NetMessage::Hello { source_id, neighbors, tools: my_tools };
+    serde_json::to_string(&msg).unwrap_or_default()
+}
+
+/// P3: Разослать сообщение всем соседям (flooding).
+/// except_source — не отправлять обратно источнику (защита от петель).
+async fn broadcast_to_neighbors(inner: &Arc<NetInner>, msg: &str, except_source: &str) {
+    // Входящие соединения (по node_id).
+    {
+        let incoming = inner.incoming_senders.read().await;
+        for (node_id, tx) in incoming.iter() {
+            if node_id == except_source {
+                continue;
+            }
+            let _ = tx.try_send(msg.to_string());
+        }
+    }
+    // Исходящие соединения (по url).
+    {
+        let outbound = inner.outbound.read().await;
+        for (_url, tx) in outbound.iter() {
+            let _ = tx.try_send(msg.to_string());
+        }
+    }
+}
+
+/// P3: Периодическая рассылка Hello всем соседям (discovery loop).
+async fn run_discovery_loop(inner: Arc<NetInner>) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(HELLO_INTERVAL_SECS));
+    loop {
+        interval.tick().await;
+        let hello = pack_hello(&inner).await;
+        broadcast_to_neighbors(&inner, &hello, "").await;
+    }
 }
 
 /// Форвард события на удалённый хост (вызывается из bus при пустом получателе).
@@ -791,5 +877,101 @@ mod tests {
         assert!(check_dedup(&inner, "ev-ccc").await, "ev-ccc → новое (не конфликтует)");
         // Повтор ev-aaa всё ещё дубликат.
         assert!(!check_dedup(&inner, "ev-aaa").await, "ev-aaa повтор → дубликат");
+    }
+
+    // P3: Hello обновляет LSDB (топология) и сохраняет инструменты.
+    #[tokio::test]
+    async fn p3_lsdb_updated_on_hello() {
+        let inner = NetInner::new_test();
+        let tools = vec![crate::plugin::engine::ToolDef {
+            name: "calculator".into(),
+            description: "calc".into(),
+            parameters_json: "{}".into(),
+        }];
+        handle_hello(
+            &inner,
+            "00000000-0000-0000-0000-0000000000b2".into(),
+            vec!["00000000-0000-0000-0000-0000000000c3".into()],
+            tools.clone(),
+        )
+        .await;
+        // LSDB содержит узел b2 с соседом c3.
+        let lsdb = inner.lsdb.read().await;
+        let (neighbors, _ts) = lsdb.get("00000000-0000-0000-0000-0000000000b2").unwrap();
+        assert_eq!(neighbors, &vec!["00000000-0000-0000-0000-0000000000c3".to_string()]);
+        drop(lsdb);
+        // Инструменты сохранены.
+        let stored = inner.origin_tools.read().await;
+        assert_eq!(stored.get("00000000-0000-0000-0000-0000000000b2").unwrap().len(), 1);
+    }
+
+    // P3: свой собственный Hello игнорируется (нет петель).
+    #[tokio::test]
+    async fn p3_hello_ignores_self() {
+        let inner = NetInner::new_test();
+        let my_id = inner.cfg.node_id.clone();
+        handle_hello(&inner, my_id.clone(), vec![], vec![]).await;
+        assert!(inner.lsdb.read().await.get(&my_id).is_none(), "свой node_id не должен попасть в LSDB");
+    }
+
+    // P3: повторный Hello от того же узла обновляет список соседей (замена, не дублирование).
+    #[tokio::test]
+    async fn p3_lsdb_update_replaces_neighbors() {
+        let inner = NetInner::new_test();
+        let id = "00000000-0000-0000-0000-0000000000b2".to_string();
+        handle_hello(&inner, id.clone(), vec!["c3".into()], vec![]).await;
+        handle_hello(&inner, id.clone(), vec!["c3".into(), "d4".into()], vec![]).await;
+        let lsdb = inner.lsdb.read().await;
+        let (neighbors, _ts) = lsdb.get(&id).unwrap();
+        // Должны быть оба соседа, без дублей c3.
+        assert_eq!(neighbors.len(), 2, "соседи заменяются, а не добавляются");
+        assert!(neighbors.contains(&"c3".to_string()));
+        assert!(neighbors.contains(&"d4".to_string()));
+    }
+
+    // P3: LSDB сохраняет timestamp последнего Hello (для будущего timeout в P6).
+    #[tokio::test]
+    async fn p3_lsdb_timestamp_recorded() {
+        let inner = NetInner::new_test();
+        let before = current_unix_secs();
+        handle_hello(&inner, "b2".into(), vec![], vec![]).await;
+        let after = current_unix_secs();
+        let lsdb = inner.lsdb.read().await;
+        let (_n, ts) = lsdb.get("b2").unwrap();
+        assert!(*ts >= before && *ts <= after, "timestamp в окне вызова");
+    }
+
+    // P3: broadcast_to_neighbors не отправляет источнику (защита от петель flooding).
+    #[tokio::test]
+    async fn p3_broadcast_excludes_source() {
+        let inner = NetInner::new_test();
+        // Регистрируем двух "соседей" в incoming_senders.
+        let (tx_a, mut rx_a) = mpsc::channel::<String>(8);
+        let (tx_b, mut rx_b) = mpsc::channel::<String>(8);
+        inner.incoming_senders.write().await.insert("aa".into(), tx_a);
+        inner.incoming_senders.write().await.insert("bb".into(), tx_b);
+        // Flooding от bb: должен уйти только aa.
+        broadcast_to_neighbors(&inner, "MSG", "bb").await;
+        // aa получил.
+        let got_a = rx_a.try_recv();
+        assert!(got_a.is_ok(), "сосед aa должен получить сообщение");
+        // bb (источник) — нет.
+        let got_b = rx_b.try_recv();
+        assert!(got_b.is_err(), "источник bb не должен получить своё же сообщение");
+    }
+
+    // P3: pack_hello содержит свой node_id и соседей из конфига.
+    #[tokio::test]
+    async fn p3_pack_hello_self_and_neighbors() {
+        let inner = NetInner::new_test();
+        let s = pack_hello(&inner).await;
+        match unpack_message(&s).unwrap() {
+            NetMessage::Hello { source_id, neighbors, .. } => {
+                assert_eq!(source_id, inner.cfg.node_id, "source_id = свой node_id");
+                // У new_test remotes пусты → neighbors пусты.
+                assert!(neighbors.is_empty(), "neighbors из пустого cfg.remotes");
+            }
+            _ => panic!("expected Hello"),
+        }
     }
 }
