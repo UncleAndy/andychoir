@@ -322,4 +322,11 @@ mod tests {
             assert!(uuid::Uuid::parse_str(&cfg.net.node_id).is_ok(), "{}: node_id должен быть UUID", ext);
         }
     }
+
+    // P0: node_id с окружающими пробелами (невалидный UUID) → генерируется UUID.
+    #[tokio::test]
+    async fn p0_whitespace_node_id_generates_uuid() {
+        let cfg = load_temp("yaml", "logger: {}\nplugins: []\nnet:\n  node_id: \" host-a \"\n").await;
+        assert!(uuid::Uuid::parse_str(&cfg.net.node_id).is_ok(), "node_id с пробелами → UUID, получено: {}", cfg.net.node_id);
+    }
 }

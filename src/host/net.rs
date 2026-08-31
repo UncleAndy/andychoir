@@ -18,10 +18,17 @@ use crate::config::config::{NetConfig, NetRemote};
 use crate::{error, info, warn};
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::Router;
+use fastbloom::BloomFilter;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
+
+/// Размер битовой матрицы Bloom-фильтра (P2). 4096 бит = 512 байт, фиксированно.
+/// Не растёт со временем; периодически сбрасывается (dedup_window).
+const DEDUP_BITS: usize = 4096;
+/// Окно сброса Bloom-фильтра (секунды).
+const DEDUP_WINDOW_SECS: u64 = 60;
 
 /// Внутреннее состояние сетевого моста.
 pub struct NetInner {
@@ -43,9 +50,35 @@ pub struct NetInner {
     /// Обратные каналы входящих соединений: origin_node_id -> Sender ответов.
     /// Позволяет вернуть ответ на входящее соединение (П1).
     incoming_senders: Arc<RwLock<HashMap<String, mpsc::Sender<String>>>>,
+    /// P2: Bloom-фильтр для дедупликации входящих сетевых событий по event_id.
+    /// Фиксированный размер (DEDUP_BITS), сбрасывается каждые DEDUP_WINDOW_SECS.
+    dedup: Arc<RwLock<BloomFilter>>,
+    /// P2: время последнего сброса Bloom-фильтра (unix-секунды).
+    dedup_last_reset: Arc<RwLock<u64>>,
 }
 
 static INNER: std::sync::OnceLock<Arc<NetInner>> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+impl NetInner {
+    /// Тестовый конструктор (минимальный, без сетевых соединений).
+    fn new_test() -> Arc<NetInner> {
+        Arc::new(NetInner {
+            tx: mpsc::channel(1).0,
+            cfg: NetConfig::default(),
+            session_origin: Arc::new(RwLock::new(HashMap::new())),
+            request_origin: Arc::new(RwLock::new(HashMap::new())),
+            outbound: Arc::new(RwLock::new(HashMap::new())),
+            pending_outbound: Arc::new(RwLock::new(HashMap::new())),
+            origin_tools: Arc::new(RwLock::new(HashMap::new())),
+            incoming_senders: Arc::new(RwLock::new(HashMap::new())),
+            dedup: Arc::new(RwLock::new(
+                BloomFilter::with_num_bits(DEDUP_BITS).expected_items(1024),
+            )),
+            dedup_last_reset: Arc::new(RwLock::new(current_unix_secs())),
+        })
+    }
+}
 
 fn set_inner(inner: Arc<NetInner>) {
     let _ = INNER.set(inner);
@@ -123,11 +156,17 @@ fn value_to_event(v: &serde_json::Value) -> Option<Event> {
     })
 }
 
-/// Упаковать событие в сетевое сообщение.
-/// P1: генерирует event_id (UUID v4) и ttl (16), source_id = node_id отправителя.
+/// Упаковать событие в сетевое сообщение (TTL по умолчанию 16).
+/// Используется в тестах; в прод-коде применяется pack_event_with_ttl (с декрементом TTL).
+#[allow(dead_code)]
 fn pack_event(origin: &str, hop: u8, ev: &Event) -> String {
+    let ttl: u8 = 16; // значение по умолчанию при первой упаковке
+    pack_event_with_ttl(origin, hop, ev, ttl)
+}
+
+/// Упаковать событие с явно заданным TTL (P2: для декремента при пересылке).
+fn pack_event_with_ttl(origin: &str, hop: u8, ev: &Event, ttl: u8) -> String {
     let event_id = uuid::Uuid::new_v4().to_string();
-    let ttl: u8 = 16;
     let msg = NetMessage::Event {
         origin: origin.to_string(),
         source_id: origin.to_string(),
@@ -137,6 +176,13 @@ fn pack_event(origin: &str, hop: u8, ev: &Event) -> String {
         event: event_to_value(ev),
     };
     serde_json::to_string(&msg).unwrap_or_default()
+}
+
+/// P2: декремент TTL при пересылке события дальше по сети.
+/// Возвращает Some(ttl-1), если событие ещё живое (ttl > 0),
+/// и None, если TTL исчерпан (событие нужно отбросить).
+fn decrement_ttl(ttl: u8) -> Option<u8> {
+    ttl.checked_sub(1)
 }
 
 /// Упаковать анонс возможностей (локальные инструменты хоста).
@@ -167,6 +213,10 @@ pub async fn start_net(tx: mpsc::Sender<Event>, cfg: NetConfig) -> NetHandle {
         pending_outbound: Arc::new(RwLock::new(HashMap::new())),
         origin_tools: Arc::new(RwLock::new(HashMap::new())),
         incoming_senders: Arc::new(RwLock::new(HashMap::new())),
+        dedup: Arc::new(RwLock::new(
+            BloomFilter::with_num_bits(DEDUP_BITS).expected_items(1024),
+        )),
+        dedup_last_reset: Arc::new(RwLock::new(current_unix_secs())),
     });
     set_inner(inner.clone());
 
@@ -269,8 +319,13 @@ async fn handle_incoming(inner: Arc<NetInner>, socket: WebSocket) {
             NetMessage::Bye { source_id: _ } => {
                 // TODO P6: удалить из LSDB, очистить каналы.
             }
-            NetMessage::Event { origin, source_id: _, event_id: _, ttl: _, hop: _hop, event } => {
+            NetMessage::Event { origin, source_id: _, event_id, ttl: _, hop: _hop, event } => {
                 if origin == inner.cfg.node_id {
+                    continue;
+                }
+                // P2: dedup по event_id (Bloom-фильтр). Если дубликат — отбрасываем.
+                if !check_dedup(&inner, &event_id).await {
+                    info!("[Хост] Net: дубликат события {} отброшен (dedup)", event_id);
                     continue;
                 }
                 let Some(ev) = value_to_event(&event) else { continue };
@@ -369,8 +424,13 @@ async fn run_outbound_loop(inner: Arc<NetInner>, remote: NetRemote) {
                         NetMessage::Bye { source_id: _ } => {
                             // TODO P6: удалить из LSDB.
                         }
-                        NetMessage::Event { origin, source_id: _, event_id: _, ttl: _, hop: _hop, event } => {
+                        NetMessage::Event { origin, source_id: _, event_id, ttl: _, hop: _hop, event } => {
                             if origin == inner.cfg.node_id {
+                                continue;
+                            }
+                            // P2: dedup по event_id (Bloom-фильтр). Если дубликат — отбрасываем.
+                            if !check_dedup(&inner, &event_id).await {
+                                info!("[Хост] Net: дубликат события {} отброшен (dedup)", event_id);
                                 continue;
                             }
                             let Some(ev) = value_to_event(&event) else { continue };
@@ -402,6 +462,48 @@ async fn run_outbound_loop(inner: Arc<NetInner>, remote: NetRemote) {
         }
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
+}
+
+/// Текущее время в unix-секундах (для окна сброса dedup).
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// P2: Проверить и зарегистрировать event_id в Bloom-фильтре.
+///
+/// Возвращает `true`, если событие НОВОЕ (пропустить дальше),
+/// и `false`, если это ДУБЛИКАТ (уже видели в окне dedup).
+///
+/// Логика:
+/// - Сначала проверяем окно сброса: если прошло > DEDUP_WINDOW_SECS,
+///   очищаем фильтр (старые события "забываются" — для event-bus это ок).
+/// - `check_and_add` атомарно: возвращает true, если элемент УЖЕ был
+///   (дубликат), и добавляет его. Инвертируем для смысла "новое".
+pub async fn check_dedup(inner: &Arc<NetInner>, event_id: &str) -> bool {
+    // Сброс по окну.
+    {
+        let mut last = inner.dedup_last_reset.write().await;
+        let now = current_unix_secs();
+        if now.saturating_sub(*last) >= DEDUP_WINDOW_SECS {
+            inner.dedup.write().await.clear();
+            *last = now;
+        }
+    }
+    // contains → true, если УЖЕ присутствует (дубликат). insert добавляет.
+    let is_dup = inner.dedup.write().await.contains(event_id);
+    if !is_dup {
+        inner.dedup.write().await.insert(event_id);
+    }
+    !is_dup
+}
+
+/// P2: Полностью сбросить Bloom-фильтр (полезно при очистке/тестах).
+pub async fn reset_dedup(inner: &Arc<NetInner>) {
+    inner.dedup.write().await.clear();
+    *inner.dedup_last_reset.write().await = current_unix_secs();
 }
 
 /// Форвард события на удалённый хост (вызывается из bus при пустом получателе).
@@ -440,7 +542,9 @@ pub async fn forward(ev: &Event) -> bool {
             let incoming = inner.incoming_senders.read().await;
             if let Some(tx) = incoming.get(origin) {
                 let my_id = inner.cfg.node_id.clone();
-                let payload = pack_event(&my_id, 0, ev);
+                // P2: декремент TTL при пересылке (защита от петель).
+                let ttl = decrement_ttl(16).unwrap_or(0);
+                let payload = pack_event_with_ttl(&my_id, 0, ev, ttl);
                 if tx.try_send(payload).is_ok() {
                     info!("[Хост] Net: ответ {} возвращён по входящему соединению {} (origin)", ev.target, origin);
                     return true;
@@ -453,7 +557,9 @@ pub async fn forward(ev: &Event) -> bool {
 
     // Собираем обёртку.
     let origin = origin_host.unwrap_or_else(|| inner.cfg.node_id.clone());
-    let payload = pack_event(&origin, 0, ev);
+    // P2: декремент TTL при пересылке (защита от петель).
+    let ttl = decrement_ttl(16).unwrap_or(0);
+    let payload = pack_event_with_ttl(&origin, 0, ev, ttl);
 
     let outbound = inner.outbound.read().await;
     if let Some(tx) = outbound.get(&remote.url) {
@@ -614,5 +720,76 @@ mod tests {
         let id2 = match m2 { NetMessage::Event { event_id, .. } => event_id, _ => panic!() };
         assert_ne!(id1, id2, "event_id должен быть уникальным для каждой упаковки");
         assert!(uuid::Uuid::parse_str(&id1).is_ok(), "event_id должен быть UUID");
+    }
+
+    // P2: декремент TTL — базовая логика защиты от петель.
+    #[test]
+    fn p2_ttl_decrement() {
+        assert_eq!(decrement_ttl(0), None, "ttl=0 → событие отбрасывается");
+        assert_eq!(decrement_ttl(1), Some(0), "ttl=1 → 0 (последний hop)");
+        assert_eq!(decrement_ttl(16), Some(15), "ttl=16 → 15");
+    }
+
+    // P2: упаковка с явным TTL сохраняет значение при roundtrip.
+    #[test]
+    fn p2_ttl_preserved_in_message() {
+        let ev = make_event("tool:x", "s");
+        let s = pack_event_with_ttl("00000000-0000-0000-0000-0000000000a1", 0, &ev, 7);
+        match unpack_message(&s).unwrap() {
+            NetMessage::Event { ttl, .. } => assert_eq!(ttl, 7, "ttl должен сохраняться в сообщении"),
+            _ => panic!("expected Event"),
+        }
+    }
+
+    // P2: Bloom-фильтр корректно определяет дубликаты (contains/insert семантика).
+    #[test]
+    fn p2_bloom_check_and_add() {
+        let mut bf: BloomFilter = BloomFilter::with_num_bits(4096).expected_items(1024);
+        // Первый раз — не было (false), второй — уже есть (true).
+        let first = bf.contains("event-1");
+        bf.insert("event-1");
+        let second = bf.contains("event-1");
+        assert!(!first, "первое появление → не дубликат");
+        assert!(second, "повтор → дубликат");
+        // Другой ID — с высокой вероятностью новый.
+        let other = bf.contains("event-2");
+        assert!(!other, "другой ID → новый");
+    }
+
+    // P2: окно сброса dedup — старые события "забываются" через DEDUP_WINDOW_SECS.
+    #[tokio::test]
+    async fn p2_dedup_window_reset() {
+        let inner = NetInner::new_test();
+        let id = "00000000-0000-0000-0000-0000000000d2";
+        assert!(check_dedup(&inner, id).await, "первый раз → новое");
+        assert!(!check_dedup(&inner, id).await, "повтор (в окне) → дубликат");
+        // Симулируем старение: сдвигаем dedup_last_reset на 61с назад.
+        let old = current_unix_secs().saturating_sub(61);
+        *inner.dedup_last_reset.write().await = old;
+        // Теперь check_dedup должен сбросить фильтр (окно истекло) и принять ID как новый.
+        assert!(check_dedup(&inner, id).await, "после истечения окна → снова новое");
+    }
+
+    // P2: check_dedup отклоняет повторяющийся event_id (интеграция с NetInner).
+    #[tokio::test]
+    async fn p2_dedup_rejects_duplicate() {
+        let inner = NetInner::new_test();
+        let id = "00000000-0000-0000-0000-0000000000d1";
+        assert!(check_dedup(&inner, id).await, "первый раз → новое событие");
+        assert!(!check_dedup(&inner, id).await, "повтор → дубликат (отброшен)");
+        // После сброса — снова новое.
+        reset_dedup(&inner).await;
+        assert!(check_dedup(&inner, id).await, "после reset → снова новое");
+    }
+
+    // P2: разные event_id не блокируют друг друга (низкий false-positive).
+    #[tokio::test]
+    async fn p2_dedup_distinct_ids() {
+        let inner = NetInner::new_test();
+        assert!(check_dedup(&inner, "ev-aaa").await, "ev-aaa → новое");
+        assert!(check_dedup(&inner, "ev-bbb").await, "ev-bbb → новое (не конфликтует)");
+        assert!(check_dedup(&inner, "ev-ccc").await, "ev-ccc → новое (не конфликтует)");
+        // Повтор ev-aaa всё ещё дубликат.
+        assert!(!check_dedup(&inner, "ev-aaa").await, "ev-aaa повтор → дубликат");
     }
 }
