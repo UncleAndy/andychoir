@@ -13,6 +13,9 @@ pub(crate) mod message;
 pub(crate) mod dedup;
 pub(crate) mod lsdb;
 pub(crate) mod discovery;
+pub(crate) mod server;
+pub(crate) mod outbound;
+pub(crate) mod forward;
 pub(crate) mod net;
 
 use crate::ai::host::types::Event;
@@ -28,7 +31,8 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
 pub(crate) use message::NetMessage;
-pub use net::{forward, start_net};
+pub use net::start_net;
+pub use forward::forward;
 
 /// Внутреннее состояние сетевого моста.
 pub(crate) struct NetInner {
