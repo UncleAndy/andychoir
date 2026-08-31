@@ -711,4 +711,54 @@ mod tests {
         super::discovery::cleanup_expired_once(&inner).await;
         assert!(inner.lsdb.read().await.contains_key(&b), "свежий B сохранён");
     }
+
+    // P6: pack_bye сериализуется с правильным source_id.
+    #[tokio::test]
+    async fn p6_pack_bye_format() {
+        let inner = NetInner::new_test();
+        let msg = super::discovery::pack_bye(&inner).await;
+        match super::message::unpack_message(&msg).unwrap() {
+            NetMessage::Bye { source_id } => {
+                assert_eq!(source_id, inner.cfg.node_id, "Bye содержит свой node_id");
+            }
+            _ => panic!("expected Bye"),
+        }
+    }
+
+    // P6: cleanup удаляет ТОЛЬКО устаревшие узлы (смешанный случай).
+    #[tokio::test]
+    async fn p6_cleanup_mixed_old_and_fresh() {
+        let inner = NetInner::new_test();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        let c = "00000000-0000-0000-0000-0000000000c3".to_string();
+        let now = super::dedup::current_unix_secs();
+        let old = now.saturating_sub(super::discovery::LSDB_TIMEOUT_SECS + 10);
+        inner.lsdb.write().await.insert(b.clone(), (vec![], old)); // устаревший
+        inner.lsdb.write().await.insert(c.clone(), (vec![], now)); // свежий
+        super::lsdb::rebuild_fib(&inner).await;
+        super::discovery::cleanup_expired_once(&inner).await;
+        assert!(!inner.lsdb.read().await.contains_key(&b), "устаревший B удалён");
+        assert!(inner.lsdb.read().await.contains_key(&c), "свежий C сохранён");
+    }
+
+    // P6: handle_bye инвалидирует transit-маршруты (B был транзитом A→C).
+    #[tokio::test]
+    async fn p6_bye_invalidates_transit_routes() {
+        let inner = NetInner::new_test();
+        let my = inner.cfg.node_id.clone();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        let c = "00000000-0000-0000-0000-0000000000c3".to_string();
+        // Топология: B видит A и C (B — транзит для A→C).
+        inner.lsdb.write().await.insert(b.clone(), (vec![my.clone(), c.clone()], super::dedup::current_unix_secs()));
+        inner.lsdb.write().await.insert(c.clone(), (vec![b.clone()], super::dedup::current_unix_secs()));
+        super::lsdb::rebuild_fib(&inner).await;
+        // До ухода B: маршрут A→C есть (через B).
+        assert!(super::lsdb::route_next_hop(&inner, &c).await.is_some(), "маршрут к C есть (через B)");
+        // B уходит (Bye).
+        super::discovery::handle_bye(&inner, &b).await;
+        // После ухода B: маршрут к C недостижим (C был только через B).
+        assert!(super::lsdb::route_next_hop(&inner, &c).await.is_none(), "маршрут к C инвалидирован");
+        // И B больше нет в FIB.
+        assert!(!inner.fib.read().await.contains_key(&b), "B удалён из FIB");
+    }
 }
