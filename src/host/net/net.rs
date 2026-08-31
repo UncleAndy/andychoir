@@ -1,228 +1,20 @@
-//! Сетевой мост между экземплярами andychour.
+//! Центральный модуль сетевого моста: запуск, входящие/исходящие соединения, forward.
 //!
-//! Мост — хостовый транспорт (как http/ws). Плагины и шина НЕ знают о сети:
-//! Event не меняется. Вся сетевая логика живёт здесь.
-//!
-//! - Входящее: WS-сервер на `/net` (порт listen_port). Принимает сетевые
-//!   обёртки `{origin, event}`, впрыскивает event в локальную шину (tx).
-//! - Исходящее: персистентные WS-соединения к каждому `remote`. Когда
-//!   `forward(event)` вызывается из bus (событие не нашло локального
-//!   получателя), мост отправляет событие на нужный удалённый хост.
-//! - Карта контекста: `session_id -> origin_host` (куда возвращать вызовы
-//!   утилит из этого запроса) и `request_id -> (origin, session)`.
-//! - Предотвращение циклов: origin != self, ограничение хопов.
-//! - Аутентификация: токен в WS-handshake (заголовок/query).
+//! Wire-протокол, dedup, LSDB/FIB и discovery вынесены в подмодули
+//! (`message`, `dedup`, `lsdb`, `discovery`). Здесь — оркестрация.
 
-use crate::ai::host::types::Event;
-use crate::config::config::{NetConfig, NetRemote};
-use crate::{error, info, warn};
-use axum::extract::ws::{WebSocket, WebSocketUpgrade};
+use super::*;
+use super::dedup::check_dedup;
+use super::discovery::{handle_hello, run_discovery_loop};
+use super::lsdb::route_next_hop;
+use super::message::{decrement_ttl, pack_capabilities, pack_event_with_ttl, unpack_message, NetMessage};
+use crate::config::config::NetRemote;
+use axum::extract::ws::WebSocket;
 use axum::Router;
-use fastbloom::BloomFilter;
-use futures_util::{SinkExt, StreamExt};
-use petgraph::algo::dijkstra;
-use petgraph::graph::NodeIndex;
-use petgraph::visit::EdgeRef;
-use petgraph::Graph;
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
-
-/// Размер битовой матрицы Bloom-фильтра (P2). 4096 бит = 512 байт, фиксированно.
-/// Не растёт со временем; периодически сбрасывается (dedup_window).
-const DEDUP_BITS: usize = 4096;
-/// Окно сброса Bloom-фильтра (секунды).
-const DEDUP_WINDOW_SECS: u64 = 60;
-/// P3: интервал периодической рассылки Hello (секунды).
-const HELLO_INTERVAL_SECS: u64 = 10;
-/// P4: вес каждого ребра графа (все рёбра равны — однородная сеть).
-const GRAPH_EDGE_WEIGHT: u32 = 1;
-
-/// Внутреннее состояние сетевого моста.
-pub struct NetInner {
-    /// Канал для впрыска входящих событий в локальную шину.
-    tx: mpsc::Sender<Event>,
-    /// Конфиг.
-    cfg: NetConfig,
-    /// Карта контекста: session_id -> origin_host.
-    session_origin: Arc<RwLock<HashMap<String, String>>>,
-    /// Карта контекста: request_id -> (origin_host, session_id).
-    request_origin: Arc<RwLock<HashMap<String, (String, String)>>>,
-    /// Исходящие соединения: remote_url -> Sender сете-обёрток.
-    outbound: Arc<RwLock<HashMap<String, mpsc::Sender<String>>>>,
-    /// Буфер исходящих событий для remote, к которому ещё нет соединения.
-    /// remote_url -> список упакованных обёрток.
-    pending_outbound: Arc<RwLock<HashMap<String, Vec<String>>>>,
-    /// Инструменты удалённых хостов по их origin_node_id (из capabilities).
-    origin_tools: Arc<RwLock<HashMap<String, Vec<crate::plugin::engine::ToolDef>>>>,
-    /// Обратные каналы входящих соединений: origin_node_id -> Sender ответов.
-    /// Позволяет вернуть ответ на входящее соединение (П1).
-    incoming_senders: Arc<RwLock<HashMap<String, mpsc::Sender<String>>>>,
-    /// P2: Bloom-фильтр для дедупликации входящих сетевых событий по event_id.
-    /// Фиксированный размер (DEDUP_BITS), сбрасывается каждые DEDUP_WINDOW_SECS.
-    dedup: Arc<RwLock<BloomFilter>>,
-    /// P2: время последнего сброса Bloom-фильтра (unix-секунды).
-    dedup_last_reset: Arc<RwLock<u64>>,
-    /// P3: Link-State Database — полная топология сети.
-    /// node_id -> (список соседей node_id, время последнего Hello).
-    lsdb: Arc<RwLock<HashMap<String, (Vec<String>, u64)>>>,
-    /// P4: FIB (Forwarding Information Base) — таблица маршрутизации.
-    /// target_node_id -> next_hop_node_id (через кого слать).
-    fib: Arc<RwLock<HashMap<String, String>>>,
-    /// P4: мапа node_id -> ws-url исходящего соединения (для отправки по FIB).
-    node_url: Arc<RwLock<HashMap<String, String>>>,
-}
-
-static INNER: std::sync::OnceLock<Arc<NetInner>> = std::sync::OnceLock::new();
-
-#[cfg(test)]
-impl NetInner {
-    /// Тестовый конструктор (минимальный, без сетевых соединений).
-    fn new_test() -> Arc<NetInner> {
-        Arc::new(NetInner {
-            tx: mpsc::channel(1).0,
-            cfg: NetConfig::default(),
-            session_origin: Arc::new(RwLock::new(HashMap::new())),
-            request_origin: Arc::new(RwLock::new(HashMap::new())),
-            outbound: Arc::new(RwLock::new(HashMap::new())),
-            pending_outbound: Arc::new(RwLock::new(HashMap::new())),
-            origin_tools: Arc::new(RwLock::new(HashMap::new())),
-            incoming_senders: Arc::new(RwLock::new(HashMap::new())),
-            dedup: Arc::new(RwLock::new(
-                BloomFilter::with_num_bits(DEDUP_BITS).expected_items(1024),
-            )),
-            dedup_last_reset: Arc::new(RwLock::new(current_unix_secs())),
-            lsdb: Arc::new(RwLock::new(HashMap::new())),
-            fib: Arc::new(RwLock::new(HashMap::new())),
-            node_url: Arc::new(RwLock::new(HashMap::new())),
-        })
-    }
-}
-
-fn set_inner(inner: Arc<NetInner>) {
-    let _ = INNER.set(inner);
-}
-
-pub fn get_inner() -> Option<Arc<NetInner>> {
-    INNER.get().cloned()
-}
-
-/// Handle для сетевого моста.
-pub struct NetHandle {
-    pub server: tokio::task::JoinHandle<()>,
-    pub outbound: Vec<tokio::task::JoinHandle<()>>,
-}
-
-/// Сетевое сообщение: событие ИЛИ анонс возможностей (capabilities) хоста.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum NetMessage {
-    /// Событие шины (упаковано для передачи по сети).
-    /// P1: добавлены поля для mesh-маршрутизации и dedup:
-    /// - source_id: node_id отправителя (UUID хоста)
-    /// - event_id: уникальный UUID события (для Bloom-фильтра dedup)
-    /// - ttl: счетчик времени жизни (защита от петель)
-    Event {
-        origin: String,      // обратная совместимость: node_id отправителя
-        source_id: String,   // node_id отправителя (mesh-маршрутизация)
-        event_id: String,    // UUID события (dedup)
-        ttl: u8,              // time-to-live
-        hop: u8,
-        event: serde_json::Value,
-    },
-    /// Анонс локальных инструментов хоста (шлётся при подключении).
-    /// P1: добавлены neighbors (список известных соседей) для LSDB.
-    Capabilities {
-        origin: String,
-        source_id: String,   // node_id анонсирующего хоста
-        neighbors: Vec<String>, // известные соседи (для LSDB)
-        tools: Vec<crate::plugin::engine::ToolDef>,
-    },
-    /// Приветствие (discovery): анонс node_id + соседей + инструменты.
-    /// Flooding по сети для построения полной топологии (LSDB).
-    Hello {
-        source_id: String,
-        neighbors: Vec<String>,
-        tools: Vec<crate::plugin::engine::ToolDef>,
-    },
-    /// Уведомление об уходе хоста (graceful shutdown).
-    Bye {
-        source_id: String,
-    },
-}
-
-/// Event -> JSON Value (поля record Event).
-fn event_to_value(ev: &Event) -> serde_json::Value {
-    serde_json::json!({
-        "request_id": ev.request_id,
-        "session_id": ev.session_id,
-        "source": ev.source,
-        "target": ev.target,
-        "topic": ev.topic,
-        "payload": ev.payload,
-    })
-}
-
-/// JSON Value -> Event.
-fn value_to_event(v: &serde_json::Value) -> Option<Event> {
-    Some(Event {
-        request_id: v.get("request_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        session_id: v.get("session_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        source: v.get("source").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        target: v.get("target").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        topic: v.get("topic").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-        payload: v.get("payload").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-    })
-}
-
-/// Упаковать событие в сетевое сообщение (TTL по умолчанию 16).
-/// Используется в тестах; в прод-коде применяется pack_event_with_ttl (с декрементом TTL).
-#[allow(dead_code)]
-fn pack_event(origin: &str, hop: u8, ev: &Event) -> String {
-    let ttl: u8 = 16; // значение по умолчанию при первой упаковке
-    pack_event_with_ttl(origin, hop, ev, ttl)
-}
-
-/// Упаковать событие с явно заданным TTL (P2: для декремента при пересылке).
-fn pack_event_with_ttl(origin: &str, hop: u8, ev: &Event, ttl: u8) -> String {
-    let event_id = uuid::Uuid::new_v4().to_string();
-    let msg = NetMessage::Event {
-        origin: origin.to_string(),
-        source_id: origin.to_string(),
-        event_id,
-        ttl,
-        hop,
-        event: event_to_value(ev),
-    };
-    serde_json::to_string(&msg).unwrap_or_default()
-}
-
-/// P2: декремент TTL при пересылке события дальше по сети.
-/// Возвращает Some(ttl-1), если событие ещё живое (ttl > 0),
-/// и None, если TTL исчерпан (событие нужно отбросить).
-fn decrement_ttl(ttl: u8) -> Option<u8> {
-    ttl.checked_sub(1)
-}
-
-/// Упаковать анонс возможностей (локальные инструменты хоста).
-/// P1: добавлены source_id и neighbors (из LSDB, пока пустой — заполняется в P3).
-fn pack_capabilities(origin: &str, tools: Vec<crate::plugin::engine::ToolDef>) -> String {
-    let msg = NetMessage::Capabilities {
-        origin: origin.to_string(),
-        source_id: origin.to_string(),
-        neighbors: Vec::new(), // P3: заполняется из LSDB
-        tools,
-    };
-    serde_json::to_string(&msg).unwrap_or_default()
-}
-
-/// Распаковать сетевое сообщение.
-fn unpack_message(text: &str) -> Option<NetMessage> {
-    serde_json::from_str(text).ok()
-}
+use tokio_tungstenite;
 
 /// Запустить сетевой мост: входящий WS-сервер + исходящие соединения к remotes.
-pub async fn start_net(tx: mpsc::Sender<Event>, cfg: NetConfig) -> NetHandle {
+pub async fn start_net(tx: mpsc::Sender<Event>, cfg: super::NetConfig) -> super::NetHandle {
     let inner = Arc::new(NetInner {
         tx,
         cfg: cfg.clone(),
@@ -233,14 +25,14 @@ pub async fn start_net(tx: mpsc::Sender<Event>, cfg: NetConfig) -> NetHandle {
         origin_tools: Arc::new(RwLock::new(HashMap::new())),
         incoming_senders: Arc::new(RwLock::new(HashMap::new())),
         dedup: Arc::new(RwLock::new(
-            BloomFilter::with_num_bits(DEDUP_BITS).expected_items(1024),
+            BloomFilter::with_num_bits(super::dedup::DEDUP_BITS).expected_items(1024),
         )),
-        dedup_last_reset: Arc::new(RwLock::new(current_unix_secs())),
+        dedup_last_reset: Arc::new(RwLock::new(super::dedup::current_unix_secs())),
         lsdb: Arc::new(RwLock::new(HashMap::new())),
         fib: Arc::new(RwLock::new(HashMap::new())),
         node_url: Arc::new(RwLock::new(HashMap::new())),
     });
-    set_inner(inner.clone());
+    super::set_inner(inner.clone());
 
     // Входящий WS-сервер.
     let server = tokio::spawn({
@@ -268,7 +60,7 @@ pub async fn start_net(tx: mpsc::Sender<Event>, cfg: NetConfig) -> NetHandle {
     });
     outbound.push(discovery);
 
-    NetHandle { server, outbound }
+    super::NetHandle { server, outbound }
 }
 
 /// Входящий WS-сервер на /net.
@@ -344,7 +136,7 @@ async fn handle_incoming(inner: Arc<NetInner>, socket: WebSocket) {
                 let caps = pack_capabilities(&inner.cfg.node_id, my_tools);
                 let _ = out_tx.try_send(caps);
             }
-            // P1: Hello (discovery) — обрабатывается в P3.
+            // P1: Hello (discovery).
             NetMessage::Hello { source_id, neighbors, tools } => {
                 handle_hello(&inner, source_id, neighbors, tools).await;
             }
@@ -361,16 +153,12 @@ async fn handle_incoming(inner: Arc<NetInner>, socket: WebSocket) {
                     info!("[Хост] Net: дубликат события {} отброшен (dedup)", event_id);
                     continue;
                 }
-                let Some(ev) = value_to_event(&event) else { continue };
+                let Some(ev) = super::message::value_to_event(&event) else { continue };
                 inner
                     .session_origin
                     .write()
                     .await
                     .insert(ev.session_id.clone(), origin.clone());
-                inner.request_origin.write().await.insert(
-                    ev.request_id.clone(),
-                    (origin.clone(), ev.session_id.clone()),
-                );
                 if let Some(tools) = inner.origin_tools.read().await.get(&origin).cloned() {
                     crate::plugin::engine::add_session_tools(&ev.session_id, tools).await;
                 }
@@ -468,7 +256,7 @@ async fn run_outbound_loop(inner: Arc<NetInner>, remote: NetRemote) {
                                 info!("[Хост] Net: дубликат события {} отброшен (dedup)", event_id);
                                 continue;
                             }
-                            let Some(ev) = value_to_event(&event) else { continue };
+                            let Some(ev) = super::message::value_to_event(&event) else { continue };
                             inner
                                 .session_origin
                                 .write()
@@ -485,216 +273,25 @@ async fn run_outbound_loop(inner: Arc<NetInner>, remote: NetRemote) {
                     }
                 }
                 send_task.abort();
+                // Соединение потеряно: убираем из карты и пробуем переподключиться.
                 inner.outbound.write().await.remove(&remote.url);
                 if closed {
-                    return;
+                    break;
                 }
-                warn!("[Хост] Net: соединение с {} закрыто, переподключаюсь", remote.url);
+                warn!("[Хост] Net: соединение с {} закрыто, переподключение...", remote.url);
             }
             Err(e) => {
-                warn!("[Хост] Net: не удалось подключиться к {}: {}", remote.url, e);
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    }
-}
-
-/// Текущее время в unix-секундах (для окна сброса dedup).
-fn current_unix_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// P2: Проверить и зарегистрировать event_id в Bloom-фильтре.
-///
-/// Возвращает `true`, если событие НОВОЕ (пропустить дальше),
-/// и `false`, если это ДУБЛИКАТ (уже видели в окне dedup).
-///
-/// Логика:
-/// - Сначала проверяем окно сброса: если прошло > DEDUP_WINDOW_SECS,
-///   очищаем фильтр (старые события "забываются" — для event-bus это ок).
-/// - `check_and_add` атомарно: возвращает true, если элемент УЖЕ был
-///   (дубликат), и добавляет его. Инвертируем для смысла "новое".
-pub async fn check_dedup(inner: &Arc<NetInner>, event_id: &str) -> bool {
-    // Сброс по окну.
-    {
-        let mut last = inner.dedup_last_reset.write().await;
-        let now = current_unix_secs();
-        if now.saturating_sub(*last) >= DEDUP_WINDOW_SECS {
-            inner.dedup.write().await.clear();
-            *last = now;
-        }
-    }
-    // contains → true, если УЖЕ присутствует (дубликат). insert добавляет.
-    let is_dup = inner.dedup.write().await.contains(event_id);
-    if !is_dup {
-        inner.dedup.write().await.insert(event_id);
-    }
-    !is_dup
-}
-
-/// P2: Полностью сбросить Bloom-фильтр (полезно при очистке/тестах).
-pub async fn reset_dedup(inner: &Arc<NetInner>) {
-    inner.dedup.write().await.clear();
-    *inner.dedup_last_reset.write().await = current_unix_secs();
-}
-
-/// P3: Упаковать Hello-сообщение (discovery) с текущим списком соседей.
-async fn pack_hello(inner: &Arc<NetInner>) -> String {
-    let neighbors = inner.cfg.remotes.iter().map(|r| r.url.clone()).collect::<Vec<_>>();
-    let my_tools = crate::plugin::engine::local_tools().read().await.values().cloned().collect::<Vec<_>>();
-    let msg = NetMessage::Hello {
-        source_id: inner.cfg.node_id.clone(),
-        neighbors,
-        tools: my_tools,
-    };
-    serde_json::to_string(&msg).unwrap_or_default()
-}
-
-/// P3: Обработать входящий Hello (discovery).
-/// Обновляет LSDB, пересылает соседям (flooding), сохраняет tools.
-async fn handle_hello(inner: &Arc<NetInner>, source_id: String, neighbors: Vec<String>, tools: Vec<crate::plugin::engine::ToolDef>) {
-    if source_id == inner.cfg.node_id {
-        return; // свои Hello игнорируем
-    }
-    // Обновляем LSDB: source_id -> (neighbors, now)
-    {
-        let mut lsdb = inner.lsdb.write().await;
-        lsdb.insert(source_id.clone(), (neighbors.clone(), current_unix_secs()));
-    }
-    // Сохраняем инструменты удалённого хоста.
-    inner.origin_tools.write().await.insert(source_id.clone(), tools);
-    info!("[Хост] Net: discovery от {} (соседи: {:?})", source_id, neighbors.len());
-    // P4: пересчитываем FIB из обновлённой LSDB (маршрутизация по кратчайшему пути).
-    rebuild_fib(inner).await;
-    // Flooding: пересылаем Hello всем соседям, кроме источника.
-    let fwd = pack_hello_from(source_id.clone(), neighbors).await;
-    broadcast_to_neighbors(inner, &fwd, &source_id).await;
-}
-
-/// P3: Собрать Hello от конкретного узла (для flooding).
-async fn pack_hello_from(source_id: String, neighbors: Vec<String>) -> String {
-    let my_tools = crate::plugin::engine::local_tools().read().await.values().cloned().collect::<Vec<_>>();
-    let msg = NetMessage::Hello { source_id, neighbors, tools: my_tools };
-    serde_json::to_string(&msg).unwrap_or_default()
-}
-
-/// P3: Разослать сообщение всем соседям (flooding).
-/// except_source — не отправлять обратно источнику (защита от петель).
-async fn broadcast_to_neighbors(inner: &Arc<NetInner>, msg: &str, except_source: &str) {
-    // Входящие соединения (по node_id).
-    {
-        let incoming = inner.incoming_senders.read().await;
-        for (node_id, tx) in incoming.iter() {
-            if node_id == except_source {
-                continue;
-            }
-            let _ = tx.try_send(msg.to_string());
-        }
-    }
-    // Исходящие соединения (по url).
-    {
-        let outbound = inner.outbound.read().await;
-        for (_url, tx) in outbound.iter() {
-            let _ = tx.try_send(msg.to_string());
-        }
-    }
-}
-
-/// P3: Периодическая рассылка Hello всем соседям (discovery loop).
-async fn run_discovery_loop(inner: Arc<NetInner>) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(HELLO_INTERVAL_SECS));
-    loop {
-        interval.tick().await;
-        let hello = pack_hello(&inner).await;
-        broadcast_to_neighbors(&inner, &hello, "").await;
-    }
-}
-
-/// P4: Пересчитать FIB (Forwarding Information Base) из LSDB методом Дейкстры.
-///
-/// Для каждого известного узла строим граф (узлы = хосты, рёбра = соседство из LSDB),
-/// запускаем dijkstra от своего node_id и сохраняем next-hop для каждого целевого узла.
-/// Если цель — прямой сосед, next-hop = цель. Иначе — первый узел на кратчайшем пути.
-pub async fn rebuild_fib(inner: &Arc<NetInner>) {
-    let lsdb = inner.lsdb.read().await;
-    // Собираем множество всех узлов и рёбер.
-    let mut nodes: Vec<String> = lsdb.keys().cloned().collect();
-    nodes.push(inner.cfg.node_id.clone());
-    nodes.sort();
-    nodes.dedup();
-
-    let mut graph = Graph::<String, u32>::new();
-    let mut idx: HashMap<String, NodeIndex> = HashMap::new();
-    for n in &nodes {
-        idx.insert(n.clone(), graph.add_node(n.clone()));
-    }
-    for (node, (neighbors, _)) in lsdb.iter() {
-        for nb in neighbors {
-            if let (Some(&a), Some(&b)) = (idx.get(node), idx.get(nb)) {
-                // Ребро в обе стороны (directed-граф эмулирует неориентированный для Дейкстры).
-                graph.add_edge(a, b, GRAPH_EDGE_WEIGHT);
-                graph.add_edge(b, a, GRAPH_EDGE_WEIGHT);
+                error!("[Хост] Net: не удалось подключиться к {}: {}", remote.url, e);
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             }
         }
     }
-
-    let my_id = inner.cfg.node_id.clone();
-    let Some(&start) = idx.get(&my_id) else {
-        return;
-    };
-    let dist = dijkstra(&graph, start, None, |e| *e.weight());
-
-    let mut fib = HashMap::new();
-    for (node, &ni) in idx.iter() {
-        if node == &my_id {
-            continue;
-        }
-        if let Some(d) = dist.get(&ni) {
-            if *d == 0 {
-                continue;
-            }
-            let mut cur = ni;
-            let mut next_hop = node.clone();
-            loop {
-                let mut found = None;
-                for edge in graph.edges(cur) {
-                    let other = if edge.source() == cur { edge.target() } else { edge.source() };
-                    if let Some(od) = dist.get(&other) {
-                        if *od + GRAPH_EDGE_WEIGHT == *dist.get(&cur).unwrap_or(&u32::MAX) {
-                            found = Some(other);
-                            break;
-                        }
-                    }
-                }
-                match found {
-                    Some(parent) if parent != start => {
-                        cur = parent;
-                        next_hop = graph[parent].clone();
-                    }
-                    _ => break,
-                }
-            }
-            fib.insert(node.clone(), next_hop);
-        }
-    }
-    drop(lsdb);
-    *inner.fib.write().await = fib;
-    info!("[Хост] Net: FIB пересчитан ({} маршрутов)", inner.fib.read().await.len());
-}
-
-/// P4: Найти next-hop для target_node по FIB.
-/// Возвращает node_id следующего узла или None, если нет маршрута.
-pub async fn route_next_hop(inner: &Arc<NetInner>, target_node: &str) -> Option<String> {
-    inner.fib.read().await.get(target_node).cloned()
 }
 
 /// Форвард события на удалённый хост (вызывается из bus при пустом получателе).
 /// Возвращает true, если событие ушло по сети (иначе — не нашлось подходящего remote).
 pub async fn forward(ev: &Event) -> bool {
-    let Some(inner) = get_inner() else {
+    let Some(inner) = super::get_inner() else {
         return false;
     };
 
@@ -795,6 +392,10 @@ pub async fn forward(ev: &Event) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin::engine::ToolDef;
+    use fastbloom::BloomFilter;
+    use super::dedup::reset_dedup;
+    use super::discovery::broadcast_to_neighbors;
 
     fn make_event(target: &str, session: &str) -> Event {
         Event {
@@ -811,11 +412,11 @@ mod tests {
     #[test]
     fn pack_unpack_roundtrip() {
         let ev = make_event("tool:calculator", "sess-1");
-        let s = pack_event("00000000-0000-0000-0000-0000000000a1", 0, &ev);
+        let s = super::message::pack_event("00000000-0000-0000-0000-0000000000a1", 0, &ev);
         let msg = unpack_message(&s).unwrap();
         match msg {
             NetMessage::Event { origin, source_id, event_id, ttl, hop, event } => {
-                let ev2 = value_to_event(&event).unwrap();
+                let ev2 = super::message::value_to_event(&event).unwrap();
                 assert_eq!(origin, "00000000-0000-0000-0000-0000000000a1");
                 assert_eq!(source_id, "00000000-0000-0000-0000-0000000000a1");
                 assert!(!event_id.is_empty(), "event_id должен быть сгенерирован");
@@ -832,7 +433,7 @@ mod tests {
     // Анонс возможностей: упаковка/распаковка сохраняет инструменты.
     #[test]
     fn capabilities_roundtrip() {
-        let tools = vec![crate::plugin::engine::ToolDef {
+        let tools = vec![ToolDef {
             name: "calculator".into(),
             description: "calc".into(),
             parameters_json: "{}".into(),
@@ -872,12 +473,12 @@ mod tests {
     #[test]
     fn self_origin_rejected() {
         let node_id = "00000000-0000-0000-0000-0000000000a1";
-        let s = pack_event("00000000-0000-0000-0000-0000000000a1", 0, &make_event("x", "s"));
+        let s = super::message::pack_event("00000000-0000-0000-0000-0000000000a1", 0, &make_event("x", "s"));
         match unpack_message(&s).unwrap() {
             NetMessage::Event { origin, .. } => assert_eq!(origin == node_id, true),
             _ => panic!(),
         }
-        let s2 = pack_event("00000000-0000-0000-0000-0000000000b2", 0, &make_event("x", "s"));
+        let s2 = super::message::pack_event("00000000-0000-0000-0000-0000000000b2", 0, &make_event("x", "s"));
         match unpack_message(&s2).unwrap() {
             NetMessage::Event { origin, .. } => assert_eq!(origin == node_id, false),
             _ => panic!(),
@@ -887,7 +488,7 @@ mod tests {
     // P1: Hello (discovery) упаковывается и распаковывается с source_id/neighbors.
     #[test]
     fn hello_roundtrip() {
-        let tools = vec![crate::plugin::engine::ToolDef {
+        let tools = vec![ToolDef {
             name: "calculator".into(),
             description: "calc".into(),
             parameters_json: "{}".into(),
@@ -927,8 +528,8 @@ mod tests {
     #[test]
     fn event_id_unique_per_pack() {
         let ev = make_event("tool:x", "s");
-        let s1 = pack_event("00000000-0000-0000-0000-0000000000a1", 0, &ev);
-        let s2 = pack_event("00000000-0000-0000-0000-0000000000a1", 0, &ev);
+        let s1 = super::message::pack_event("00000000-0000-0000-0000-0000000000a1", 0, &ev);
+        let s2 = super::message::pack_event("00000000-0000-0000-0000-0000000000a1", 0, &ev);
         let m1 = unpack_message(&s1).unwrap();
         let m2 = unpack_message(&s2).unwrap();
         let id1 = match m1 { NetMessage::Event { event_id, .. } => event_id, _ => panic!() };
@@ -979,7 +580,7 @@ mod tests {
         assert!(check_dedup(&inner, id).await, "первый раз → новое");
         assert!(!check_dedup(&inner, id).await, "повтор (в окне) → дубликат");
         // Симулируем старение: сдвигаем dedup_last_reset на 61с назад.
-        let old = current_unix_secs().saturating_sub(61);
+        let old = super::dedup::current_unix_secs().saturating_sub(61);
         *inner.dedup_last_reset.write().await = old;
         // Теперь check_dedup должен сбросить фильтр (окно истекло) и принять ID как новый.
         assert!(check_dedup(&inner, id).await, "после истечения окна → снова новое");
@@ -1012,7 +613,7 @@ mod tests {
     #[tokio::test]
     async fn p3_lsdb_updated_on_hello() {
         let inner = NetInner::new_test();
-        let tools = vec![crate::plugin::engine::ToolDef {
+        let tools = vec![ToolDef {
             name: "calculator".into(),
             description: "calc".into(),
             parameters_json: "{}".into(),
@@ -1062,9 +663,9 @@ mod tests {
     #[tokio::test]
     async fn p3_lsdb_timestamp_recorded() {
         let inner = NetInner::new_test();
-        let before = current_unix_secs();
+        let before = super::dedup::current_unix_secs();
         handle_hello(&inner, "b2".into(), vec![], vec![]).await;
-        let after = current_unix_secs();
+        let after = super::dedup::current_unix_secs();
         let lsdb = inner.lsdb.read().await;
         let (_n, ts) = lsdb.get("b2").unwrap();
         assert!(*ts >= before && *ts <= after, "timestamp в окне вызова");
@@ -1093,7 +694,7 @@ mod tests {
     #[tokio::test]
     async fn p3_pack_hello_self_and_neighbors() {
         let inner = NetInner::new_test();
-        let s = pack_hello(&inner).await;
+        let s = super::discovery::pack_hello(&inner).await;
         match unpack_message(&s).unwrap() {
             NetMessage::Hello { source_id, neighbors, .. } => {
                 assert_eq!(source_id, inner.cfg.node_id, "source_id = свой node_id");
@@ -1108,7 +709,7 @@ mod tests {
     #[tokio::test]
     async fn p4_fib_empty_when_no_topology() {
         let inner = NetInner::new_test();
-        rebuild_fib(&inner).await;
+        super::lsdb::rebuild_fib(&inner).await;
         assert!(inner.fib.read().await.is_empty(), "без LSDB FIB пуст");
         assert!(route_next_hop(&inner, "99999999-0000-0000-0000-000000000099").await.is_none());
     }
@@ -1135,9 +736,9 @@ mod tests {
         let b = "00000000-0000-0000-0000-0000000000b2".to_string();
         let c = "00000000-0000-0000-0000-0000000000c3".to_string();
         // Строим LSDB вручную: B видит A и C; C видит B.
-        inner.lsdb.write().await.insert(b.clone(), (vec![my.clone(), c.clone()], current_unix_secs()));
-        inner.lsdb.write().await.insert(c.clone(), (vec![b.clone()], current_unix_secs()));
-        rebuild_fib(&inner).await;
+        inner.lsdb.write().await.insert(b.clone(), (vec![my.clone(), c.clone()], super::dedup::current_unix_secs()));
+        inner.lsdb.write().await.insert(c.clone(), (vec![b.clone()], super::dedup::current_unix_secs()));
+        super::lsdb::rebuild_fib(&inner).await;
         // Маршрут до C должен идти через B (next-hop = B).
         let hop = route_next_hop(&inner, &c).await;
         assert_eq!(hop.as_deref(), Some(b.as_str()), "A→C идёт через B (кратчайший путь)");
@@ -1169,13 +770,13 @@ mod tests {
         // B и C связаны между собой, но не с A (my_id).
         inner.lsdb.write().await.insert(
             "00000000-0000-0000-0000-0000000000b2".to_string(),
-            (vec!["00000000-0000-0000-0000-0000000000c3".to_string()], current_unix_secs()),
+            (vec!["00000000-0000-0000-0000-0000000000c3".to_string()], super::dedup::current_unix_secs()),
         );
         inner.lsdb.write().await.insert(
             "00000000-0000-0000-0000-0000000000c3".to_string(),
-            (vec!["00000000-0000-0000-0000-0000000000b2".to_string()], current_unix_secs()),
+            (vec!["00000000-0000-0000-0000-0000000000b2".to_string()], super::dedup::current_unix_secs()),
         );
-        rebuild_fib(&inner).await;
+        super::lsdb::rebuild_fib(&inner).await;
         // Ни B, ни C недостижимы из A.
         assert!(route_next_hop(&inner, "00000000-0000-0000-0000-0000000000b2").await.is_none());
         assert!(route_next_hop(&inner, "00000000-0000-0000-0000-0000000000c3").await.is_none());
