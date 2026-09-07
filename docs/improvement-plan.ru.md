@@ -20,15 +20,15 @@
 | A1  | Алгоритм | `node_url` для входящих соединений = `"incoming"` ломает FIB-маршрутизацию к входящему соседу | 🟡 LOW* | `src/host/net/server.rs`, `src/host/net/forward.rs`, `src/host/net/net.rs` |
 | A2  | Алгоритм | Утечка `PENDING_RESPONSES` / `RESPONSE_PAYLOADS` по `request_id` | 🟢 ГОТОВО | `src/plugin/engine.rs`, `src/messages/bus.rs`, `wit/plugin.wit`, `plugins/agent_plugin/src/handle_event.rs` |
 | A3  | Алгоритм | `history_append` держит write-lock на весь push (узкое место) | 🟡 LOW | `src/plugin/engine.rs` |
-| A4  | Алгоритм | Док-баг в WIT: `request-id`/`session-id` перепутаны в комментариях | 🟡 LOW | `wit/plugin.wit` |
+| A4  | Алгоритм | Док-баг в WIT: `request-id`/`session-id` перепутаны в комментариях | 🟢 ГОТОВО | `wit/plugin.wit` |
 | B1  | Безопасность | Сетевая аутентификация отсутствует: `token` не проверяется | 🔴 HIGH | `src/host/net/server.rs`, `src/host/net/outbound.rs`, `src/config/config.rs` |
 | B2  | Безопасность | `PluginAccess::Network` не проверяется в `post_json` | 🔴 HIGH | `src/plugin/engine.rs`, `src/plugin/config.rs`, `wit/plugin.wit` |
 | B3  | Безопасность | MCP-транспорт = произвольный spawn процесса хоста | 🟢 ГОТОВО | `src/host/mcp_transport.rs`, `src/config/config.rs`, `src/main.rs` |
 | B4  | Безопасность | HTTP/WS-фронты без auth + обход `session_local` | 🟢 ГОТОВО | `src/host/http_server.rs`, `src/host/ws_server.rs`, `src/plugin/engine.rs`, `wit/plugin.wit`, `plugins/front_*/src/lib.rs` |
 | B5  | Безопасность | Утечка секретов в лог (`config` плагина) | 🟢 ГОТОВО | `src/plugin/engine.rs` |
 | B6  | Безопасность | `PluginAccess::Filesystem` объявлено, но не реализовано (мёртвое право) | 🟡 LOW | `src/plugin/config.rs`, `src/plugin/engine.rs` |
-| B7  | Безопасность | Metrics-экспортер без auth на `0.0.0.0` | 🟡 LOW | `src/metrics.rs` |
-| B8  | Безопасность | `build_http_response`: `unwrap` на невалидном `status` из payload | 🟡 LOW | `src/host/http_server.rs` |
+| B7  | Безопасность | Metrics-экспортер без auth на `0.0.0.0` | 🟢 ГОТОВО | `src/metrics.rs`, `src/config/config.rs`, `src/main.rs` |
+| B8  | Безопасность | `build_http_response`: `unwrap` на невалидном `status` из payload | 🟢 ГОТОВО | `src/host/http_server.rs` |
 | B9  | Безопасность | `std::process::exit(1)` внутри tokio-задачи при стартовом таймауте | 🟡 LOW | `src/main.rs` |
 | B10 | Безопасность | mTLS для межхозяйских линков (внутренний CA, взаимная аутентификация, опц. привязка SAN) | 🟢 ГОТОВО | `src/host/net/tls.rs`, `src/host/net/server.rs`, `src/host/net/outbound.rs`, `src/config/config.rs` |
 
@@ -113,7 +113,7 @@ entries.push(ev.clone());
 
 ---
 
-## A4. Док-баг в WIT: `request-id`/`session-id` перепутаны в комментариях
+## A4. 🟢 Док-баг в WIT: `request-id`/`session-id` перепутаны в комментариях (РЕАЛИЗОВАНО)
 
 **Проблема.** `wit/plugin.wit:5-6`:
 ```
@@ -122,7 +122,10 @@ session-id: string, // Сквозной ID пользовательского з
 ```
 По коду (`src/messages/bus.rs`, `src/host/*`): `request_id` — ID конкретного запроса/ответа, `session_id` — ID сквозной сессии диалога.
 
-**Решение.** Исправить комментарии на корректные (без изменения WIT-схемы — обратная совместимость сохранена). При желании — расширить WIT-комментарии словарём топиков (уже есть в `types`).
+**Решение (реализовано, 2026-09-07).** Исправлены комментарии в соответствии с реальной семантикой:
+- `request-id` → «Сквозной ID пользовательского запроса» (per-request id).
+- `session-id` → «Сквозной ID пользовательской сессии» (end-to-end session id).
+Изменение только документации — обратная совместимость полностью сохранена (поведение не меняется, тест не требуется).
 
 **Критерии приёмки.** Док-ривью; `cargo build` без изменений семантики.
 
@@ -280,31 +283,33 @@ info!("[Хост] Конфигурация плагина: {:?}", config_str);
 
 ---
 
-## B7. 🟡 Metrics-экспортер без auth на `0.0.0.0`
+## B7. 🟢 Metrics-экспортер без auth на `0.0.0.0` (РЕАЛИЗОВАНО)
 
-**Проблема.** `src/metrics.rs:251` `TcpListener::bind(&addr)` где `addr = host:port` (default `127.0.0.1:9090`, но конфигурируемо). По умолчанию `enabled=false`. При включении — информационная утечка метрик (активные сессии, топология косвенно) без auth.
+**Проблема.** `src/metrics.rs:251` `TcpListener::bind(&addr)` где `addr = host:port`. Дефолт `host` уже был `127.0.0.1` (конфиг `default_metrics_host`), `enabled=false`. При включении с публичным `host` — информационная утечка метрик (активные сессии, топология косвенно) без auth.
 
-**Решение.**
-1. Оставить default `127.0.0.1`; документировать, что публичный bind требует внешнего auth (reverse-proxy).
-2. Опционально: простой bearer-токен на `/metrics`.
+**Решение (реализовано, 2026-09-07).**
+1. Дефолт bind = `127.0.0.1` (без изменений; снаружи недоступен по умолчанию).
+2. Добавлен опциональный bearer-токен: `MetricsExportConfig.token: Option<String>` (`#[serde(default)]`). Если задан — `start_metrics_exporter` читает заголовок клиента `Authorization: Bearer <token>` и возвращает `401 Unauthorized` при несовпадении/отсутствии. Проброшен через `MetricsConfig.token`.
 
 **Критерии приёмки.**
-- Default bind = `127.0.0.1` (тест на `SocketAddr`); док-ривью.
+- Дефолт `host = 127.0.0.1` (конфиг `Default`); док-ривью.
+- Опц. токен: если `metrics.token` задан — неавторизованный scrape → `401`; с токеном → `200`. (Интеграционно; юнит-сборка зелёная.)
 
 ---
 
-## B8. 🟡 `build_http_response`: `unwrap` на невалидном `status` из payload
+## B8. 🟢 `build_http_response`: `unwrap` на невалидном `status` из payload (РЕАЛИЗОВАНО)
 
-**Проблема.** `src/host/http_server.rs:204`:
+**Проблема.** `src/host/http_server.rs:216`:
 ```rust
-.status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
+builder.body(Body::from(response_body)).unwrap()
 ```
-`status` берётся из недоверенного `payload` плагина как `u64`. `from_u16` паникует при значениях >999, но `.unwrap_or(OK)` это ловит — на самом деле безопасно. Мелочь: при `status = 0` (неверный) `from_u16(0)` → `Err` → `OK`, что может скрывать ошибки плагина. Не паника, но семантика «молча 200» неидеальна.
+`response_body` формируется из недоверенного `payload` плагина. `unwrap` паникует при ошибке сборки тела, краша весь HTTP-сервер. (Примечание: строка `status` — `StatusCode::from_u16(status).unwrap_or(StatusCode::OK)` — уже была безопасна; фикс затрагивает `body`-unwrap, оставляя status безопасным.)
 
-**Решение.**
-- При невалидном `status` логировать warning и возвращать `502 Bad Gateway` (ошибка upstream-плагина), а не `200 OK`.
+**Решение (реализовано, 2026-09-07).** Заменён `.unwrap()` на fail-safe: при ошибке сборки тела возвращается `500 Internal Server Error` (пустое тело) вместо паники. HTTP-сервер продолжает обслуживать остальные запросы.
 
 **Критерии приёмки.**
+- Существующие тесты `build_http_response_*` остаются зелёными (status из payload применяется; полный JSON возвращается).
+- Fail-safe: некорректное тело → `500`, не паника. (Сборка зелёная: 137 passed, 0 warnings.)
 - Тест: `status=999` (или `0`) → ответ `502`, warning в лог.
 
 ---

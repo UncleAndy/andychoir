@@ -228,7 +228,15 @@ pub fn build_http_response(resp: &Event) -> Response {
         }
     }
 
-    builder.body(Body::from(response_body)).unwrap()
+    // B8: не паникуем на недоверенном/невалидном payload — при ошибке сборки
+    // тела возвращаем 500 (fail-safe), а не крашим весь HTTP-сервер.
+    match builder.body(Body::from(response_body)) {
+        Ok(r) => r,
+        Err(_) => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::empty())
+            .unwrap_or_default(),
+    }
 }
 
 /// Запустить axum-сервер на порту.

@@ -78,6 +78,7 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
             port: config.metrics.port,
             update_interval_secs: config.metrics.update_interval_secs,
             location: config.metrics.location.clone(),
+            token: config.metrics.token.clone(),
         },
     );
 

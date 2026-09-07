@@ -115,6 +115,11 @@ pub struct MetricsExportConfig {
     pub update_interval_secs: u64,
     #[serde(default = "default_metrics_location")]
     pub location: String,
+    /// Опциональный токен аутентификации (B7). Если задан, экспортер требует
+    /// `Authorization: Bearer <token>`; иначе отвечает `401`. По умолчанию — нет
+    /// (но bind по умолчанию 127.0.0.1, так что внешне недоступен).
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 fn default_max_fuel_for_call() -> u64 {
@@ -149,6 +154,7 @@ impl Default for MetricsExportConfig {
             port: default_metrics_port(),
             update_interval_secs: default_metrics_update_interval_secs(),
             location: default_metrics_location(),
+            token: None,
         }
     }
 }

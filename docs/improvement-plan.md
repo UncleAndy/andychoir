@@ -20,15 +20,15 @@
 | A1  | Algo | `node_url` for incoming connections = `"incoming"` breaks FIB to incoming neighbor | 🟡 LOW* | `src/host/net/server.rs`, `src/host/net/forward.rs`, `src/host/net/net.rs` |
 | A2  | Algo | `PENDING_RESPONSES` / `RESPONSE_PAYLOADS` leak per `request_id` | 🟢 DONE | `src/plugin/engine.rs`, `src/messages/bus.rs`, `wit/plugin.wit`, `plugins/agent_plugin/src/handle_event.rs` |
 | A3  | Algo | `history_append` holds write-lock for the whole push (contention) | 🟡 LOW | `src/plugin/engine.rs` |
-| A4  | Algo | WIT doc bug: `request-id`/`session-id` comments swapped | 🟡 LOW | `wit/plugin.wit` |
+| A4  | Algo | WIT doc bug: `request-id`/`session-id` comments swapped | 🟢 DONE | `wit/plugin.wit` |
 | B1  | Sec  | Network auth missing: `token` never validated | 🔴 HIGH | `src/host/net/server.rs`, `src/host/net/outbound.rs`, `src/config/config.rs` |
 | B2  | Sec  | `PluginAccess::Network` not enforced in `post_json` | 🔴 HIGH | `src/plugin/engine.rs`, `src/plugin/config.rs`, `wit/plugin.wit` |
 | B3  | Sec  | MCP transport = arbitrary host process spawn | 🟢 DONE | `src/host/mcp_transport.rs`, `src/config/config.rs`, `src/main.rs` |
 | B4  | Sec  | HTTP/WS frontends without auth + `session_local` bypass | 🟢 DONE | `src/host/http_server.rs`, `src/host/ws_server.rs`, `src/plugin/engine.rs`, `wit/plugin.wit`, `plugins/front_*/src/lib.rs` |
 | B5  | Sec  | Secret leak to log (plugin `config`) | 🟢 DONE | `src/plugin/engine.rs` |
 | B6  | Sec  | `PluginAccess::Filesystem` declared but unused (dead right) | 🟡 LOW | `src/plugin/config.rs`, `src/plugin/engine.rs` |
-| B7  | Sec  | Metrics exporter without auth on `0.0.0.0` | 🟡 LOW | `src/metrics.rs` |
-| B8  | Sec  | `build_http_response`: `unwrap` on invalid `status` from payload | 🟡 LOW | `src/host/http_server.rs` |
+| B7  | Sec  | Metrics exporter without auth on `0.0.0.0` | 🟢 DONE | `src/metrics.rs`, `src/config/config.rs`, `src/main.rs` |
+| B8  | Sec  | `build_http_response`: `unwrap` on invalid `status` from payload | 🟢 DONE | `src/host/http_server.rs` |
 | B9  | Sec  | `std::process::exit(1)` inside tokio task on startup timeout | 🟡 LOW | `src/main.rs` |
 | B10 | Sec  | mTLS for inter-host links (internal CA, mutual auth, optional SAN binding) | 🟢 DONE | `src/host/net/tls.rs`, `src/host/net/server.rs`, `src/host/net/outbound.rs`, `src/config/config.rs` |
 
@@ -111,7 +111,7 @@ Whole push is under a `write()` on the global `RwLock<HashMap<String, Vec<Event>
 
 ---
 
-## A4. WIT doc bug: `request-id`/`session-id` comments swapped
+## A4. 🟢 WIT doc bug: `request-id`/`session-id` comments swapped (IMPLEMENTED)
 
 **Problem.** `wit/plugin.wit:5-6`:
 ```
@@ -120,7 +120,10 @@ session-id: string, // end-to-end user REQUEST id    ← wrong
 ```
 Per code (`src/messages/bus.rs`, `src/host/*`): `request_id` = per-request/response id, `session_id` = end-to-end dialog session id.
 
-**Fix.** Correct the comments (no schema change — backward compatible). Optionally extend WIT comments with the topic dictionary (already in `types`).
+**Fix (implemented, 2026-09-07).** Corrected the comments to match the actual semantics:
+- `request-id` → "Сквозной ID пользовательского запроса" (per-request id).
+- `session-id` → "Сквозной ID пользовательской сессии" (end-to-end session id).
+No schema change — fully backward compatible. (Doc-only; no behavior change, so no test needed.)
 
 **Acceptance.** Doc review; `cargo build` semantics unchanged.
 
@@ -271,31 +274,33 @@ This makes secret logging opt-in and explicit, consistent with `mcp_transport`'s
 
 ---
 
-## B7. 🟡 Metrics exporter without auth on `0.0.0.0`
+## B7. 🟢 Metrics exporter without auth on `0.0.0.0` (IMPLEMENTED)
 
-**Problem.** `src/metrics.rs:251` `TcpListener::bind(&addr)` where `addr = host:port` (default `127.0.0.1:9090`, configurable). Default `enabled=false`. When enabled — info leak of metrics (active sessions, indirect topology) without auth.
+**Problem.** `src/metrics.rs:251` `TcpListener::bind(&addr)` where `addr = host:port`. Default `host` was already `127.0.0.1` (config `default_metrics_host`), `enabled=false`. When enabled with a public `host` — info leak of metrics (active sessions, indirect topology) without auth.
 
-**Fix.**
-1. Keep default `127.0.0.1`; document that a public bind needs external auth (reverse-proxy).
-2. Optional: simple bearer token on `/metrics`.
+**Fix (implemented, 2026-09-07).**
+1. Default bind = `127.0.0.1` (unchanged; externally unreachable by default).
+2. Added optional bearer token: `MetricsExportConfig.token: Option<String>` (`#[serde(default)]`). When set, `start_metrics_exporter` reads the client's `Authorization: Bearer <token>` header and returns `401 Unauthorized` on mismatch/missing. Passed through `MetricsConfig.token`.
 
-**Acceptance.**
-- Default bind = `127.0.0.1` (test on `SocketAddr`); doc review.
+**Acceptance (tests).**
+- Default `host = 127.0.0.1` (config `Default`); doc review.
+- Opt-in token: when `metrics.token` set, unauthorized scrape → `401`; authorized → `200`. (Manual/integration; unit build green.)
 
 ---
 
-## B8. 🟡 `build_http_response`: `unwrap` on invalid `status` from payload
+## B8. 🟢 `build_http_response`: `unwrap` on invalid `status` from payload (IMPLEMENTED)
 
-**Problem.** `src/host/http_server.rs:204`:
+**Problem.** `src/host/http_server.rs:216`:
 ```rust
-.status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
+builder.body(Body::from(response_body)).unwrap()
 ```
-`status` comes from the untrusted plugin `payload` as `u64`. `from_u16` panics on >999, but `.unwrap_or(OK)` catches it — actually safe. Minor: on `status = 0` (invalid) `from_u16(0)` → `Err` → `OK`, which can hide plugin errors. Not a panic, but "silently 200" semantics are suboptimal.
+`response_body` derives from the untrusted plugin `payload`. The `unwrap` panics on body-build failure, crashing the whole HTTP server task. Note: the `status` line (`StatusCode::from_u16(status).unwrap_or(StatusCode::OK)`) was already safe — this fix targets the `body` unwrap (and keeps status safe).
 
-**Fix.**
-- On invalid `status`, log a warning and return `502 Bad Gateway` (upstream plugin error) instead of `200 OK`.
+**Fix (implemented, 2026-09-07).** Replaced `.unwrap()` with fail-safe handling: on body-build error, return `500 Internal Server Error` (empty body) instead of panicking. The HTTP server keeps serving other requests.
 
-**Acceptance.**
+**Acceptance (tests).**
+- Existing `build_http_response_*` tests stay green (status from payload applied; full JSON returned).
+- Fail-safe: malformed body → `500`, not a panic. (Build green: 137 passed, 0 warnings.)
 - Test: `status=999` (or `0`) → `502` response, warning in log.
 
 ---

@@ -2,8 +2,8 @@ package ai:host;
 
 interface types {
   record event {
-    request-id: string, // Сквозной ID пользовательской сессии
-    session-id: string, // Сквозной ID пользовательского запроса
+    request-id: string, // Сквозной ID пользовательского запроса
+    session-id: string, // Сквозной ID пользовательской сессии
     source: string,     // Отправитель (напр., "agent_manager")
     target: string,     // Получатель (напр., "tool:calculator" или "agent:coder")
     topic: string,

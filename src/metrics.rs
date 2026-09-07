@@ -17,6 +17,9 @@ pub struct MetricsConfig {
     pub port: u16,
     pub update_interval_secs: u64,
     pub location: String,
+    /// Опциональный токен аутентификации (B7). Если задан — требуем
+    /// `Authorization: Bearer <token>`, иначе `401`.
+    pub token: Option<String>,
 }
 
 #[derive(Default)]
@@ -270,12 +273,39 @@ pub fn start_metrics_exporter(
                 continue;
             };
             let body = metrics.render_prometheus();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            let _ = socket.write_all(response.as_bytes()).await;
+            // B7: аутентификация экспортёра (опционально).
+            let needs_auth = config.token.clone();
+            let resp = if let Some(expected) = needs_auth {
+                // Читаем запрос, чтобы извлечь заголовок Authorization.
+                use tokio::io::AsyncReadExt;
+                let mut buf = vec![0u8; 4096];
+                let n = match socket.read(&mut buf).await {
+                    Ok(n) if n > 0 => n,
+                    _ => continue,
+                };
+                let head = String::from_utf8_lossy(&buf[..n]);
+                let auth_ok = head.lines().any(|line| {
+                    let l = line.to_ascii_lowercase();
+                    l.starts_with("authorization:")
+                        && l.trim_end().ends_with(&format!("bearer {}", expected.to_ascii_lowercase()))
+                });
+                if auth_ok {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                }
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            };
+            let _ = socket.write_all(resp.as_bytes()).await;
         }
     }))
 }
