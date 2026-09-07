@@ -81,6 +81,14 @@ impl NetInner {
         Self::new_test_with_cfg(NetConfig::default())
     }
 
+    /// Тестовый конструктор с явным node_id (для тестов топологии/ринга).
+    #[cfg(test)]
+    pub(crate) fn new_test_with_node_id(node_id: String) -> Arc<NetInner> {
+        let mut cfg = NetConfig::default();
+        cfg.node_id = node_id;
+        Self::new_test_with_cfg(cfg)
+    }
+
     /// Тестовый конструктор с заданным конфигом (remotes и т.п.).
     pub(crate) fn new_test_with_cfg(cfg: NetConfig) -> Arc<NetInner> {
         Arc::new(NetInner {

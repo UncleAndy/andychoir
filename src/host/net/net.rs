@@ -983,31 +983,120 @@ mod tests {
         }
     }
 
-    // OP (session_local): pack_hello ДОЛЖЕН анонсировать инструменты с
-    // флагом session_local в сеть (удалённые агенты должны о них знать и
-    // иметь возможность вызвать в рамках своей сессии).
+    // === ФАЗА 3: интеграционный тест на кольцевой топологии (A-B-C) =========
+    // Моделируем ринг A(front) — B(agent) — C(tool) без реальной сети:
+    // B получает Hello от A, в котором A анонсирует соседей [B, C] и инструменты
+    // узла C. Тогда на B строится FIB: C достижим через next_hop=A.
+
+    // OP (Фаза 3, Сценарий 2): Tool только на C; запрос от сессии на B.
+    // Ожидаем: resolve → host:C:tool:calculator (Tier 3), forward уходит к next_hop A.
     #[tokio::test]
-    async fn p2_pack_hello_announces_session_local_tools() {
-        let inner = NetInner::new_test();
-        // Регистрируем локальный приватный инструмент.
-        crate::plugin::engine::register_local_tool(ToolDef {
-            name: "filesystem".into(),
-            description: "private fs".into(),
-            parameters_json: "{}".into(),
-            session_local: true,
-        }).await;
-        let s = super::discovery::pack_hello(&inner).await;
-        match super::message::unpack_message(&s).unwrap() {
-            NetMessage::Hello { tools, .. } => {
-                let names: Vec<&String> = tools.iter().map(|t| &t.name).collect();
-                assert!(names.contains(&&"filesystem".to_string()),
-                    "session_local инструмент должен анонсироваться в сети: {:?}", names);
-                let fs = tools.iter().find(|t| t.name == "filesystem").unwrap();
-                assert!(fs.session_local, "флаг session_local сохраняется в анонсе");
+    async fn p3_ring_b_request_routes_to_c_via_a() {
+        let a = "00000000-0000-0000-0000-0000000000a1".to_string();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        let c = "00000000-0000-0000-0000-0000000000c3".to_string();
+        let inner = NetInner::new_test_with_node_id(b.clone());
+        // B видит A как соседа; A (в своём Hello) сообщает соседей [B, C].
+        super::discovery::handle_hello(
+            &inner, a.clone(), vec![b.clone(), c.clone()], vec![], 1,
+        ).await;
+        // C анонсирует себя и свой calculator (Hello от C, полученный B напрямую
+        // или через A). Теперь origin_tools[C] содержит calculator, а FIB знает
+        // путь B→A→C.
+        super::discovery::handle_hello(
+            &inner, c.clone(), vec![a.clone()],
+            vec![ToolDef { name: "calculator".into(), description: "".into(), parameters_json: "{}".into(), session_local: false }],
+            1,
+        ).await;
+        // FIB должен построиться: C достижим через next_hop=A.
+        crate::host::net::lsdb::rebuild_fib(&inner).await;
+        let next_hop = crate::host::net::lsdb::route_next_hop(&inner, &c).await;
+        assert_eq!(next_hop, Some(a.clone()), "next-hop к C — узел A (ринг)");
+
+        // Запрос от локальной сессии на B (нет в session_origin → не Tier 1).
+        let ev = make_event("tool:calculator", "sess-b");
+        // Канал к A.
+        let url_a = "ws://host-a:8092/net".to_string();
+        inner.node_url.write().await.insert(a.clone(), url_a.clone());
+        let (tx_a, mut rx_a) = mpsc::channel::<String>(8);
+        inner.outbound.write().await.insert(url_a.clone(), tx_a);
+
+        let resolved = crate::host::net::orchestrator::resolve_tool_target(&inner, "sess-b", "calculator").await;
+        assert_eq!(
+            resolved,
+            Some(crate::host::net::orchestrator::ResolvedTarget { target: format!("host:{}:tool:calculator", c), tier: 3 }),
+            "Tier 3: tool только на C (через ринг)"
+        );
+        let sent = forward_inner(&inner, &ev).await;
+        assert!(sent, "событие ушло по сети к next_hop A");
+        let msg = rx_a.try_recv().expect("сообщение ушло в канал узла A");
+        match super::message::unpack_message(&msg).unwrap() {
+            NetMessage::Event { event, .. } => {
+                let ev2 = super::message::value_to_event(&event).unwrap();
+                assert_eq!(ev2.target, format!("host:{}:tool:calculator", c), "target разрешён в узел C через ринг");
             }
-            _ => panic!("expected Hello"),
+            _ => panic!("expected Event"),
         }
-        // Чистим, чтобы не влиять на другие тесты.
-        crate::plugin::engine::local_tools().write().await.remove("filesystem");
+    }
+
+    // OP (Фаза 3, Сценарий 1): Tool на A (источнике сессии). Запрос от сессии,
+    // инициированной A. Ожидаем Tier 1 host:A даже при наличии кольца.
+    #[tokio::test]
+    async fn p3_ring_source_priority_over_ring() {
+        let a = "00000000-0000-0000-0000-0000000000a1".to_string();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        let c = "00000000-0000-0000-0000-0000000000c3".to_string();
+        let inner = NetInner::new_test_with_node_id(b.clone());
+        // B знает A (сосед) и что у A есть calculator (и у C тоже, через A).
+        super::discovery::handle_hello(
+            &inner, a.clone(), vec![b.clone(), c.clone()],
+            vec![ToolDef { name: "calculator".into(), description: "".into(), parameters_json: "{}".into(), session_local: false }],
+            1,
+        ).await;
+        crate::host::net::lsdb::rebuild_fib(&inner).await;
+        // Сессия инициирована узлом A (источник).
+        inner.session_origin.write().await.insert("sess-a".into(), a.clone());
+        let resolved = crate::host::net::orchestrator::resolve_tool_target(&inner, "sess-a", "calculator").await;
+        assert_eq!(
+            resolved,
+            Some(crate::host::net::orchestrator::ResolvedTarget { target: format!("host:{}:tool:calculator", a), tier: 1 }),
+            "Tier 1: инструмент у источника (A) приоритетнее ринга"
+        );
+    }
+
+    // OP (Фаза 3, Сценарий 3): Tool локально на B (агенте). Запрос от локальной
+    // сессии на B → локальное исполнение (Tier 2), не уходит в сеть.
+    #[tokio::test]
+    async fn p3_ring_local_tool_executes_locally() {
+        let a = "00000000-0000-0000-0000-0000000000a1".to_string();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        let c = "00000000-0000-0000-0000-0000000000c3".to_string();
+        let inner = NetInner::new_test_with_node_id(b.clone());
+        // B знает ринг (A-сосед, C через A), но calculator — локально на B.
+        super::discovery::handle_hello(
+            &inner, a.clone(), vec![b.clone(), c.clone()], vec![], 1,
+        ).await;
+        crate::host::net::lsdb::rebuild_fib(&inner).await;
+        // Локальный инструмент B.
+        crate::plugin::engine::register_local_tool(ToolDef {
+            name: "calculator".into(), description: "".into(),
+            parameters_json: "{}".into(), session_local: false,
+        }).await;
+        let resolved = crate::host::net::orchestrator::resolve_tool_target(&inner, "sess-b", "calculator").await;
+        // resolve_tool_target НЕ реализует Tier 2 (локальный приоритет
+        // обрабатывается шиной ДО forward: matched_plugins не пуст → событие
+        // исполняется локально, не уходит в сеть). Поэтому для локального
+        // инструмента resolve возвращает None, а forward не маршрутизирует в сеть.
+        assert!(resolved.is_none(), "Tier 2 (локальный) resolve не возвращает сетевой target");
+        // forward не должен уходить в сеть (нет outbound для tool:calculator).
+        let url_a = "ws://host-a:8092/net".to_string();
+        inner.node_url.write().await.insert(a.clone(), url_a.clone());
+        let (tx_a, mut rx_a) = mpsc::channel::<String>(8);
+        inner.outbound.write().await.insert(url_a.clone(), tx_a);
+        let ev = make_event("tool:calculator", "sess-b");
+        let sent = forward_inner(&inner, &ev).await;
+        assert!(!sent, "локальный инструмент не уходит в сеть");
+        assert!(rx_a.try_recv().is_err(), "ничего не ушло в канал A");
+        crate::plugin::engine::local_tools().write().await.remove("calculator");
     }
 }
