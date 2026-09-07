@@ -26,7 +26,8 @@ Key properties:
 * **Topology-blind.** An agent plugin asks for a tool *by name*
   (`tool:calculator`); the host resolves it to a concrete node in the mesh
   (see `docs/tool-prioritization.md`). Plugins never address other hosts
-  directly.
+  directly. Inter-host mesh traffic can be encrypted and mutually authenticated
+  with mTLS (internal CA) — see `docs/NET-concept.md` §8.6; it is off by default.
 
 ---
 

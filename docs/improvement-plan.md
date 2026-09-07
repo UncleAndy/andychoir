@@ -2,7 +2,7 @@
 
 > Source: audit of method/algorithm correctness and security.
 > Scope: two sections — "Algorithmic/logical defects" and "Security (by priority)".
-> Base status: `cargo test` — 112 passed, 0 failed (host logic and network algorithms covered by unit tests).
+> Base status: `cargo test` — 129 passed, 0 failed (host logic, network algorithms, and mTLS covered by unit tests).
 > Rule: `git add`/`git commit` only on explicit command. This file is not auto-committed.
 
 ## Priority legend
@@ -30,6 +30,7 @@
 | B7  | Sec  | Metrics exporter without auth on `0.0.0.0` | 🟡 LOW | `src/metrics.rs` |
 | B8  | Sec  | `build_http_response`: `unwrap` on invalid `status` from payload | 🟡 LOW | `src/host/http_server.rs` |
 | B9  | Sec  | `std::process::exit(1)` inside tokio task on startup timeout | 🟡 LOW | `src/main.rs` |
+| B10 | Sec  | mTLS for inter-host links (internal CA, mutual auth, optional SAN binding) | 🟢 DONE | `src/host/net/tls.rs`, `src/host/net/server.rs`, `src/host/net/outbound.rs`, `src/config/config.rs` |
 
 > \*A1 is not security but breaks mesh correctness for asymmetric links — listed separately per request.
 
@@ -283,6 +284,53 @@ Abrupt exit from a task (without waiting for other tasks'/logger's graceful shut
 
 **Acceptance.**
 - Behavioral/smoke: on plugin unreadiness within `startup.timeout_secs`, process exits code 1, logs flushed.
+
+---
+
+## B10. 🟢 mTLS for inter-host links (IMPLEMENTED)
+
+**Problem.** The mesh transport is plain `ws://` (tokio-tungstenite over TCP). Even with
+`Auth` (B1), traffic is unencrypted in transit — a network observer can read events,
+tool calls, and sessions; and any host holding our CA-issued cert could impersonate
+another node. There was no transport-layer confidentiality or mutual host authentication.
+
+**Fix (implemented, 2026-09-07).**
+- New module `src/host/net/tls.rs`: internal **private CA** (self-signed, generated via
+  `rcgen` or supplied as files); `MtlsConfig` parsing; `ensure_certificates()` (auto-generates
+  CA + node cert on first start if files are missing, idempotent); `load_server_config`
+  (rustls `ServerConfig` with **required client cert** chained to our CA); `load_client_config`
+  (rustls `ClientConfig`; with `require_node_id_in_san` it uses a custom `ServerCertVerifier`
+  that additionally checks the server cert's DNS SAN == the peer `node_id` taken from the URL
+  hostname).
+- `server.rs` (`run_incoming_server`): when `mtls.enabled`, the host listens on **`wss://`**
+  (tokio `TcpListener` + `TlsAcceptor` + tungstenite); shared `process_netmsg` handles both
+  plain and TLS paths. `Auth` (B1) still runs on top of the encrypted channel.
+- `outbound.rs` (`run_outbound_loop`): when `mtls.enabled` (remote or global), dials over
+  `wss://` via `connect_async_tls_with_config` with `Connector::Rustls`; expected peer
+  `node_id` is the URL hostname.
+- `config.rs`: `MtlsConfig { enabled, dir, ca_cert, cert, key, require_node_id_in_san }` under
+  `NetConfig.mtls` and `NetRemote.mtls` (per-link override). `#[serde(default)]` → disabled by
+  default (backward compatible: plain `ws://`).
+- `net.rs` (`start_net`): when `mtls.enabled`, calls `ensure_certificates` before bringing up
+  the server/clients; fails fast if generation/load errors (no half-encrypted mesh).
+
+**Limitation (documented honestly).** Strict SAN↔node_id binding is enforced on the **client
+side** only. Server-side strict SAN check of the client is not implemented because the server
+learns the client's `node_id` only after `Auth`/`Hello`, which arrive *after* the TLS
+handshake (enforcing it in the verifier would require a wire-protocol change). The base
+mutual-CA check (client cert required + chained to our CA) is fully implemented and closes the
+main threat (encryption + mutual CA authentication). For production, distribute per-host certs
+and keep `require_node_id_in_san: true` on the dialing side.
+
+**Acceptance (tests).**
+- `tls::tests`: `generate_then_load_server_config` (auto-gen + load), `cert_san_contains_node_id`
+  (SAN == node_id), `verify_peer_node_id_matches` (match/mismatch), `ensure_noop_when_disabled`.
+- `server::b1_auth_tests`: `mtls_accepts_valid_cert_and_registers` (wss client with valid cert
+  registers), `mtls_rejects_plain_ws` (mTLS server rejects a plain ws client).
+- Regression: B1 plain-ws tests stay green (backward compatible). Full suite: **129 passed,
+  0 warnings**.
+
+See `docs/mtls-plan.md` and `docs/NET-concept.md` §8.6 for the full design and config examples.
 
 ---
 

@@ -12,6 +12,11 @@ The central binary is a host application. It loads a configuration plugin
 configures all the required plugins. In addition, the host is responsible for
 the message bus between plugins.
 
+Hosts can form a decentralized **mesh network** (link-state discovery, shortest-path
+routing, bloom-filter dedup) over plain `ws://` or mutually-authenticated, encrypted
+`mTLS` (`wss://`) with an internal private CA. See `docs/NET-concept.md` and
+`docs/mtls-plan.md`.
+
 ## Plugin format
 
 Plugins are loaded as wasm applications. They must export an `init` function

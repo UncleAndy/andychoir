@@ -44,6 +44,9 @@ history:
 # (behind NAT / does not accept incoming). A never dials C directly.
 # Routing to C is automatic via FIB (A->B->C). See docs/NET-concept.md §8.
 #
+# mTLS (OPTIONAL, see docs/NET-concept.md §8.6): switch to wss:// + mtls block.
+# Certs auto-generated into ./certs on first start if missing (one shared ca.pem).
+#
 # Retry: по умолчанию 10с между попытками, окно 5 мин (300с).
 # Чтобы кольцо собралось при неодновременном старте — достаточно дефолтов.
 net:
@@ -52,8 +55,12 @@ net:
   connect_retry_interval_secs: 10   # пауза между попытками (default 10)
   connect_timeout_secs: 300         # окно отказа 5 мин; 0 = вечно
   token: []
+  mtls:
+    enabled: true
+    dir: "./certs"
+    require_node_id_in_san: true
   remotes:
-    - url: "ws://127.0.0.1:8091/net"
+    - url: "wss://127.0.0.1:8091/net"
       token: "secret-b"
       targets: []
       retry_interval_secs: 0         # 0 → из NetConfig (10)

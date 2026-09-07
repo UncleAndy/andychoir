@@ -6,6 +6,10 @@ AndyChoir supports a decentralized mesh network of hosts. Each host can connect 
 
 The system achieves this through a combination of **Link-State Discovery**, **Local Shortest-Path Routing**, and **Probabilistic Dedup**.
 
+**Transport.** By default hosts talk over plain `ws://` (tokio-tungstenite over TCP). To
+encrypt inter-host traffic and mutually authenticate hosts, enable **mTLS** with an internal
+private CA — see §8.6. mTLS is optional and off by default (backward compatible).
+
 ## 2. Decentralized Discovery (Link-State)
 
 Instead of a central coordinator, every host independently maintains a **Link-State Database (LSDB)** — a local map of the entire network topology.
@@ -319,4 +323,132 @@ long-lived mesh links behind unreliable networks).
 
 Combined with the Dijkstra FIB (shortest path) and per-hop `ttl` decrement,
 events route correctly through cycles without infinite flooding or routing loops.
+
+### 8.6 Transport security: mTLS (inter-host encryption + mutual auth)
+
+By default the mesh runs over **plain `ws://`** (tokio-tungstenite over TCP). Discovery,
+routing and dedup are unencrypted and unauthenticated at the transport layer — the only
+protection is the `Auth` token (B1, see `docs/improvement-plan.md`). To encrypt
+inter-host traffic **and** mutually authenticate hosts, enable **mTLS** (mutual TLS) with
+an **internal private CA** that the deployment owns — no public/third-party CA.
+
+> Implemented in `src/host/net/tls.rs` + wired into `server.rs` (incoming) and
+> `outbound.rs` (outgoing). Plan: `docs/mtls-plan.md`. 129 unit tests pass, 0 warnings.
+
+### 8.6.1 What mTLS gives you
+
+- **Encryption** — every inter-host link (and every hop through a relay) is TLS; a network
+  observer can no longer read events/tools/sessions in transit.
+- **Mutual authentication** — both ends must present a certificate signed by *our* internal
+  CA. A host presenting a cert not from our CA is rejected (server-side: client cert
+  required; client-side: server cert must chain to our CA).
+- **Defense-in-depth** — the `Auth` token (B1) still rides *on top* of the encrypted
+  channel, as a second factor.
+
+### 8.6.2 Certificate model
+
+- One **internal root CA** per deployment (self-signed). You distribute its `ca.pem` to
+  every host (out of band, e.g. via your config management).
+- Each host has a **node certificate** issued (signed) by that CA. The cert's SAN (DNS)
+  **must equal the host's `node_id`** (the convention used by `tls.rs`: SAN = `node_id`
+  + loopback IPs). The `node_id` in the URL hostname and the cert SAN are the same value
+  by convention (`NetRemote::url_host()` returns the node_id).
+- **Auto-generation on first start:** if `ca.pem`/`node.pem`/`node.key` are missing,
+  `ensure_certificates()` generates the internal CA + node cert automatically (via `rcgen`)
+  and writes them to `mtls.dir`. Idempotent — if the files exist and load, nothing is
+  regenerated. This is convenient for single-host dev/test; for production, ship a real CA
+  and per-host certs (set explicit `ca_cert`/`cert`/`key` paths, leave `dir` empty).
+
+### 8.6.3 Configuration (`MtlsConfig`)
+
+`MtlsConfig` lives under `net.mtls` (global) and under each `net.remotes[].mtls` (per-link
+override). It is `#[serde(default)]` — **disabled by default** (plain `ws://`).
+
+```yaml
+net:
+  mtls:
+    enabled: true
+    dir: "./certs"            # where ca.pem/node.pem/node.key live or are generated
+    ca_cert: ""               # optional explicit path; "" → "<dir>/ca.pem"
+    cert: ""                  # optional explicit path; "" → "<dir>/node.pem"
+    key: ""                   # optional explicit path; "" → "<dir>/node.key"
+    require_node_id_in_san: true   # strict: peer cert SAN must == peer node_id
+```
+
+- `enabled: false` (default) → plain `ws://` (backward compatible). Tokens still apply.
+- `enabled: true` → the host listens on **`wss://`** and dials remotes over **`wss://`**.
+  URLs in `remotes[].url` should use the `wss://` scheme.
+- `require_node_id_in_san`:
+  - `false` → "any cert from our CA" is accepted (base mTLS). Hosts are mutually
+    authenticated to the CA, but a compromised CA-issued cert for *another* node could
+    connect. Good enough when the CA is tightly controlled.
+  - `true` → strict: the **client** additionally verifies the server cert's SAN == the
+    server's `node_id` (taken from the URL hostname) via a custom `ServerCertVerifier`.
+    This binds TLS identity to mesh identity. (See limitation below.)
+
+> **Per-link override:** a remote may carry its own `mtls:` block; if present and
+> `enabled`, it overrides the global `net.mtls` for that link only. Mixed meshes are
+> supported (some links plain, some mTLS) — but a plain server will reject an mTLS
+> client and vice versa; configure both ends consistently.
+
+### 8.6.4 Limitation (documented honestly)
+
+Strict SAN↔node_id binding is enforced on the **client side** (the dialing host checks
+the server's cert SAN against the URL hostname). Server-side strict SAN checking of the
+*client* is **not** implemented, because the server learns the client's `node_id` only
+after the `Auth`/`Hello` messages, which arrive *after* the TLS handshake. Enforcing it
+in the verifier would require transmitting the node_id before the handshake (a wire-protocol
+change). The base mutual-CA check (client cert required + chained to our CA) is fully
+implemented and closes the main threat (encryption + mutual CA authentication). For
+production, prefer distributing per-host certs and keeping `require_node_id_in_san: true`
+on the dialing side.
+
+### 8.6.5 mTLS mesh example (A → B → C, encrypted)
+
+All three hosts share the same internal `ca.pem`. Each host gets its own `node.pem`/`node.key`
+(SAN = its `node_id`). Only `net.mtls` is added vs. §8.3; routing/FIB is unchanged.
+
+**Host A** (`listen_port: 0`, dials B over `wss://`):
+```yaml
+net:
+  node_id: "00000000-0000-0000-0000-0000000000a1"
+  listen_port: 0
+  mtls:
+    enabled: true
+    dir: "./certs"
+    require_node_id_in_san: true
+  remotes:
+    - url: "wss://127.0.0.1:8091/net"
+      token: "secret-b"
+```
+
+**Host B** (relay, listens on `wss://8091`):
+```yaml
+net:
+  node_id: "00000000-0000-0000-0000-0000000000b2"
+  listen_port: 8091
+  token: ["secret-b", "secret-c"]
+  mtls:
+    enabled: true
+    dir: "./certs"
+  remotes: []
+```
+
+**Host C** (`listen_port: 0`, dials B over `wss://`):
+```yaml
+net:
+  node_id: "00000000-0000-0000-0000-0000000000c3"
+  listen_port: 0
+  mtls:
+    enabled: true
+    dir: "./certs"
+    require_node_id_in_san: true
+  remotes:
+    - url: "wss://127.0.0.1:8091/net"
+      token: "secret-c"
+```
+
+When A emits `host:…c3:tool:calculator`, the event is forwarded A→B→C **inside TLS**;
+each hop validates the peer cert against the internal CA, and (with `require_node_id_in_san`)
+against the peer's `node_id`. A passive network observer sees only ciphertext.
 

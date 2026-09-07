@@ -40,6 +40,9 @@ history:
 
 # Host B: relay. SERVER — listens on 8091, accepts A and C (tokens),
 # dials nobody. See docs/NET-concept.md §8.
+#
+# mTLS (OPTIONAL, see docs/NET-concept.md §8.6): listens on wss:// + mtls block.
+# Certs auto-generated into ./certs on first start if missing (one shared ca.pem).
 net:
   node_id: "00000000-0000-0000-0000-0000000000b2"
   listen_port: 8091
@@ -48,4 +51,7 @@ net:
   token:
     - "secret-b"
     - "secret-c"
+  mtls:
+    enabled: true
+    dir: "./certs"
   remotes: []
