@@ -156,22 +156,61 @@ pub struct ToolDef {
     pub name: String,
     pub description: String,
     pub parameters_json: String,
+    /// `true` — инструмент доступен только сессиям, инициированным на ЭТОМ
+    /// хосте (вызвавшим плагин локально). Чужим (сетевым) сессиям недоступен
+    /// и НЕ анонсируется в сеть (см. tool-prioritization.md §Флаг session_local).
+    #[serde(default)]
+    pub session_local: bool,
 }
 
 /// Реестр ЛОКАЛЬНЫХ инструментов хоста: name -> ToolDef.
 /// Заполняется при загрузке tool-плагинов (их определения из конфига).
 static LOCAL_TOOLS: OnceLock<RwLock<HashMap<String, ToolDef>>> = OnceLock::new();
 
-/// Инструменты СЕССИИ (добавленные в ходе работы, из подключённых хостов):
-/// session_id -> name -> ToolDef. Приоритет над локальными при конфликте.
-static SESSION_TOOLS: OnceLock<RwLock<HashMap<String, HashMap<String, ToolDef>>>> = OnceLock::new();
+/// Реестр ЛОКАЛЬНЫХ сессий хоста: session_id -> unix-timestamp последнего
+/// обращения. Заполняется при создании сессии фронтендом (ws/http) и
+/// очищается при её закрытии. Используется для флага `session_local`
+/// инструментов: чужой (сетевой) запрос к приватному инструменту допускается
+/// только если session_id реально сформирован на ЭТОМ хосте (иначе отклоняем).
+/// См. tool-prioritization.md §Флаг session_local.
+static LOCAL_SESSIONS: OnceLock<RwLock<HashMap<String, u64>>> = OnceLock::new();
+
+fn local_sessions() -> &'static RwLock<HashMap<String, u64>> {
+    LOCAL_SESSIONS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Зарегистрировать локальную сессию хоста (вызывается при создании сессии
+/// фронтендом ws/http).
+pub async fn register_local_session(id: &str) {
+    local_sessions().write().await.insert(id.to_string(), crate::host::net::dedup::current_unix_secs());
+}
+
+/// Снять регистрацию локальной сессии (вызывается при закрытии сокета/сессии).
+pub async fn unregister_local_session(id: &str) {
+    local_sessions().write().await.remove(id);
+}
+
+/// Существует ли session_id как локальная сессия этого хоста?
+pub async fn is_local_session(id: &str) -> bool {
+    local_sessions().read().await.contains_key(id)
+}
 
 pub fn local_tools() -> &'static RwLock<HashMap<String, ToolDef>> {
     LOCAL_TOOLS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+/// Инструменты СЕССИИ (добавленные в ходе работы, из подключённых хостов):
+/// session_id -> name -> ToolDef. Приоритет над локальными при конфликте.
+static SESSION_TOOLS: OnceLock<RwLock<HashMap<String, HashMap<String, ToolDef>>>> = OnceLock::new();
+
 fn session_tools() -> &'static RwLock<HashMap<String, HashMap<String, ToolDef>>> {
     SESSION_TOOLS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Очистить инструменты конкретной сессии (для тестов).
+#[allow(dead_code)]
+pub(crate) async fn session_tools_clear(session_id: &str) {
+    session_tools().write().await.remove(session_id);
 }
 
 /// Зарегистрировать локальный инструмент хоста (вызывается при загрузке
@@ -1416,5 +1455,65 @@ mod tests {
         assert!(!can_plugin_read_file(&perms, "./README.md"));
         let perms2 = vec![PluginAccess::ConsolePrint(100)];
         assert!(!can_plugin_read_file(&perms2, "./README.md"));
+    }
+
+    // --- Реестр локальных сессий (session_local) ----------------------------
+    #[tokio::test]
+    async fn local_session_register_and_lookup() {
+        let sid = "sess-local-1";
+        assert!(!is_local_session(sid).await, "до регистрации — нет");
+        register_local_session(sid).await;
+        assert!(is_local_session(sid).await, "после регистрации — есть");
+        unregister_local_session(sid).await;
+        assert!(!is_local_session(sid).await, "после снятия — снова нет");
+    }
+
+    #[tokio::test]
+    async fn local_session_independent_of_others() {
+        register_local_session("sess-A").await;
+        register_local_session("sess-B").await;
+        assert!(is_local_session("sess-A").await);
+        assert!(is_local_session("sess-B").await);
+        assert!(!is_local_session("sess-C").await, "неизвестная сессия — нет");
+        unregister_local_session("sess-A").await;
+        assert!(!is_local_session("sess-A").await);
+        assert!(is_local_session("sess-B").await, "соседняя сессия не затронута");
+        unregister_local_session("sess-B").await;
+    }
+
+    // --- add_session_tools сохраняет session_local инструменты -----------
+    #[tokio::test]
+    async fn add_session_tools_keeps_session_local() {
+        // Чужой узел анонсирует calculator (обычный) и filesystem (session_local).
+        let defs = vec![
+            ToolDef { name: "calculator".into(), description: "".into(), parameters_json: "{}".into(), session_local: false },
+            ToolDef { name: "filesystem".into(), description: "".into(), parameters_json: "{}".into(), session_local: true },
+        ];
+        add_session_tools("sess-remote", defs).await;
+        let tools = get_session_tools("sess-remote").await;
+        let names: Vec<&String> = tools.iter().map(|t| &t.name).collect();
+        assert!(names.contains(&&"calculator".to_string()));
+        assert!(names.contains(&&"filesystem".to_string()),
+            "session_local инструмент чужого узла должен попасть в SESSION_TOOLS (чтобы оркестратор мог его резолвить)");
+        // Чистим.
+        session_tools_clear("sess-remote").await;
+    }
+
+    // --- ToolDef: serde roundtrip сохраняет флаг session_local -----------
+    #[test]
+    fn tooldef_serde_roundtrip_keeps_session_local() {
+        let def = ToolDef {
+            name: "filesystem".into(),
+            description: "fs".into(),
+            parameters_json: "{}".into(),
+            session_local: true,
+        };
+        let s = serde_json::to_string(&def).unwrap();
+        let back: ToolDef = serde_json::from_str(&s).unwrap();
+        assert!(back.session_local, "флаг session_local должен сохраняться при сериализации");
+        assert_eq!(back.name, "filesystem");
+        // По умолчанию (отсутствие поля) — false.
+        let def2: ToolDef = serde_json::from_str(r#"{"name":"x","description":"","parameters_json":"{}"}"#).unwrap();
+        assert!(!def2.session_local, "отсутствие поля → false (обратная совместимость)");
     }
 }

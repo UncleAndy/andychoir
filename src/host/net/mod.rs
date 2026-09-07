@@ -112,6 +112,12 @@ pub(crate) fn get_inner() -> Option<Arc<NetInner>> {
     INNER.lock().unwrap().clone()
 }
 
+/// Сбросить глобальный инстанс (для тестов).
+#[cfg(test)]
+pub(crate) fn clear_inner() {
+    *INNER.lock().unwrap() = None;
+}
+
 /// Handle для сетевого моста.
 #[allow(dead_code)]
 pub struct NetHandle {

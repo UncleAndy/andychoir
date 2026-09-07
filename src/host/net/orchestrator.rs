@@ -12,6 +12,25 @@
 use super::*;
 use super::lsdb::route_next_hop;
 
+/// Является ли сессия «чужой» (пришедшей из сети от другого хоста)?
+///
+/// Сессия считается чужой, если она зарегистрирована в `session_origin`
+/// с `node_id`, отличным от своего хоста. Локальные сессии (инициированные
+/// на этом хосте, напр. `front:console`) в `session_origin` не значатся →
+/// считаются «своими». Используется для флага `session_local` инструментов
+/// (приватные инструменты недоступны чужим сессиям).
+pub(crate) async fn is_session_foreign(inner: &Arc<NetInner>, session_id: &str) -> bool {
+    let origin = inner.session_origin.read().await.get(session_id).cloned();
+    match origin {
+        // Нет записи → локальная сессия (своя).
+        None => false,
+        // Источник — свой хост → своя сессия.
+        Some(node) if node == inner.cfg.node_id => false,
+        // Источник — другой хост → чужая.
+        Some(_) => true,
+    }
+}
+
 /// Результат разрешения инструмента: сетевой target и уровень приоритета.
 /// `tier` = 1 (узел-источник) или 3 (другой узел сети).
 #[derive(Debug, PartialEq)]

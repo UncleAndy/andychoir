@@ -9,7 +9,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use wasmtime::Engine;
 use wasmtime::component::{Component, Linker};
 
-use crate::{error, info, debug, HostPlugin};
+use crate::{error, info, debug, warn, HostPlugin};
 use crate::ai::host::types::Event;
 use crate::exports::ai::host::plugin_lifecycle::Guest;
 use crate::metrics::Metrics;
@@ -320,7 +320,15 @@ async fn dispatch_event(
     // (без отдельного discovery-цикла со стороны агента).
     if event.topic == "definition" && event.source.starts_with("tool:") {
         // Tool-плагин публикует {name, description, parameters}. Нормализуем в
-        // наш ToolDef (parameters -> parameters_json).
+        // наш ToolDef (parameters -> parameters_json). Флаг session_local берём
+        // из конфига плагина (тот же источник), чтобы приватные инструменты
+        // не анонсировались в сеть и не исполнялись для чужих сессий.
+        let is_session_local = plugins
+            .read()
+            .await
+            .get(&event.source)
+            .map(|p| p.config.session_local)
+            .unwrap_or(false);
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&event.payload) {
             let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
             if !name.is_empty() {
@@ -328,6 +336,7 @@ async fn dispatch_event(
                     name,
                     description: v.get("description").and_then(|x| x.as_str()).unwrap_or("").to_string(),
                     parameters_json: v.get("parameters").cloned().unwrap_or(serde_json::Value::Null).to_string(),
+                    session_local: is_session_local,
                 };
                 crate::plugin::engine::register_local_tool(def).await;
             }
@@ -453,6 +462,29 @@ async fn dispatch_event(
         }
 
         for plugin_name in matched_plugins {
+            // Защита session_local: приватные инструменты (флаг в конфиге
+            // плагина) доступны удалённым агентам, но ТОЛЬКО в рамках session_id,
+            // реально сформированного на этом хосте. Если чужой (сетевой) запрос
+            // приходит с session_id, которого нет на этом хосте — отклоняем.
+            // См. tool-prioritization.md §Флаг session_local.
+            let is_private = plugins
+                .read()
+                .await
+                .get(&plugin_name)
+                .map(|p| p.config.session_local)
+                .unwrap_or(false);
+            if is_private {
+                // Чужая сессия (пришла из сети) И не зарегистрирована
+                // локально → отказ. Своя (локальная) сессия → разрешено.
+                if should_deny_session_local(plugins, &plugin_name, &event.session_id).await {
+                    warn!(
+                        "[Хост] Инструмент '{}' помечен session_local — отказ в доступе: session_id '{}' не существует на этом хосте",
+                        plugin_name, event.session_id
+                    );
+                    continue;
+                }
+            }
+
             info!("[Хост] Исполнение плагина {} ({:?})", plugin_name, event);
             let Some((store, lifecycle)) = store_for_event(
                 plugins,
@@ -530,6 +562,49 @@ pub(crate) fn match_plugin_names(known: &[String], target_pattern: &str) -> Vec<
             .cloned()
             .collect()
     }
+}
+
+/// Чистое правило отказа для `session_local`-инструмента.
+/// `foreign` — сессия пришла из сети (чужая); `local` — session_id
+/// зарегистрирован как локальная сессия этого хоста.
+/// Отказ, если сессия чужая И не зарегистрирована локально.
+/// Выделено для юнит-тестирования (без сети/registry).
+pub(crate) fn session_local_deny_decision(foreign: bool, local: bool) -> bool {
+    foreign && !local
+}
+
+/// Решение об отказе для `session_local`-инструмента.
+///
+/// Возвращает `true` (отказать), если плагин помечен `session_local` И
+/// сессия чужая (пришла из сети от другого хоста) И при этом `session_id`
+/// не зарегистрирован как локальная сессия этого хоста.
+///
+/// Семантика (см. tool-prioritization.md §Флаг session_local): приватный
+/// инструмент доступен удалённым агентам, но ТОЛЬКО в рамках session_id,
+/// реально существующего на этом хосте. Несуществующий session_id → отказ.
+///
+/// Выделено в чистую функцию для юнит-тестирования (без сборки worker/store).
+pub(crate) async fn should_deny_session_local(
+    plugins: &PluginRegistry,
+    plugin_name: &str,
+    session_id: &str,
+) -> bool {
+    let is_private = plugins
+        .read()
+        .await
+        .get(plugin_name)
+        .map(|p| p.config.session_local)
+        .unwrap_or(false);
+    if !is_private {
+        return false;
+    }
+    let Some(inner) = crate::host::net::get_inner() else {
+        // Сеть не инициализирована — считаем, что исполнять нельзя (fail-closed).
+        return true;
+    };
+    let foreign = crate::host::net::orchestrator::is_session_foreign(&inner, session_id).await;
+    let local = crate::plugin::engine::is_local_session(session_id).await;
+    session_local_deny_decision(foreign, local)
 }
 
 /// Распарс поля `target` события: несколько имён/масок разделены пробелами.
@@ -759,5 +834,41 @@ mod tests {
         let r = StartupReadiness::new(0);
         // С zero expected любой источник даёт >= 0.
         assert!(r.record_ready("x").await);
+    }
+
+    // --- session_local: чистое правило отказа -------------------------------
+    #[test]
+    fn session_local_deny_decision_truth_table() {
+        // Чужая + не локальная → отказ.
+        assert!(session_local_deny_decision(true, false));
+        // Чужая + локальная → разрешено (сессия существует на этом хосте).
+        assert!(!session_local_deny_decision(true, true));
+        // Своя + не локальная → разрешено.
+        assert!(!session_local_deny_decision(false, false));
+        // Своя + локальная → разрешено.
+        assert!(!session_local_deny_decision(false, true));
+    }
+
+    // --- session_local: fail-closed при неинициализированной сети ----------
+    #[tokio::test]
+    async fn should_deny_when_net_uninitialized() {
+        // Плагин не в registry → is_private=false → не отказываем.
+        let plugins: PluginRegistry = Arc::new(RwLock::new(HashMap::new()));
+        assert!(!should_deny_session_local(&plugins, "tool:filesystem", "sess-x").await);
+    }
+
+    // --- session_local: локальная сессия разрешена (даже если плагин private) -
+    #[tokio::test]
+    async fn should_allow_when_local_session_registered() {
+        // Имитируем сеть: inner без session_origin (сессия "локальная").
+        let inner = crate::host::net::NetInner::new_test();
+        crate::host::net::set_inner(inner);
+        // Регистрируем сессию как локальную.
+        crate::plugin::engine::register_local_session("sess-local").await;
+        // Плагина нет в registry (is_private=false) — не должно отказывать.
+        let plugins: PluginRegistry = Arc::new(RwLock::new(HashMap::new()));
+        assert!(!should_deny_session_local(&plugins, "tool:filesystem", "sess-local").await);
+        crate::plugin::engine::unregister_local_session("sess-local").await;
+        crate::host::net::clear_inner();
     }
 }

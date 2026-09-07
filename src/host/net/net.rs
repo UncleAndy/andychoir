@@ -126,6 +126,7 @@ mod tests {
             name: "calculator".into(),
             description: "calc".into(),
             parameters_json: "{}".into(),
+            session_local: false,
         }];
         let s = super::message::pack_capabilities("00000000-0000-0000-0000-0000000000a1", tools.clone());
         let msg = super::message::unpack_message(&s).unwrap();
@@ -181,6 +182,7 @@ mod tests {
             name: "calculator".into(),
             description: "calc".into(),
             parameters_json: "{}".into(),
+            session_local: false,
         }];
         let msg = NetMessage::Hello {
             source_id: "00000000-0000-0000-0000-0000000000a1".into(),
@@ -308,6 +310,7 @@ mod tests {
             name: "calculator".into(),
             description: "calc".into(),
             parameters_json: "{}".into(),
+            session_local: false,
         }];
         super::discovery::handle_hello(
             &inner,
@@ -916,8 +919,8 @@ mod tests {
         // Сессия пришла от A.
         inner.session_origin.write().await.insert("sess-x".into(), a.clone());
         // И калькулятор есть и у A (источник), и у B (другой узел).
-        inner.origin_tools.write().await.insert(a.clone(), vec![ToolDef { name: "calculator".into(), description: "".into(), parameters_json: "{}".into() }]);
-        inner.origin_tools.write().await.insert(b.clone(), vec![ToolDef { name: "calculator".into(), description: "".into(), parameters_json: "{}".into() }]);
+        inner.origin_tools.write().await.insert(a.clone(), vec![ToolDef { name: "calculator".into(), description: "".into(), parameters_json: "{}".into(), session_local: false }]);
+        inner.origin_tools.write().await.insert(b.clone(), vec![ToolDef { name: "calculator".into(), description: "".into(), parameters_json: "{}".into(), session_local: false }]);
         let resolved = crate::host::net::orchestrator::resolve_tool_target(&inner, "sess-x", "calculator").await;
         assert_eq!(resolved, Some(crate::host::net::orchestrator::ResolvedTarget { target: format!("host:{}:tool:calculator", a), tier: 1 }), "Tier 1: инструмент источника");
     }
@@ -930,7 +933,7 @@ mod tests {
         let b = "00000000-0000-0000-0000-0000000000b2".to_string();
         inner.session_origin.write().await.insert("sess-x".into(), a.clone());
         // У источника A инструмента нет; у B — есть.
-        inner.origin_tools.write().await.insert(b.clone(), vec![ToolDef { name: "calculator".into(), description: "".into(), parameters_json: "{}".into() }]);
+        inner.origin_tools.write().await.insert(b.clone(), vec![ToolDef { name: "calculator".into(), description: "".into(), parameters_json: "{}".into(), session_local: false }]);
         let resolved = crate::host::net::orchestrator::resolve_tool_target(&inner, "sess-x", "calculator").await;
         assert_eq!(resolved, Some(crate::host::net::orchestrator::ResolvedTarget { target: format!("host:{}:tool:calculator", b), tier: 3 }), "Tier 3: инструмент другого узла");
     }
@@ -959,7 +962,7 @@ mod tests {
         // B объявил calculator (передаём в Hello как capabilities; он же прямой
         // сосед, FIB знает путь). handle_hello сохраняет tools в origin_tools.
         super::discovery::handle_hello(&inner, b.clone(), vec![inner.cfg.node_id.clone()],
-            vec![ToolDef { name: "calculator".into(), description: "".into(), parameters_json: "{}".into() }], 0).await;
+            vec![ToolDef { name: "calculator".into(), description: "".into(), parameters_json: "{}".into(), session_local: false }], 0).await;
         // node_url для B + исходящий канал.
         inner.node_url.write().await.insert(b.clone(), url.clone());
         let (tx, mut rx) = mpsc::channel::<String>(8);
@@ -978,5 +981,33 @@ mod tests {
             }
             _ => panic!("expected Event"),
         }
+    }
+
+    // OP (session_local): pack_hello ДОЛЖЕН анонсировать инструменты с
+    // флагом session_local в сеть (удалённые агенты должны о них знать и
+    // иметь возможность вызвать в рамках своей сессии).
+    #[tokio::test]
+    async fn p2_pack_hello_announces_session_local_tools() {
+        let inner = NetInner::new_test();
+        // Регистрируем локальный приватный инструмент.
+        crate::plugin::engine::register_local_tool(ToolDef {
+            name: "filesystem".into(),
+            description: "private fs".into(),
+            parameters_json: "{}".into(),
+            session_local: true,
+        }).await;
+        let s = super::discovery::pack_hello(&inner).await;
+        match super::message::unpack_message(&s).unwrap() {
+            NetMessage::Hello { tools, .. } => {
+                let names: Vec<&String> = tools.iter().map(|t| &t.name).collect();
+                assert!(names.contains(&&"filesystem".to_string()),
+                    "session_local инструмент должен анонсироваться в сети: {:?}", names);
+                let fs = tools.iter().find(|t| t.name == "filesystem").unwrap();
+                assert!(fs.session_local, "флаг session_local сохраняется в анонсе");
+            }
+            _ => panic!("expected Hello"),
+        }
+        // Чистим, чтобы не влиять на другие тесты.
+        crate::plugin::engine::local_tools().write().await.remove("filesystem");
     }
 }

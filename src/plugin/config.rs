@@ -29,5 +29,11 @@ pub struct PluginConfig {
     #[serde(default)]
     pub allow_background: bool,
     #[allow(unused)]
+    #[serde(default)]
+    /// `true` — инструменты этого плагина приватны для сессий данного хоста
+    /// (см. tool-prioritization.md §Флаг session_local). Чужим (сетевым)
+    /// сессиям недоступны и не анонсируются в сеть.
+    pub session_local: bool,
+    #[allow(unused)]
     pub config: serde_json::Value, // Параметры инициализации плагина (внутренние параметры плагина в нужном ему формате
 }

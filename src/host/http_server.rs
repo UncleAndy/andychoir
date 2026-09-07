@@ -132,6 +132,12 @@ async fn handle_request(
     let body = String::from_utf8_lossy(&body_bytes).to_string();
 
     let (request_id, event) = build_http_event(&listener, &method, &path, &query, &headers, &body);
+    let session_id = event.session_id.clone();
+
+    // Регистрируем session_id как локальную сессию хоста (нужно для флага
+    // session_local инструментов: чужие сетевые запросы к приватному инструменту
+    // допускаются только в рамках реально существующей на этом хосте сессии).
+    engine::register_local_session(&session_id).await;
 
     let (resp_tx, resp_rx) = oneshot::channel::<Event>();
     {
@@ -141,6 +147,7 @@ async fn handle_request(
 
     if inner.tx.send(event).await.is_err() {
         inner.pending.lock().await.remove(&request_id);
+        engine::unregister_local_session(&session_id).await;
         info!("[Хост] HTTP: bus closed при отправке request_id={}", request_id);
         return Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -154,6 +161,7 @@ async fn handle_request(
         Ok(Ok(ev)) => ev,
         _ => {
             inner.pending.lock().await.remove(&request_id);
+            engine::unregister_local_session(&session_id).await;
             return Response::builder()
                 .status(StatusCode::GATEWAY_TIMEOUT)
                 .body(Body::from("timeout waiting for response"))
@@ -161,6 +169,7 @@ async fn handle_request(
         }
     };
 
+    engine::unregister_local_session(&session_id).await;
     build_http_response(&resp)
 }
 

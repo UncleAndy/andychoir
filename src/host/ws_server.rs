@@ -143,6 +143,12 @@ async fn handle_socket(inner: Arc<WsServerInner>, mut socket: WebSocket) {
 
                 let request_id = uuid::Uuid::new_v4().to_string();
 
+                // Регистрируем session_id как локальную сессию хоста (нужно для
+                // флага session_local инструментов: чужие сетевые запросы к
+                // приватному инструменту допускаются только в рамках реально
+                // существующей на этом хосте сессии).
+                engine::register_local_session(&session_id).await;
+
                 // Запоминаем: request_id -> (socket_id, session_id).
                 {
                     let mut pending = inner.pending.lock().await;
@@ -177,6 +183,10 @@ async fn handle_socket(inner: Arc<WsServerInner>, mut socket: WebSocket) {
     let mut sockets = inner.sockets.lock().await;
     sockets.remove(&socket_id);
     let mut pending = inner.pending.lock().await;
+    // Снимаем регистрацию всех сессий, привязанных к этому сокету.
+    for (sid, _) in pending.iter().filter(|(_, (s, _))| s == &socket_id) {
+        engine::unregister_local_session(sid).await;
+    }
     pending.retain(|_, (sid, _)| sid != &socket_id);
     info!("[Хост] WS-подключение закрыто: {}", socket_id);
 }
