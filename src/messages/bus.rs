@@ -396,7 +396,8 @@ async fn dispatch_event(
         // Сохраняем payload для агента (take-response-payload), т.к. wasmtime
         // сериализует handle_event: агент, ожидающий ответ, не может обработать
         // входящий response в своём же handle_event.
-        crate::plugin::engine::store_response_payload(&event.request_id, &event.payload).await;
+        // A2: ключ (session_id, request_id) — ответ принадлежит сессии запроса.
+        crate::plugin::engine::store_response_payload(&event.session_id, &event.request_id, &event.payload).await;
         // Сначала пробуем HTTP-сервер (по request_id). Если обработано — пропускаем
         // консольный сигнал (HTTP-ответ не предназначен консоли).
         let handled_by_http = crate::host::http_server::deliver_http_response(
@@ -417,7 +418,8 @@ async fn dispatch_event(
             crate::host::console::deliver_console_response(&event.request_id, event.clone()).await
         };
         if !handled_by_http && !handled_by_ws && !handled_by_console {
-            crate::plugin::engine::signal_response(&event.request_id).await;
+            // A2: signal_response теперь по (session_id, request_id).
+            crate::plugin::engine::signal_response(&event.session_id, &event.request_id).await;
         }
     }
 

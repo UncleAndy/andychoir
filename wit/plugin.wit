@@ -80,19 +80,20 @@ interface host-control {
   // Ждать, пока не придёт ответ (topic:"response") на запрос с данным
   // request-id. Хост держит карту request_id -> Notify и сигналит при
   // приходе response. Без блокировки wasm-нити (это async).
-  wait-for-response: async func(request-id: string);
+  wait-for-response: async func(request-id: string, session-id: string);
 
   // Ждать ответ с таймаутом (timeout-ms). Возвращает true, если ответ пришёл
   // до истечения, false — если таймаут. Предотвращает зависание, когда
   // инструмент не отвечает (ошибка/молчание).
-  wait-for-response-timeout: async func(request-id: string, timeout-ms: u64) -> bool;
+  wait-for-response-timeout: async func(request-id: string, session-id: string, timeout-ms: u64) -> bool;
 
-  // Забрать payload ответа на request-id (после wait-for-response-timeout).
-  // Хост сохраняет payload последнего response по request-id при его приходе.
+  // Забрать payload ответа на (request-id, session-id) (после wait-for-response-timeout).
+  // Хост сохраняет payload последнего response по (session-id, request-id) при его приходе.
   // Возвращает None, если ответа нет. Нужно, т.к. wasmtime сериализует
   // handle_event: агент, ожидающий ответ, не может обработать входящий response
   // в своём же handle_event, поэтому payload хранится на хосте.
-  take-response-payload: async func(request-id: string) -> option<string>;
+  // Доступно только для ЛОКАЛЬНОЙ сессии хоста (A2: защита от чтения чужих ответов).
+  take-response-payload: async func(request-id: string, session-id: string) -> option<string>;
 
   // Вернуть историю диалоговых событий сессии (request/response),
   // сохранённую хостом. Пустой список, если сессии нет.

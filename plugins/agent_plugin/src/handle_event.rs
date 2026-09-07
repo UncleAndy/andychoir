@@ -230,6 +230,7 @@ pub async fn handle_event(ev: Event) {
                 // Ждём ответ от инструмента с таймаутом (не зависаем).
                 let got = crate::ai::host::host_control::wait_for_response_timeout(
                     call_request_id.clone(),
+                    ev.session_id.clone(),
                     30000,
                 ).await;
 
@@ -237,7 +238,11 @@ pub async fn handle_event(ev: Event) {
                     // Читаем payload ответа напрямую с хоста (не через
                     // TOOL_RESULTS, т.к. wasmtime сериализует handle_event:
                     // агент, ожидающий ответ, не обработает входящий response).
-                    crate::ai::host::host_control::take_response_payload(call_request_id.clone())
+                    // A2: ключ (session_id, request_id) — только своя сессия.
+                    crate::ai::host::host_control::take_response_payload(
+                        call_request_id.clone(),
+                        ev.session_id.clone(),
+                    )
                         .await
                         .unwrap_or_else(|| "(инструмент не вернул результат)".to_string())
                 } else {

@@ -35,6 +35,8 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     // B3: инициализировать allowlist бинарей для MCP-транспорта (fail-closed
     // при непустом списке). Вызывается до старта плагинов/обработки запросов.
     andychoir::host::mcp_transport::init_mcp_policy(config.mcp.allowed_binaries.clone()).await;
+    // A2: фоновая очистка невостребованных payload-ответов (защита от утечки памяти).
+    tokio::spawn(andychoir::plugin::engine::start_response_payload_reaper());
     let log_res = host::log::init_log(
         &config.logger
     );

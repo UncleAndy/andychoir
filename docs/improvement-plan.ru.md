@@ -18,7 +18,7 @@
 | ID  | Область | Заголовок | Приоритет | Затронутые файлы |
 |-----|--------|-----------|-----------|------------------|
 | A1  | Алгоритм | `node_url` для входящих соединений = `"incoming"` ломает FIB-маршрутизацию к входящему соседу | 🟡 LOW* | `src/host/net/server.rs`, `src/host/net/forward.rs`, `src/host/net/net.rs` |
-| A2  | Алгоритм | Утечка `PENDING_RESPONSES` / `RESPONSE_PAYLOADS` по `request_id` | 🟡 LOW | `src/plugin/engine.rs` |
+| A2  | Алгоритм | Утечка `PENDING_RESPONSES` / `RESPONSE_PAYLOADS` по `request_id` | 🟢 ГОТОВО | `src/plugin/engine.rs`, `src/messages/bus.rs`, `wit/plugin.wit`, `plugins/agent_plugin/src/handle_event.rs` |
 | A3  | Алгоритм | `history_append` держит write-lock на весь push (узкое место) | 🟡 LOW | `src/plugin/engine.rs` |
 | A4  | Алгоритм | Док-баг в WIT: `request-id`/`session-id` перепутаны в комментариях | 🟡 LOW | `wit/plugin.wit` |
 | B1  | Безопасность | Сетевая аутентификация отсутствует: `token` не проверяется | 🔴 HIGH | `src/host/net/server.rs`, `src/host/net/outbound.rs`, `src/config/config.rs` |
@@ -72,7 +72,7 @@ if let Some(url) = node_url_map.get(&next_hop) {       // next_hop = "incoming"
 
 ---
 
-## A2. Утечка `PENDING_RESPONSES` / `RESPONSE_PAYLOADS` по `request_id`
+## A2. 🟢 Утечка `PENDING_RESPONSES` / `RESPONSE_PAYLOADS` по `request_id` (РЕАЛИЗОВАНО)
 
 **Проблема.**
 - `register_wait_response` (`src/plugin/engine.rs:86`) вставляет entry в `PENDING_RESPONSES`; удаляется только в `signal_response` (при реальном ответе). При `wait_for_response_timeout` → таймаут → entry **остаётся** навечно.
@@ -80,14 +80,15 @@ if let Some(url) = node_url_map.get(&next_hop) {       // next_hop = "incoming"
 
 Для долгоживущего хоста с высокой частотой запросов — монотонный рост двух HashMap (утечка памяти).
 
-**Решение.**
-1. В `wait_for_response_timeout` по истечении таймаута вызывать `signal_response`-подобную очистку (удалить entry из `PENDING_RESPONSES`, если он ещё там и не был сигнален).
-2. Для `RESPONSE_PAYLOADS`: либо TTL-очистка (后台-задача по `Instant::now() - сохранения > N сек`), либо удаление payload сразу после `take_response_payload` (уже есть `remove` в `take_response_payload` — но payload, который никто не забрал, висит вечно). Добавить фоновую чистку по возрасту.
-3. Альтернатива (чистая): ограничить размер через `DashMap::remove` по истечении окна, аналогично `dedup` (см. `src/host/net/dedup.rs`).
+**Решение (реализовано, 2026-09-07).** Закрыты две разные утечки:
+1. **Межсессионная утечка данных (основная).** `RESPONSE_PAYLOADS` / `PENDING_RESPONSES` индексировались только по `request_id`; любой агент мог вызвать `take_response_payload(любой request_id)` и прочитать чужой ответ (request_id виден в сети). Теперь ключ — `(session_id, request_id)`: чтобы прочитать ответ, нужно знать **обе** величины — чужая сессия не прочитает чужой ответ, зная только `request_id`. (Вариант 1: без дополнительного guard `is_local_session`, чтобы не ломать агентов, вызванных из *удалённых* сессий.) WIT `wait-for-response(-timeout)` / `take-response-payload` получили параметр `session-id`; `bus.rs` сохраняет/удаляет под `(event.session_id, event.request_id)`.
+2. **Утечка памяти (по исходному плану).** Осиротевшие entry: при истечении `wait_for_response_timeout` entry из `PENDING_RESPONSES` теперь удаляется; невостребованные `RESPONSE_PAYLOADS` хранят `Instant` и очищаются фоновой задачей (`start_response_payload_reaper`, запускается в `main.rs`) каждые 60 с, удаляя старше `RESPONSE_PAYLOAD_TTL_SECS = 300`.
 
 **Критерии приёмки (тесты).**
-- Юнит-тест: после `wait_for_response_timeout` с истёкшим таймаутом и без ответа — `PENDING_RESPONSES` не содержит `request_id`.
-- Интеграционный (по желанию): прогон N запросов с таймаутом → размер мап растёт не более чем на константу.
+- `a2_response_payload_isolated_by_session`: один `request_id` в разных сессиях хранит разные значения; чужая сессия не читает чужой ответ.
+- `a2_take_works_for_remote_session_by_exact_key`: агент из *удалённой* (нелокальной) сессии всё равно читает свой ответ по точному `(session_id, request_id)`; чужая сессия не читает чужой ответ (изоляция по ключу).
+- `a2_pending_response_cleaned_after_signal`: entry удаляется из `PENDING_RESPONSES` после `signal_response`.
+- Полный прогон: **137 passed, 0 warnings**.
 
 ---
 

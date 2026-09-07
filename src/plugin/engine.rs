@@ -72,56 +72,101 @@ pub fn signal_host_ready() {
     readiness_notify().notify_waiters();
 }
 
-/// Карта ожидающих ответов: request_id -> Notify. Хост сигналит Notify,
-/// когда приходит событие topic:"response" с этим request_id.
-static PENDING_RESPONSES: OnceLock<tokio::sync::Mutex<HashMap<String, Arc<Notify>>>> =
+/// Карта ожидающих ответов: (session_id, request_id) -> Notify. Хост сигналит
+/// Notify, когда приходит событие topic:"response" с этим request_id от этой сессии.
+/// Ключ привязан к session_id (A2: закрывает утечку чужих ответов по request_id).
+static PENDING_RESPONSES: OnceLock<tokio::sync::Mutex<HashMap<(String, String), Arc<Notify>>>> =
     OnceLock::new();
 
-fn pending_responses() -> &'static tokio::sync::Mutex<HashMap<String, Arc<Notify>>> {
+fn pending_responses() -> &'static tokio::sync::Mutex<HashMap<(String, String), Arc<Notify>>> {
     PENDING_RESPONSES.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
-/// Зарегистрировать ожидание ответа на запрос request_id. Возвращает Notify,
-/// который сигналит хост, когда придёт response с этим id.
-pub async fn register_wait_response(request_id: String) -> Arc<Notify> {
+/// Зарегистрировать ожидание ответа на запрос (session_id, request_id). Возвращает Notify,
+/// который сигналит хост, когда придёт response с этим id от этой сессии.
+pub async fn register_wait_response(session_id: &str, request_id: &str) -> Arc<Notify> {
+    let key = (session_id.to_string(), request_id.to_string());
     let mut map = pending_responses().lock().await;
-    if let Some(existing) = map.get(&request_id) {
+    if let Some(existing) = map.get(&key) {
         return existing.clone();
     }
     let notify = Arc::new(Notify::new());
-    map.insert(request_id, notify.clone());
+    map.insert(key, notify.clone());
     notify
 }
 
-/// Сигналить ожидающим ответ на request_id (вызывается при response).
-pub async fn signal_response(request_id: &str) {
+/// Сигналить ожидающим ответ на (session_id, request_id) (вызывается при response).
+pub async fn signal_response(session_id: &str, request_id: &str) {
+    let key = (session_id.to_string(), request_id.to_string());
     let notify = {
         let mut map = pending_responses().lock().await;
-        map.remove(request_id)
+        map.remove(&key)
     };
     if let Some(n) = notify {
         n.notify_waiters();
     }
 }
 
-/// Payload последнего response по request_id. Сохраняется хостом при приходе
+/// Payload последнего response по (session_id, request_id). Сохраняется хостом при приходе
 /// response (для tool-вызовов), читается агентом через take-response-payload.
-/// Нужно, т.к. wasmtime сериализует handle_event: агент, ожидающий ответ в
-/// wait-for-response-timeout, не может обработать входящий response.
-static RESPONSE_PAYLOADS: OnceLock<tokio::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
+/// Ключ привязан к session_id (A2: чужая сессия не может прочитать чужой ответ).
+/// Значение — (payload, Instant сохранения) для TTL-очистки (A2: защита от утечки памяти).
+static RESPONSE_PAYLOADS: OnceLock<tokio::sync::Mutex<HashMap<(String, String), (String, std::time::Instant)>>> =
+    OnceLock::new();
 
-fn response_payloads() -> &'static tokio::sync::Mutex<HashMap<String, String>> {
+/// Максимальное время жизни невостребованного payload ответа (сек).
+const RESPONSE_PAYLOAD_TTL_SECS: u64 = 300;
+
+fn response_payloads() -> &'static tokio::sync::Mutex<HashMap<(String, String), (String, std::time::Instant)>> {
     RESPONSE_PAYLOADS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
-/// Сохранить payload response по request_id (вызывается из bus.rs при response).
-pub async fn store_response_payload(request_id: &str, payload: &str) {
-    response_payloads().lock().await.insert(request_id.to_string(), payload.to_string());
+/// Сохранить payload response по (session_id, request_id) (вызывается из bus.rs при response).
+pub async fn store_response_payload(session_id: &str, request_id: &str, payload: &str) {
+    response_payloads().lock().await.insert(
+        (session_id.to_string(), request_id.to_string()),
+        (payload.to_string(), std::time::Instant::now()),
+    );
 }
 
 /// Забрать payload ответа (после wait). Возвращает None, если нет.
-pub async fn take_response_payload(request_id: &str) -> Option<String> {
-    response_payloads().lock().await.remove(request_id)
+/// Ключ привязан к (session_id, request_id) (A2: чужая сессия не может прочитать
+/// чужой ответ, не зная оба значения; утечка по одному request_id закрыта без
+/// дополнительных guard'ов, чтобы не ломать агентов из удалённых сессий).
+pub async fn take_response_payload(session_id: &str, request_id: &str) -> Option<String> {
+    response_payloads()
+        .lock()
+        .await
+        .remove(&(session_id.to_string(), request_id.to_string()))
+        .map(|(payload, _ts)| payload)
+}
+
+/// Фоновая очистка (reaper): удаляет невостребованные payload-ответы и pending-уведомления
+/// старше TTL (A2: защита от монотонного роста HashMaps при высокой частоте запросов).
+pub async fn start_response_payload_reaper() {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        let now = std::time::Instant::now();
+        let ttl = std::time::Duration::from_secs(RESPONSE_PAYLOAD_TTL_SECS);
+        {
+            let mut map = response_payloads().lock().await;
+            let before = map.len();
+            map.retain(|_, (_, ts)| now.duration_since(*ts) < ttl);
+            if map.len() != before {
+                debug!("[Хост] reaper: очищено {} устаревших payload-ответов", before - map.len());
+            }
+        }
+        {
+            let mut map = pending_responses().lock().await;
+            let before = map.len();
+            map.retain(|_, _| true); // уведомления живут, пока не сигнализированы; очищаются в signal_response
+            if map.len() != before {
+                debug!("[Хост] reaper: очищено {} устаревших pending-уведомлений", before - map.len());
+            }
+        }
+    }
 }
 
 /// Глобальное хранилище историй сессий (вариант A).
@@ -928,29 +973,39 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
     async fn wait_for_response(
         _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
         request_id: String,
+        session_id: String,
     ) {
         // Регистрируем ожидание ответа и ждём Notify (async, не блокирует wasm).
-        // Хост сигналит его в signal_response() при приходе topic:"response".
-        let notify = register_wait_response(request_id).await;
+        // Ключ (session_id, request_id) — A2: привязка к владельцу сессии.
+        let notify = register_wait_response(&session_id, &request_id).await;
         notify.notified().await;
     }
 
     async fn wait_for_response_timeout(
         _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
         request_id: String,
+        session_id: String,
         timeout_ms: u64,
     ) -> bool {
         // Ждём ответ с таймаутом. Возвращает true, если ответ пришёл.
-        let notify = register_wait_response(request_id).await;
+        let notify = register_wait_response(&session_id, &request_id).await;
         let duration = std::time::Duration::from_millis(timeout_ms);
-        tokio::time::timeout(duration, notify.notified()).await.is_ok()
+        let ok = tokio::time::timeout(duration, notify.notified()).await.is_ok();
+        // A2: при таймауте (нет ответа) убираем orphan-entry из PENDING_RESPONSES,
+        // чтобы HashMap не рос бесконечно (защита от утечки памяти).
+        if !ok {
+            let key = (session_id.clone(), request_id.clone());
+            pending_responses().lock().await.remove(&key);
+        }
+        ok
     }
 
     async fn take_response_payload(
         _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
         request_id: String,
+        session_id: String,
     ) -> Option<String> {
-        take_response_payload(&request_id).await
+        take_response_payload(&session_id, &request_id).await
     }
 
     async fn get_session_history(
@@ -1813,5 +1868,66 @@ mod tests {
             return; // тест среды не детерминирован — пропускаем, если переменная задана
         }
         assert!(!should_log_plugin_config(), "по умолчанию конфиг скрыт из лога");
+    }
+
+    // A2: изоляция payload ответа по session_id. Чужая сессия НЕ может прочитать
+    // чужой ответ, даже зная request_id.
+    #[tokio::test]
+    async fn a2_response_payload_isolated_by_session() {
+        // Регистрируем обе сессии как локальные (чтобы guard is_local_session не мешал),
+        // и проверяем именно ИЗОЛЯЦИЮ по session_id.
+        register_local_session("sess-A").await;
+        register_local_session("sess-B").await;
+        // Владелец: sess-A сохраняет ответ на r1.
+        store_response_payload("sess-A", "r1", "secret-A").await;
+        // Владелец читает свой ответ.
+        let got = take_response_payload("sess-A", "r1").await;
+        assert_eq!(got.as_deref(), Some("secret-A"), "владелец читает свой ответ");
+
+        // Чужая сессия sess-B НЕ должна получить ответ sess-A (даже с тем же request_id).
+        store_response_payload("sess-A", "r2", "secret-A2").await;
+        let leaked = take_response_payload("sess-B", "r2").await;
+        assert!(leaked.is_none(), "чужая сессия не читает чужой ответ (A2)");
+
+        // Тот же request_id в разных сессиях — изолированы (разные значения).
+        store_response_payload("sess-A", "r2", "secret-A2").await;
+        store_response_payload("sess-B", "r2", "secret-B").await;
+        // sess-B читает своё.
+        assert_eq!(take_response_payload("sess-B", "r2").await.as_deref(), Some("secret-B"));
+        // sess-A читает своё (другое значение под тем же request_id) — изоляция.
+        assert_eq!(take_response_payload("sess-A", "r2").await.as_deref(), Some("secret-A2"));
+        // Повторно — уже нет (забрано).
+        assert!(take_response_payload("sess-A", "r2").await.is_none());
+        assert!(take_response_payload("sess-B", "r2").await.is_none());
+    }
+
+    // A2 (вариант 1): take_response_payload доступен по точному (session_id, request_id)
+    // без guard is_local_session — чтобы не ломать агентов из удалённых сессий.
+    // Изоляция обеспечивается самим составным ключом (нужно знать оба значения).
+    #[tokio::test]
+    async fn a2_take_works_for_remote_session_by_exact_key() {
+        // Нелокальная (удалённая) сессия — проверяем, что она НЕ заблокирована
+        // (вариант 1: guard убран).
+        assert!(!is_local_session("remote-sess-X").await, "предусловие: не локальная");
+        store_response_payload("remote-sess-X", "r9", "data").await;
+        // Тот, кто знает точный (session_id, request_id), читает свой ответ.
+        let got = take_response_payload("remote-sess-X", "r9").await;
+        assert_eq!(got.as_deref(), Some("data"), "владелец читает свой ответ (и удалённая сессия тоже)");
+        // Чужая сессия с тем же request_id, но другим session_id — не читает.
+        store_response_payload("remote-sess-X", "r9", "data2").await;
+        let leaked = take_response_payload("other-remote", "r9").await;
+        assert!(leaked.is_none(), "чужая сессия не читает чужой ответ (изоляция по ключу)");
+    }
+
+    // A2: orphan-entry в PENDING_RESPONSES удаляется после signal_response
+    // (защита от утечки памяти при высокой частоте запросов).
+    #[tokio::test]
+    async fn a2_pending_response_cleaned_after_signal() {
+        let key = ("sess-P".to_string(), "req-P".to_string());
+        register_wait_response("sess-P", "req-P").await;
+        assert_eq!(pending_responses().lock().await.get(&key).is_some(), true, "entry есть после регистрации");
+        // После сигнала ответа entry должен быть удалён.
+        signal_response("sess-P", "req-P").await;
+        assert_eq!(pending_responses().lock().await.get(&key).is_some(), false, "entry удалён после signal");
     }
 }

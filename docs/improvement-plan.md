@@ -18,7 +18,7 @@
 | ID  | Area | Title | Priority | Files |
 |-----|------|-------|----------|-------|
 | A1  | Algo | `node_url` for incoming connections = `"incoming"` breaks FIB to incoming neighbor | 🟡 LOW* | `src/host/net/server.rs`, `src/host/net/forward.rs`, `src/host/net/net.rs` |
-| A2  | Algo | `PENDING_RESPONSES` / `RESPONSE_PAYLOADS` leak per `request_id` | 🟡 LOW | `src/plugin/engine.rs` |
+| A2  | Algo | `PENDING_RESPONSES` / `RESPONSE_PAYLOADS` leak per `request_id` | 🟢 DONE | `src/plugin/engine.rs`, `src/messages/bus.rs`, `wit/plugin.wit`, `plugins/agent_plugin/src/handle_event.rs` |
 | A3  | Algo | `history_append` holds write-lock for the whole push (contention) | 🟡 LOW | `src/plugin/engine.rs` |
 | A4  | Algo | WIT doc bug: `request-id`/`session-id` comments swapped | 🟡 LOW | `wit/plugin.wit` |
 | B1  | Sec  | Network auth missing: `token` never validated | 🔴 HIGH | `src/host/net/server.rs`, `src/host/net/outbound.rs`, `src/config/config.rs` |
@@ -71,7 +71,7 @@ Consequence: for a node known *only* as an incoming connection (asymmetric link:
 
 ---
 
-## A2. `PENDING_RESPONSES` / `RESPONSE_PAYLOADS` leak per `request_id`
+## A2. 🟢 `PENDING_RESPONSES` / `RESPONSE_PAYLOADS` leak per `request_id` (IMPLEMENTED)
 
 **Problem.**
 - `register_wait_response` (`src/plugin/engine.rs:86`) inserts into `PENDING_RESPONSES`; removed only in `signal_response` (real reply). On `wait_for_response_timeout` → timeout → entry **stays** forever.
@@ -79,14 +79,15 @@ Consequence: for a node known *only* as an incoming connection (asymmetric link:
 
 For a long-lived host under high request rate — monotonic growth of two HashMaps (memory leak).
 
-**Fix.**
-1. In `wait_for_response_timeout`, on expiry, perform a `signal_response`-like cleanup (remove entry if still present and not signaled).
-2. For `RESPONSE_PAYLOADS`: either TTL cleanup (background task by `Instant::now() - stored > N sec`), or remove payload immediately after `take_response_payload` (already does `remove`, but unclaimed payloads live forever). Add age-based background cleanup.
-3. Alternative (clean): bound size via `DashMap::remove` on expiry, analogous to `dedup` (`src/host/net/dedup.rs`).
+**Fix (implemented, 2026-09-07).** Two distinct leaks closed:
+1. **Cross-session info-leak (primary).** `RESPONSE_PAYLOADS` / `PENDING_RESPONSES` were keyed only by `request_id`; any agent could `take_response_payload(any_request_id)` and read another session's reply (request_id is visible on the wire). Now keyed by `(session_id, request_id)`: to read a reply one must know **both** the `session_id` and the `request_id` — a foreign session cannot read another's reply knowing only `request_id`. (Variant 1: no extra `is_local_session` guard, so agents invoked from *remote* sessions are not broken.) WIT `wait-for-response(-timeout)` / `take-response-payload` gained a `session-id` parameter; `bus.rs` stores/clears under `(event.session_id, event.request_id)`.
+2. **Memory leak (per original plan).** Orphan entries: on `wait_for_response_timeout` expiry the `PENDING_RESPONSES` entry is now removed; unclaimed `RESPONSE_PAYLOADS` carry an `Instant` and are reaped by a background task (`start_response_payload_reaper`, spawned in `main.rs`) every 60 s, dropping entries older than `RESPONSE_PAYLOAD_TTL_SECS = 300`.
 
 **Acceptance (tests).**
-- Unit test: after `wait_for_response_timeout` with expiry and no reply — `PENDING_RESPONSES` does not contain `request_id`.
-- (Optional) integration: N timed-out requests → map grows at most by a constant.
+- `a2_response_payload_isolated_by_session`: same `request_id` in different sessions stores different values; a foreign session cannot read another's reply.
+- `a2_take_works_for_remote_session_by_exact_key`: an agent from a *remote* (non-local) session can still read its own reply by exact `(session_id, request_id)`; a foreign session cannot read another's reply (key isolation).
+- `a2_pending_response_cleaned_after_signal`: entry removed from `PENDING_RESPONSES` after `signal_response`.
+- Full suite: **137 passed, 0 warnings**.
 
 ---
 
