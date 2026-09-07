@@ -12,6 +12,14 @@
 use super::*;
 use super::lsdb::route_next_hop;
 
+/// Результат разрешения инструмента: сетевой target и уровень приоритета.
+/// `tier` = 1 (узел-источник) или 3 (другой узел сети).
+#[derive(Debug, PartialEq)]
+pub(crate) struct ResolvedTarget {
+    pub target: String,
+    pub tier: u8,
+}
+
 /// Разрешить имя инструмента `tool_name` в сетевой target `host:<node_id>:tool:<name>`
 /// по иерархии приоритетов. Если подходящий узел не найден — `None`.
 ///
@@ -20,7 +28,7 @@ pub(crate) async fn resolve_tool_target(
     inner: &Arc<NetInner>,
     session_id: &str,
     tool_name: &str,
-) -> Option<String> {
+) -> Option<ResolvedTarget> {
     // --- Tier 1: инструмент на узле-источнике (сессия пришла от него) ---
     let source_id = {
         let s = inner.session_origin.read().await;
@@ -31,7 +39,10 @@ pub(crate) async fn resolve_tool_target(
         if let Some(tools) = origin_tools.get(source) {
             if tools.iter().any(|t| t.name == tool_name) {
                 // Источник обладает инструментом → возвращаем его (приоритет 1).
-                return Some(format!("host:{}:tool:{}", source, tool_name));
+                return Some(ResolvedTarget {
+                    target: format!("host:{}:tool:{}", source, tool_name),
+                    tier: 1,
+                });
             }
         }
         drop(origin_tools);
@@ -66,7 +77,10 @@ pub(crate) async fn resolve_tool_target(
 
     // Сначала узлы с маршрутом (кратчайший путь), затем любые.
     for node_id in reachable.into_iter().chain(any.into_iter()) {
-        return Some(format!("host:{}:tool:{}", node_id, tool_name));
+        return Some(ResolvedTarget {
+            target: format!("host:{}:tool:{}", node_id, tool_name),
+            tier: 3,
+        });
     }
 
     None

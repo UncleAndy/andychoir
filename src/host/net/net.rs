@@ -919,7 +919,7 @@ mod tests {
         inner.origin_tools.write().await.insert(a.clone(), vec![ToolDef { name: "calculator".into(), description: "".into(), parameters_json: "{}".into() }]);
         inner.origin_tools.write().await.insert(b.clone(), vec![ToolDef { name: "calculator".into(), description: "".into(), parameters_json: "{}".into() }]);
         let resolved = crate::host::net::orchestrator::resolve_tool_target(&inner, "sess-x", "calculator").await;
-        assert_eq!(resolved, Some(format!("host:{}:tool:calculator", a)), "Tier 1: инструмент источника");
+        assert_eq!(resolved, Some(crate::host::net::orchestrator::ResolvedTarget { target: format!("host:{}:tool:calculator", a), tier: 1 }), "Tier 1: инструмент источника");
     }
 
     // OP (Origin-Aware): если у источника нет инструмента, выбирается другой узел сети (Tier 3).
@@ -932,7 +932,7 @@ mod tests {
         // У источника A инструмента нет; у B — есть.
         inner.origin_tools.write().await.insert(b.clone(), vec![ToolDef { name: "calculator".into(), description: "".into(), parameters_json: "{}".into() }]);
         let resolved = crate::host::net::orchestrator::resolve_tool_target(&inner, "sess-x", "calculator").await;
-        assert_eq!(resolved, Some(format!("host:{}:tool:calculator", b)), "Tier 3: инструмент другого узла");
+        assert_eq!(resolved, Some(crate::host::net::orchestrator::ResolvedTarget { target: format!("host:{}:tool:calculator", b), tier: 3 }), "Tier 3: инструмент другого узла");
     }
 
     // OP (Origin-Aware): инструмент вообще нигде в сети не найден → None.
@@ -943,5 +943,40 @@ mod tests {
         inner.session_origin.write().await.insert("sess-x".into(), a.clone());
         let resolved = crate::host::net::orchestrator::resolve_tool_target(&inner, "sess-x", "calculator").await;
         assert!(resolved.is_none(), "инструмент не найден в сети → None");
+    }
+
+    // OP (Origin-Aware): сквозной путь через forward — tool:calculator от
+    // сессии, инициированной узлом B (у которого есть calculator), разрешается
+    // в host:B:tool:calculator и уходит по сети к B (приоритет Уровень 1).
+    // Структура зеркальна работающему p5_forward_routes_via_fib.
+    #[tokio::test]
+    async fn forward_resolves_tool_via_origin_priority() {
+        let inner = NetInner::new_test();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        let url = "ws://host-b:8092/net".to_string();
+        // Сессия инициирована узлом B.
+        inner.session_origin.write().await.insert("sess-x".into(), b.clone());
+        // B объявил calculator (передаём в Hello как capabilities; он же прямой
+        // сосед, FIB знает путь). handle_hello сохраняет tools в origin_tools.
+        super::discovery::handle_hello(&inner, b.clone(), vec![inner.cfg.node_id.clone()],
+            vec![ToolDef { name: "calculator".into(), description: "".into(), parameters_json: "{}".into() }], 0).await;
+        // node_url для B + исходящий канал.
+        inner.node_url.write().await.insert(b.clone(), url.clone());
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        inner.outbound.write().await.insert(url.clone(), tx);
+
+        // Агент просит tool:calculator (общий). Оркестратор должен разрешить
+        // в host:B:tool:calculator (B — источник сессии, Уровень 1).
+        let ev = make_event("tool:calculator", "sess-x");
+        let sent = forward_inner(&inner, &ev).await;
+        assert!(sent, "инструмент разрешён и ушёл по сети");
+        let msg = rx.try_recv().expect("сообщение ушло в канал узла B");
+        match super::message::unpack_message(&msg).unwrap() {
+            NetMessage::Event { event, .. } => {
+                let ev2 = super::message::value_to_event(&event).unwrap();
+                assert_eq!(ev2.target, format!("host:{}:tool:calculator", b), "target разрешён в узел-источник");
+            }
+            _ => panic!("expected Event"),
+        }
     }
 }

@@ -44,10 +44,21 @@ pub(crate) async fn forward_inner(inner: &Arc<NetInner>, ev: &Event) -> bool {
     // таргет НЕ переопределяем (агент сам выбрал конкретный узел).
     if let Some(tool_name) = target.strip_prefix("tool:") {
         if let Some(resolved) = super::orchestrator::resolve_tool_target(inner, &ev.session_id, tool_name).await {
-            info!("[Хост] Net: инструмент '{}' разрешён в {} (приоритет источника/сети)", tool_name, resolved);
-            target = resolved;
+            info!(
+                "[Хост] Net: инструмент '{}' разрешён в {} (приоритет: Уровень {})",
+                tool_name, resolved.target, resolved.tier
+            );
+            target = resolved.target;
         }
     }
+    // Подменяем target в самом событии, чтобы он ушёл с разрешённым
+    // адресом (host:<node>:tool:<name>) во все нижележащие ветки (FIB/pinned).
+    let fwd_ev = {
+        let mut e = (*ev).clone();
+        e.target = target.clone();
+        e
+    };
+    let ev = &fwd_ev;
 
     // --- P5.1: маршрутизация через FIB по целевому узлу ---
     // Формат target: `host:<node_id>:<tool>` (см. NET-concept.md §6).
