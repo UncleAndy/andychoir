@@ -1342,6 +1342,15 @@ fn run_plugin_in_background(
     }
 }
 
+/// B5: логировать ли полный конфиг плагина (который может содержать секреты).
+/// По умолчанию `false` (fail-closed — секреты не утекают в лог). Включается
+/// только явно через `ANDYCHOIR_LOG_PLUGIN_CONFIG=1` для локальной отладки.
+pub fn should_log_plugin_config() -> bool {
+    std::env::var("ANDYCHOIR_LOG_PLUGIN_CONFIG")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 pub async fn load_and_init_plugin(
     engine: &Engine,
     linker: &Linker<ChoirHostState>,
@@ -1365,7 +1374,21 @@ pub async fn load_and_init_plugin(
     info!("[Хост] Вызов метода init...");
 
     let config_str = plugin_config.config.to_string();
-    info!("[Хост] Конфигурация плагина: {:?}", config_str);
+    // B5 (fail-closed): полный конфиг плагина может содержать секреты
+    // (API-ключи, токены, пароли). По умолчанию НЕ логируем его. Отладочный
+    // вывод конфига — только при явном ANDYCHOIR_LOG_PLUGIN_CONFIG=1
+    // (локальная отладка, НЕ в проде/mesh с чужими операторами).
+    if should_log_plugin_config() {
+        info!(
+            "[Хост] Конфигурация плагина (DEBUG, ANDYCHOIR_LOG_PLUGIN_CONFIG=1): {:?}",
+            config_str
+        );
+    } else {
+        info!(
+            "[Хост] Плагин '{}' инициализируется (конфиг скрыт из лога во избежание утечки секретов)",
+            plugin_config.name
+        );
+    }
 
     let subscriptions_res = store
         .run_concurrent(async |accessor| lifecycle.call_init(accessor, config_str).await)
@@ -1780,5 +1803,15 @@ mod tests {
         end_frontend_request(sid, &rid2).await;
         unregister_local_session(sid).await;
         assert!(!is_local_session(sid).await);
+    }
+
+    // B5: по умолчанию конфиг плагина НЕ логируется (секреты не утекают).
+    #[test]
+    fn should_log_plugin_config_default_false() {
+        // Без env-переменной — false (fail-closed).
+        if std::env::var("ANDYCHOIR_LOG_PLUGIN_CONFIG").is_ok() {
+            return; // тест среды не детерминирован — пропускаем, если переменная задана
+        }
+        assert!(!should_log_plugin_config(), "по умолчанию конфиг скрыт из лога");
     }
 }

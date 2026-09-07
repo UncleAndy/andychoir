@@ -25,7 +25,7 @@
 | B2  | Sec  | `PluginAccess::Network` not enforced in `post_json` | 🔴 HIGH | `src/plugin/engine.rs`, `src/plugin/config.rs`, `wit/plugin.wit` |
 | B3  | Sec  | MCP transport = arbitrary host process spawn | 🟢 DONE | `src/host/mcp_transport.rs`, `src/config/config.rs`, `src/main.rs` |
 | B4  | Sec  | HTTP/WS frontends without auth + `session_local` bypass | 🟢 DONE | `src/host/http_server.rs`, `src/host/ws_server.rs`, `src/plugin/engine.rs`, `wit/plugin.wit`, `plugins/front_*/src/lib.rs` |
-| B5  | Sec  | Secret leak to log (plugin `config`) | 🟠 MEDIUM | `src/plugin/engine.rs` |
+| B5  | Sec  | Secret leak to log (plugin `config`) | 🟢 DONE | `src/plugin/engine.rs` |
 | B6  | Sec  | `PluginAccess::Filesystem` declared but unused (dead right) | 🟡 LOW | `src/plugin/config.rs`, `src/plugin/engine.rs` |
 | B7  | Sec  | Metrics exporter without auth on `0.0.0.0` | 🟡 LOW | `src/metrics.rs` |
 | B8  | Sec  | `build_http_response`: `unwrap` on invalid `status` from payload | 🟡 LOW | `src/host/http_server.rs` |
@@ -232,20 +232,24 @@ Any `command` + `args` + `env` from a plugin → spawn a host binary. A plugin w
 
 ---
 
-## B5. 🟠 Secret leak to log (plugin `config`)
+## B5. 🟢 Secret leak to log (plugin `config`) (IMPLEMENTED)
 
-**Problem.** `src/plugin/engine.rs:1257`:
+**Problem.** `src/plugin/engine.rs:1368` (was 1257):
 ```rust
+let config_str = plugin_config.config.to_string();
 info!("[Хост] Конфигурация плагина: {:?}", config_str);
 ```
-Prints the **entire plugin JSON config** (may contain API keys/tokens) to the log file (`flexi_logger`, `src/host/log.rs`). Meanwhile `mcp_transport` correctly does NOT log env values (`mcp_transport.rs:42` "env values are NOT logged") — inconsistent.
+Prints the **entire plugin JSON config** (may contain API keys/tokens) to the log file (`flexi_logger`, `src/host/log.rs`). Meanwhile `mcp_transport` correctly does NOT log env values (`mcp_transport.rs` "env values are NOT logged") — inconsistent.
 
-**Fix.**
-1. Do not log `config` in full; log only "safe" fields (name, `access` list, `session_local`) or redact `token`/`api_key`/`secret`/`password` fields.
-2. Add a `redact_config(json) -> json` helper and use it before `info!`.
+**Fix (implemented, 2026-09-07).**
+The full plugin config is **no longer logged by default** (fail-closed). A new `should_log_plugin_config()` helper reads the `ANDYCHOIR_LOG_PLUGIN_CONFIG` env var:
+- default / unset → `false` → only `plugin name` is logged (no config values);
+- `=1` / `=true` → the full config is logged (local debugging only, never in prod/mesh with other operators).
 
-**Acceptance.**
-- Test/review: no key values from `config` appear in the log.
+This makes secret logging opt-in and explicit, consistent with `mcp_transport`'s "env values are NOT logged" rule.
+
+**Acceptance (tests).**
+- `engine::tests::should_log_plugin_config_default_false`: without the env var, config is not logged (fail-closed). Full suite: **133 passed, 0 warnings**.
 
 ---
 

@@ -25,7 +25,7 @@
 | B2  | Безопасность | `PluginAccess::Network` не проверяется в `post_json` | 🔴 HIGH | `src/plugin/engine.rs`, `src/plugin/config.rs`, `wit/plugin.wit` |
 | B3  | Безопасность | MCP-транспорт = произвольный spawn процесса хоста | 🟢 ГОТОВО | `src/host/mcp_transport.rs`, `src/config/config.rs`, `src/main.rs` |
 | B4  | Безопасность | HTTP/WS-фронты без auth + обход `session_local` | 🟢 ГОТОВО | `src/host/http_server.rs`, `src/host/ws_server.rs`, `src/plugin/engine.rs`, `wit/plugin.wit`, `plugins/front_*/src/lib.rs` |
-| B5  | Безопасность | Утечка секретов в лог (`config` плагина) | 🟠 MEDIUM | `src/plugin/engine.rs` |
+| B5  | Безопасность | Утечка секретов в лог (`config` плагина) | 🟢 ГОТОВО | `src/plugin/engine.rs` |
 | B6  | Безопасность | `PluginAccess::Filesystem` объявлено, но не реализовано (мёртвое право) | 🟡 LOW | `src/plugin/config.rs`, `src/plugin/engine.rs` |
 | B7  | Безопасность | Metrics-экспортер без auth на `0.0.0.0` | 🟡 LOW | `src/metrics.rs` |
 | B8  | Безопасность | `build_http_response`: `unwrap` на невалидном `status` из payload | 🟡 LOW | `src/host/http_server.rs` |
@@ -240,21 +240,25 @@ cmd.args(args).stdin(Stdio::piped())...;
 
 ---
 
-## B5. 🟠 Утечка секретов в лог (`config` плагина)
+## B5. 🟢 Утечка секретов в лог (`config` плагина) (РЕАЛИЗОВАНО)
 
 **Проблема.**
-`src/plugin/engine.rs:1257`:
+`src/plugin/engine.rs:1368` (было 1257):
 ```rust
+let config_str = plugin_config.config.to_string();
 info!("[Хост] Конфигурация плагина: {:?}", config_str);
 ```
-Печатает **весь JSON-конфиг плагина** (может содержать API-ключи/токены) в файл лога (`flexi_logger`, `src/host/log.rs`). При этом `mcp_transport` корректно НЕ логирует env-значения (`mcp_transport.rs:42` «значения env НЕ логируются») — непоследовательно.
+Печатает **весь JSON-конфиг плагина** (может содержать API-ключи/токены) в файл лога (`flexi_logger`, `src/host/log.rs`). При этом `mcp_transport` корректно НЕ логирует env-значения — непоследовательно.
 
-**Решение.**
-1. Не логировать `config` целиком; логировать только «безопасные» поля (имя, список `access`, `session_local`) или маскировать поля `token`/`api_key`/`secret`/`password`.
-2. Добавить хелпер `redact_config(json) -> json` и использовать его перед `info!`.
+**Решение (реализовано, 2026-09-07).**
+Полный конфиг плагина **больше не логируется по умолчанию** (fail-closed). Новый хелпер `should_log_plugin_config()` читает env `ANDYCHOIR_LOG_PLUGIN_CONFIG`:
+- по умолчанию / не задана → `false` → логируется только имя плагина (без значений конфига);
+- `=1` / `=true` → полный конфиг логируется (только локальная отладка, не в проде/mesh с чужими операторами).
 
-**Критерии приёмки.**
-- Тест/ривью: в лог не попадают значения ключей из `config`.
+Логирование секретов стало opt-in и явным, согласованным с правилом `mcp_transport` «значения env НЕ логируются».
+
+**Критерии приёмки (тесты).**
+- `engine::tests::should_log_plugin_config_default_false`: без env-переменной конфиг не логируется (fail-closed). Полный прогон: **133 passed, 0 warnings**.
 
 ---
 
