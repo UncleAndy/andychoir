@@ -59,10 +59,36 @@ pub(crate) async fn handle_incoming(inner: Arc<NetInner>, socket: WebSocket) {
     });
 
     let mut this_origin: Option<String> = None;
+    // B1: состояние аутентификации входящего соединения. До получения
+    // валидного Auth мы НЕ обрабатываем Capabilities/Hello/Event и не
+    // регистрируем узел в incoming_senders/origin_tools (fail-closed).
+    // Если список токенов пуст — аутентификация отключена (открытый режим,
+    // обратная совместимость с узлами без токена).
+    let mut authed = inner.cfg.token.is_empty();
     while let Some(msg) = ws_stream.next().await {
         let Ok(axum::extract::ws::Message::Text(text)) = msg else { continue };
         let Some(netmsg) = unpack_message(&text) else { continue };
         match netmsg {
+            // B1: первое сообщение должно быть Auth. Сверяем с NetConfig.token.
+            NetMessage::Auth { token } => {
+                if inner.cfg.token.iter().any(|t| t == &token) {
+                    authed = true;
+                    info!("[Хост] Net: входящее соединение аутентифицировано (токен совпал).");
+                } else {
+                    error!("[Хост] Net: отклонено соединение — неверный токен аутентификации.");
+                    // Закрываем соединение без регистрации узла. Отправляем
+                    // сообщение через канал задачи-отправителя (ws_sink уже
+                    // перемещён туда), затем разрываем.
+                    let _ = out_tx.try_send("{\"error\":\"auth failed\"}".to_string());
+                    // Даём задаче-отправителю шанс отослать и завершаем цикл.
+                    break;
+                }
+            }
+            // B1: любое не-Auth сообщение до аутентификации — отбрасываем.
+            _ if !authed => {
+                warn!("[Хост] Net: проигнорировано сообщение до аутентификации (Auth требуется первым).");
+                continue;
+            }
             NetMessage::Capabilities { origin, source_id: _, neighbors: _, tools } => {
                 if origin == inner.cfg.node_id {
                     continue;
@@ -118,4 +144,163 @@ pub(crate) async fn handle_incoming(inner: Arc<NetInner>, socket: WebSocket) {
     }
     send_task.abort();
     info!("[Хост] Net: входящее соединение закрыто");
+}
+
+#[cfg(test)]
+mod b1_auth_tests {
+    use super::*;
+    use crate::plugin::engine::ToolDef;
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    /// Найти свободный порт (для уникального bind в каждом тесте).
+    async fn free_port() -> u16 {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    }
+
+    /// Поднять входящий сервер с заданным конфигом, вернуть inner.
+    async fn spawn_server(cfg: NetConfig) -> Arc<NetInner> {
+        let inner = NetInner::new_test_with_cfg(cfg);
+        let inner_c = inner.clone();
+        tokio::spawn(async move { run_incoming_server(inner_c).await });
+        // Дать серверу забиндиться.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        inner
+    }
+
+    /// Подождать, пока origin появится (present=true) или гарантированно
+    /// отсутствует (present=false) в incoming_senders — с таймаутом.
+    async fn wait_registration(inner: &Arc<NetInner>, origin: &str, present: bool) -> bool {
+        for _ in 0..50 {
+            let has = inner.incoming_senders.read().await.contains_key(origin);
+            if has == present {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        inner.incoming_senders.read().await.contains_key(origin) == present
+    }
+
+    fn caps_msg(origin: &str) -> NetMessage {
+        NetMessage::Capabilities {
+            origin: origin.to_string(),
+            source_id: origin.to_string(),
+            neighbors: vec![],
+            tools: vec![ToolDef {
+                name: "calculator".into(),
+                description: "".into(),
+                parameters_json: "{}".into(),
+                session_local: false,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn b1_rejects_without_auth() {
+        let port = free_port().await;
+        let mut cfg = NetConfig::default();
+        cfg.listen_port = port;
+        cfg.token = vec!["sekret".to_string()]; // аутентификация ВКЛЮЧЕНА
+        let inner = spawn_server(cfg).await;
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/net"))
+            .await
+            .expect("connect");
+        // Шлём Capabilities БЕЗ Auth — должно игнорироваться.
+        let _ = ws
+            .send(Message::Text(serde_json::to_string(&caps_msg("node-B")).unwrap().into()))
+            .await;
+
+        let registered = wait_registration(&inner, "node-B", false).await;
+        assert!(registered, "без Auth узел НЕ должен регистрироваться");
+        assert!(
+            !inner.origin_tools.read().await.contains_key("node-B"),
+            "origin_tools не должен содержать node-B без Auth"
+        );
+        let _ = ws.close(None).await;
+    }
+
+    #[tokio::test]
+    async fn b1_rejects_wrong_token() {
+        let port = free_port().await;
+        let mut cfg = NetConfig::default();
+        cfg.listen_port = port;
+        cfg.token = vec!["sekret".to_string()];
+        let inner = spawn_server(cfg).await;
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/net"))
+            .await
+            .expect("connect");
+        // Неверный токен → сервер должен разорвать и не регистрировать.
+        let _ = ws
+            .send(Message::Text(
+                serde_json::to_string(&NetMessage::Auth { token: "wrong".to_string() })
+                    .unwrap()
+                    .into(),
+            ))
+            .await;
+        // Даже если клиент пошлёт Capabilities после — не должно зарегистрироваться.
+        let _ = ws
+            .send(Message::Text(serde_json::to_string(&caps_msg("node-B")).unwrap().into()))
+            .await;
+
+        let registered = wait_registration(&inner, "node-B", false).await;
+        assert!(registered, "при неверном токене узел НЕ должен регистрироваться");
+    }
+
+    #[tokio::test]
+    async fn b1_accepts_valid_token() {
+        let port = free_port().await;
+        let mut cfg = NetConfig::default();
+        cfg.listen_port = port;
+        cfg.token = vec!["sekret".to_string()];
+        let inner = spawn_server(cfg).await;
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/net"))
+            .await
+            .expect("connect");
+        // Валидный Auth, затем Capabilities.
+        let _ = ws
+            .send(Message::Text(
+                serde_json::to_string(&NetMessage::Auth { token: "sekret".to_string() })
+                    .unwrap()
+                    .into(),
+            ))
+            .await;
+        let _ = ws
+            .send(Message::Text(serde_json::to_string(&caps_msg("node-B")).unwrap().into()))
+            .await;
+
+        let registered = wait_registration(&inner, "node-B", true).await;
+        assert!(registered, "при верном токене узел ДОЛЖЕН зарегистрироваться");
+        assert!(
+            inner.origin_tools.read().await.contains_key("node-B"),
+            "origin_tools должен содержать node-B после Auth"
+        );
+        let _ = ws.close(None).await;
+    }
+
+    #[tokio::test]
+    async fn b1_open_mode_no_token_required() {
+        let port = free_port().await;
+        let mut cfg = NetConfig::default();
+        cfg.listen_port = port;
+        cfg.token = vec![]; // пустой список → открытый режим (обратная совместимость)
+        let inner = spawn_server(cfg).await;
+
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/net"))
+            .await
+            .expect("connect");
+        // Без Auth, но сервер в открытом режиме — должен принять.
+        let _ = ws
+            .send(Message::Text(serde_json::to_string(&caps_msg("node-B")).unwrap().into()))
+            .await;
+
+        let registered = wait_registration(&inner, "node-B", true).await;
+        assert!(registered, "в открытом режиме (пустой token) узел ДОЛЖЕН регистрироваться без Auth");
+        let _ = ws.close(None).await;
+    }
 }

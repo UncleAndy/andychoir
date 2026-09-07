@@ -5,7 +5,7 @@ use crate::ai::host::types::Event;
 use crate::plugin::engine::ToolDef;
 
 /// Сетевое сообщение: событие ИЛИ анонс возможностей (capabilities) хоста.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum NetMessage {
     /// Событие шины (упаковано для передачи по сети).
@@ -41,6 +41,13 @@ pub(crate) enum NetMessage {
     /// Уведомление об уходе хоста (graceful shutdown).
     Bye {
         source_id: String,
+    },
+    /// Аутентификация входящего/исходящего соединения (B1).
+    /// Первое сообщение после установки WS-соединения: клиент шлёт токен,
+    /// сервер (входящая сторона) сверяет его с `NetConfig.token`.
+    /// Токен НЕ хранится в логах (только факт успеха/неудачи).
+    Auth {
+        token: String,
     },
 }
 
@@ -112,4 +119,39 @@ pub(crate) fn pack_capabilities(origin: &str, tools: Vec<ToolDef>) -> String {
 /// Распаковать сетевое сообщение.
 pub(crate) fn unpack_message(text: &str) -> Option<NetMessage> {
     serde_json::from_str(text).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // B1: NetMessage::Auth сериализуется с тегом type="auth" и полем token,
+    // и корректно десериализуется обратно через unpack_message.
+    #[test]
+    fn auth_roundtrip_serialization() {
+        let msg = NetMessage::Auth {
+            token: "secret-token-123".to_string(),
+        };
+        let s = serde_json::to_string(&msg).expect("serialize Auth");
+        // Тег по rename_all = snake_case → "auth".
+        assert!(s.contains("\"type\":\"auth\""), "тег должен быть auth, got: {s}");
+        assert!(s.contains("\"token\":\"secret-token-123\""), "поле token должно быть");
+
+        let back = unpack_message(&s).expect("deserialize Auth");
+        match back {
+            NetMessage::Auth { token } => assert_eq!(token, "secret-token-123"),
+            other => panic!("ожидался Auth, получили: {other:?}"),
+        }
+    }
+
+    // B1: Auth не конфликтует с другими вариантами (тип уникален).
+    #[test]
+    fn auth_tag_distinct_from_bye() {
+        let auth = serde_json::json!({"type":"auth","token":"x"}).to_string();
+        let bye = serde_json::json!({"type":"bye","source_id":"node"}).to_string();
+        match (unpack_message(&auth), unpack_message(&bye)) {
+            (Some(NetMessage::Auth { .. }), Some(NetMessage::Bye { .. })) => {}
+            other => panic!("неожиданные варианты: {other:?}"),
+        }
+    }
 }

@@ -682,6 +682,77 @@ pub(crate) fn can_plugin_read_file(perms: &[PluginAccess], path: &str) -> bool {
     })
 }
 
+/// Извлечь (host, port) из URL для проверки сетевых прав.
+/// Поддерживает схемы http/https/ws/wss, IPv4 и IPv6 (`[..]:port`),
+/// а также дефолтные порты (http=80, https/ws=443, wss=443).
+/// Возвращает None, если URL невозможно разобрать.
+fn parse_host_port(url: &str) -> Option<(String, u16)> {
+    // Отрезаем схему "scheme://".
+    let after_scheme = match url.find("://") {
+        Some(i) => &url[i + 3..],
+        None => url, // схема не указана — трактуем как есть
+    };
+    // Отрезаем путь/query/fragment.
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    // Убираем userinfo (user@host).
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+
+    if authority.starts_with('[') {
+        // IPv6: [addr]:port
+        let close = authority.find(']')?;
+        let host = authority[1..close].to_string();
+        let rest = &authority[close + 1..];
+        let port = if let Some(p) = rest.strip_prefix(':') {
+            p.parse::<u16>().ok()?
+        } else {
+            default_port_for_scheme(url)?
+        };
+        return Some((host, port));
+    }
+
+    // IPv4 / hostname: host[:port]
+    if let Some(colon) = authority.rfind(':') {
+        let host = authority[..colon].to_string();
+        let port = authority[colon + 1..].parse::<u16>().ok()?;
+        Some((host, port))
+    } else {
+        Some((authority.to_string(), default_port_for_scheme(url)?))
+    }
+}
+
+/// Дефолтный порт по схеме.
+fn default_port_for_scheme(url: &str) -> Option<u16> {
+    if url.starts_with("https://") || url.starts_with("wss://") {
+        Some(443)
+    } else if url.starts_with("http://") || url.starts_with("ws://") {
+        Some(80)
+    } else {
+        // Без схемы — не можем определить дефолт, требуем явный порт в allowed.
+        None
+    }
+}
+
+/// Проверка права плагина на исходящий сетевой запрос (http.post_json).
+/// Возвращает true, только если среди прав есть `Network(allowed)` и
+/// (host, port) запрошенного url входит в список разрешённых.
+/// Fail-closed: без права Network ИЛИ при пустом списке — запрещено всё
+/// (любой url, который не удалось разобрать, тоже запрещён).
+pub(crate) fn can_plugin_network(perms: &[PluginAccess], url: &str) -> bool {
+    let Some((host, port)) = parse_host_port(url) else {
+        return false;
+    };
+    perms.iter().any(|p| {
+        if let PluginAccess::Network(allowed) = p {
+            allowed.iter().any(|(ah, ap)| *ah == host && *ap == port)
+        } else {
+            false
+        }
+    })
+}
+
 impl crate::ai::host::event_bus::Host for ChoirHostState {
     fn publish_event(&mut self, event: Event) -> () {
         info!("[Хост] Новое входящее событие: {:?}.", event);
@@ -755,12 +826,28 @@ impl crate::ai::host::http::Host for ChoirHostState {}
 
 impl crate::ai::host::http::HostWithStore<ChoirHostState> for ChoirHostState {
     async fn post_json(
-        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
         url: String,
         json_body: String,
     ) -> (u16, String) {
-        // TODO(P1): здесь можно добавить проверку прав плагина на сетевой
-        // доступ (PluginAccess::Network) — fail-closed, как для консоли.
+        // B2: проверка права плагина на сетевой доступ (PluginAccess::Network).
+        // Fail-closed, как для консоли: без права / вне белого списка (host, port)
+        // — запрос блокируется. Получаем права текущего плагина из состояния.
+        let allowed = accessor.with(|mut access| {
+            access
+                .get()
+                .current_plugin_permissions
+                .as_ref()
+                .map(|perms| can_plugin_network(perms, &url))
+                .unwrap_or(false)
+        });
+        if !allowed {
+            error!(
+                "[Хост] Плагин не имеет права Network на доступ к {} (требуется PluginAccess::Network с совпадением host:port).",
+                url
+            );
+            return (403, "{\"error\":\"network access denied\"}".to_string());
+        }
         // Таймаут: если LLM/ollama не отвечает (или обрабатывает очень большой
         // запрос), без таймаута .send() может висеть бесконечно, блокируя агента
         // (и Ctrl-C не сработает, т.к. былm-нити занят).
@@ -1508,6 +1595,57 @@ mod tests {
         assert!(!can_plugin_read_file(&perms, "./README.md"));
         let perms2 = vec![PluginAccess::ConsolePrint(100)];
         assert!(!can_plugin_read_file(&perms2, "./README.md"));
+    }
+
+    // --- can_plugin_network (B2): fail-closed, белый список host:port ---------
+
+    #[test]
+    fn network_denied_when_no_network_perm() {
+        // Нет права Network вообще.
+        let perms = vec![PluginAccess::ConsolePrint(100)];
+        assert!(!can_plugin_network(&perms, "https://api.openai.com/v1/chat"));
+    }
+
+    #[test]
+    fn network_denied_when_empty_allow_list() {
+        // Право Network есть, но список пуст → всё запрещено (fail-closed).
+        let perms = vec![PluginAccess::Network(vec![])];
+        assert!(!can_plugin_network(&perms, "https://api.openai.com/v1/chat"));
+    }
+
+    #[test]
+    fn network_allowed_exact_host_port() {
+        let perms = vec![PluginAccess::Network(vec![
+            ("api.openai.com".to_string(), 443),
+        ])];
+        // https → дефолтный порт 443, совпадает.
+        assert!(can_plugin_network(&perms, "https://api.openai.com/v1/chat"));
+        // http → дефолтный порт 80, не совпадает с 443.
+        assert!(!can_plugin_network(&perms, "http://api.openai.com/v1/chat"));
+        // Явный порт 443 в URL совпадает.
+        assert!(can_plugin_network(&perms, "https://api.openai.com:443/x"));
+    }
+
+    #[test]
+    fn network_allowed_with_explicit_port_and_ipv6() {
+        let perms = vec![PluginAccess::Network(vec![
+            ("127.0.0.1".to_string(), 8090),
+            ("::1".to_string(), 8080),
+        ])];
+        assert!(can_plugin_network(&perms, "http://127.0.0.1:8090/foo"));
+        assert!(!can_plugin_network(&perms, "http://127.0.0.1:8091/foo"));
+        assert!(can_plugin_network(&perms, "http://[::1]:8080/foo"));
+    }
+
+    #[test]
+    fn network_denied_on_unparseable_url() {
+        // Без схемы и порта невозможно определить дефолтный порт → запрещено.
+        let perms = vec![PluginAccess::Network(vec![
+            ("example.com".to_string(), 80),
+        ])];
+        assert!(!can_plugin_network(&perms, "example.com/path"));
+        // Но с явным портом — ок.
+        assert!(can_plugin_network(&perms, "http://example.com:80/path"));
     }
 
     // --- Реестр локальных сессий (session_local) ----------------------------

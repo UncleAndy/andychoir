@@ -72,6 +72,17 @@ pub(crate) async fn run_outbound_loop(inner: Arc<NetInner>, remote: NetRemote) {
                 // split(): отправитель (Sink) и приёмник (Stream) раздельно.
                 let (mut ws_sink, mut ws_stream) = ws.split();
 
+                // B1: отправляем Auth первым сообщением (до capabilities/hello),
+                // чтобы удалённая входящая сторона могла проверить токен.
+                if !remote.token.is_empty() {
+                    let auth = NetMessage::Auth { token: remote.token.clone() };
+                    if let Ok(auth_text) = serde_json::to_string(&auth) {
+                        let _ = ws_sink
+                            .send(tokio_tungstenite::tungstenite::Message::Text(auth_text.into()))
+                            .await;
+                    }
+                }
+
                 // При подключении анонсируем свои локальные инструменты
                 // (capabilities), чтобы удалённый хост знал, что мы умеем.
                 let my_tools = crate::plugin::engine::local_tools().read().await.values().cloned().collect::<Vec<_>>();
@@ -138,6 +149,8 @@ pub(crate) async fn run_outbound_loop(inner: Arc<NetInner>, remote: NetRemote) {
                                 break;
                             }
                         }
+                        // B1: Auth от входящей стороны здесь не ожидается — игнорируем.
+                        _ => continue,
                     }
                 }
                 send_task.abort();
