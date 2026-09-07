@@ -137,6 +137,12 @@ interface http-server {
     port: u16,
     path: string,
     target: string,
+    // Адрес привязки (B4). По умолчанию "0.0.0.0" (все интерфейсы).
+    // Для локального доступа задайте "127.0.0.1".
+    bind: option<string>,
+    // Токен аутентификации (B4). Если задан, HTTP-запросы требуют
+    // `Authorization: Bearer <token>`. None = без аутентификации (compat).
+    auth-token: option<string>,
   }
 
   // Зарегистрировать HTTP-слушатель. Возвращает true при успехе.
@@ -159,6 +165,11 @@ interface ws-server {
     port: u16,
     path: string,
     target: string,
+    // Адрес привязки (B4). По умолчанию "0.0.0.0". Для локального доступа — "127.0.0.1".
+    bind: option<string>,
+    // Токен аутентификации (B4). Если задан, WS-сообщения требуют поле
+    // `auth: "<token>"` в JSON. None = без аутентификации (compat).
+    auth-token: option<string>,
   }
 
   // Зарегистрировать WS-слушатель. Возвращает true при успехе.

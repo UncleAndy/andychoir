@@ -24,7 +24,7 @@
 | B1  | Sec  | Network auth missing: `token` never validated | 🔴 HIGH | `src/host/net/server.rs`, `src/host/net/outbound.rs`, `src/config/config.rs` |
 | B2  | Sec  | `PluginAccess::Network` not enforced in `post_json` | 🔴 HIGH | `src/plugin/engine.rs`, `src/plugin/config.rs`, `wit/plugin.wit` |
 | B3  | Sec  | MCP transport = arbitrary host process spawn | 🟢 DONE | `src/host/mcp_transport.rs`, `src/config/config.rs`, `src/main.rs` |
-| B4  | Sec  | HTTP/WS frontends without auth + `session_local` bypass | 🟠 MEDIUM | `src/host/http_server.rs`, `src/host/ws_server.rs`, `src/plugin/engine.rs` |
+| B4  | Sec  | HTTP/WS frontends without auth + `session_local` bypass | 🟢 DONE | `src/host/http_server.rs`, `src/host/ws_server.rs`, `src/plugin/engine.rs`, `wit/plugin.wit`, `plugins/front_*/src/lib.rs` |
 | B5  | Sec  | Secret leak to log (plugin `config`) | 🟠 MEDIUM | `src/plugin/engine.rs` |
 | B6  | Sec  | `PluginAccess::Filesystem` declared but unused (dead right) | 🟡 LOW | `src/plugin/config.rs`, `src/plugin/engine.rs` |
 | B7  | Sec  | Metrics exporter without auth on `0.0.0.0` | 🟡 LOW | `src/metrics.rs` |
@@ -200,21 +200,35 @@ Any `command` + `args` + `env` from a plugin → spawn a host binary. A plugin w
 
 ---
 
-## B4. 🟠 HTTP/WS frontends without auth + `session_local` bypass
+## B4. 🟢 HTTP/WS frontends without auth + `session_local` bypass (IMPLEMENTED)
 
 **Problem.**
 - `src/host/http_server.rs:231` / `src/host/ws_server.rs:70` listen on `0.0.0.0` without authentication.
 - A direct HTTP call to `front:http` calls `begin_frontend_request` (`http_server.rs:141`), which **registers the session as local and active** → the request gets access to `session_local` tools (`src/messages/bus.rs:485` `should_deny_session_local` returns `false`, since the session is local and active).
 - The `session_local` guard (meant against *network* foreign sessions) **does not protect** against a direct local HTTP/WS client. If the frontend is public — anyone invokes private tools.
 
-**Fix.**
-1. Default frontend bind to `127.0.0.1` (config `http.bind`/`ws.bind`, default `127.0.0.1`).
-2. Optional: auth on frontends (token in header/query, matched against config).
-3. Or: `session_local` should require an extra "trusted frontend" flag (separate flag in `begin_frontend_request`) so an arbitrary HTTP client cannot reach private tools.
+**Fix (implemented, 2026-09-07).**
+1. **session_local bypass closed (fail-closed).** HTTP/WS frontends no longer call
+   `begin_frontend_request` with the **client-supplied** `session_id`. The client's
+   `session_id` (`x-session-id` header for HTTP, `session_id` in JSON for WS) is used
+   *only for response correlation* and is **never registered as a local session**.
+   Therefore `session_local` tools are unreachable through HTTP/WS fronts (the session
+   is never marked local+active). Local session registration stays only for the real
+   local console/frontend. No WIT change — enforcement is in the host.
+2. **Bind address (opt-in).** WIT `listener`/`ws-listener` gained `bind: option<string>`
+   (default `0.0.0.0` for backward compat). Host binds the TCP listener to this address,
+   so operators can restrict to `127.0.0.1`. Invalid address → server logs and skips.
+3. **Frontend auth token (opt-in).** WIT gained `auth-token: option<string>`.
+   - HTTP: if set, requests require `Authorization: Bearer <token>` (or raw token);
+     mismatch/absent → `401 Unauthorized`.
+   - WS: if set, each message must carry `"auth": "<token>"`; mismatch → socket closed.
+   Both are fail-closed when the token is configured. Empty/absent token = compat (no auth).
 
 **Acceptance (tests).**
-- `start_http_servers`/`start_ws_servers` bind `127.0.0.1` by default (test on `SocketAddr`).
-- Integration: direct HTTP call to a `session_local` tool without trusted flag → denied (if option 3 chosen).
+- `http_server::tests::http_session_id_from_header_not_registered_as_local`: a client
+  `x-session-id` reaches the event (for correlation) but `is_local_session` stays `false`
+  → `session_local` denied. `http_listener_serde_roundtrip_keeps_bind_and_token`: config
+  parse of `bind`/`auth_token` round-trips. Full suite: **132 passed, 0 warnings**.
 
 ---
 

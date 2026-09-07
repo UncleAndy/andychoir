@@ -14,6 +14,13 @@ struct ListenerConfig {
     /// Целевой плагин, которому будет уходить HTTP-запрос (напр. "agent:*").
     #[serde(default = "default_target")]
     target: String,
+    /// Адрес привязки (B4). Если не задан — хост использует "0.0.0.0".
+    #[serde(default)]
+    bind: Option<String>,
+    /// Токен аутентификации (B4). Если задан — клиент обязан слать
+    /// `Authorization: Bearer <token>`; иначе 401.
+    #[serde(default)]
+    auth_token: Option<String>,
 }
 
 fn default_target() -> String {
@@ -105,6 +112,8 @@ impl Guest for FrontHttpPluginImplementation {
                     port: l.port,
                     path: l.path.clone(),
                     target: l.target.clone(),
+                    bind: l.bind.clone(),
+                    auth_token: l.auth_token.clone(),
                 },
             )
             .await;

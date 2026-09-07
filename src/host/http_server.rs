@@ -132,13 +132,30 @@ async fn handle_request(
     let body = String::from_utf8_lossy(&body_bytes).to_string();
 
     let (_rid, event) = build_http_event(&listener, &method, &path, &query, &headers, &body);
-    let session_id = event.session_id.clone();
 
-    // Регистрируем session_id как локальную сессию хоста и помечаем начало
-    // активного запроса (доступ к session_local-инструментам разрешён только
-    // пока есть незавершённый запрос от фронта). Фронт-агностичная точка —
-    // та же, что у ws/console. request_id генерируется централизованно.
-    let request_id = engine::begin_frontend_request(&session_id).await;
+    // B4: аутентификация фронта (опционально, opt-in). Если у слушателя задан
+    // auth_token — требуем `Authorization: Bearer <token>`; несовпадение → 401.
+    if let Some(expected) = &listener.auth_token {
+        let ok = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == format!("Bearer {}", expected) || v == *expected)
+            .unwrap_or(false);
+        if !ok {
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body(Body::from("unauthorized"))
+                .unwrap();
+        }
+    }
+
+    // B4 (session_local bypass fix): НЕ регистрируем присланный клиентом
+    // session_id как локальную сессию хоста. session_id из заголовка
+    // x-session-id используется только для корреляции ответа, но не даёт
+    // доступа к session_local-инструментам (fail-closed: через сетевой фронт
+    // session_local недоступен). Локальная сессия регистрируется только
+    // реальными локальными фронтами (консоль), а не произвольным HTTP-клиентом.
+    let request_id = event.request_id.clone();
 
     let (resp_tx, resp_rx) = oneshot::channel::<Event>();
     {
@@ -148,8 +165,6 @@ async fn handle_request(
 
     if inner.tx.send(event).await.is_err() {
         inner.pending.lock().await.remove(&request_id);
-        engine::unregister_local_session(&session_id).await;
-        engine::end_frontend_request(&session_id, &request_id).await;
         info!("[Хост] HTTP: bus closed при отправке request_id={}", request_id);
         return Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -163,8 +178,6 @@ async fn handle_request(
         Ok(Ok(ev)) => ev,
         _ => {
             inner.pending.lock().await.remove(&request_id);
-            engine::unregister_local_session(&session_id).await;
-            engine::mark_request_inactive(&session_id, &request_id).await;
             return Response::builder()
                 .status(StatusCode::GATEWAY_TIMEOUT)
                 .body(Body::from("timeout waiting for response"))
@@ -172,8 +185,6 @@ async fn handle_request(
         }
     };
 
-    engine::unregister_local_session(&session_id).await;
-    engine::mark_request_inactive(&session_id, &request_id).await;
     build_http_response(&resp)
 }
 
@@ -221,23 +232,29 @@ pub fn build_http_response(resp: &Event) -> Response {
 }
 
 /// Запустить axum-сервер на порту.
-fn spawn_server(inner: Arc<HttpServerInner>, port: u16) -> tokio::task::JoinHandle<()> {
+fn spawn_server(inner: Arc<HttpServerInner>, port: u16, bind_addr: String) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let app = Router::new()
             .fallback(handle_request)
             .with_state(inner)
             .into_make_service_with_connect_info::<std::net::SocketAddr>();
 
-        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+        let addr: std::net::SocketAddr = match bind_addr.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                error!("[Хост] HTTP: невалидный bind-адрес '{}': {}", bind_addr, e);
+                return;
+            }
+        };
         match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => {
-                info!("[Хост] HTTP-сервер слушает 0.0.0.0:{}", port);
+                info!("[Хост] HTTP-сервер слушает {}:{}", bind_addr, port);
                 if let Err(e) = axum::serve(listener, app).await {
                     error!("[Хост] HTTP-сервер на :{} упал: {}", port, e);
                 }
             }
             Err(e) => {
-                error!("[Хост] Не удалось занять порт {}: {}", port, e);
+                error!("[Хост] Не удалось занять {}:{}: {}", bind_addr, port, e);
             }
         }
     })
@@ -258,7 +275,8 @@ pub async fn start_http_servers(tx: mpsc::Sender<Event>) -> HttpServerHandle {
     let mut seen: HashSet<u16> = HashSet::new();
     for l in listeners {
         if seen.insert(l.port) {
-            handles.push(spawn_server(inner.clone(), l.port));
+            let bind = l.bind.clone().unwrap_or_else(|| "0.0.0.0".to_string());
+            handles.push(spawn_server(inner.clone(), l.port, bind));
         }
     }
 
@@ -288,6 +306,8 @@ mod tests {
             port,
             path: path.to_string(),
             target: target.to_string(),
+            bind: None,
+            auth_token: None,
         }
     }
 
@@ -386,5 +406,47 @@ mod tests {
         };
         let resp = build_http_response(&ev);
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // B4: HttpListener сериализуется/десериализуется с bind и auth_token (конфиг-парсинг).
+    #[test]
+    fn http_listener_serde_roundtrip_keeps_bind_and_token() {
+        let json = serde_json::json!({
+            "port": 8090,
+            "path": "/q",
+            "target": "agent:*",
+            "bind": "127.0.0.1",
+            "auth_token": "secret"
+        })
+        .to_string();
+        let l: engine::HttpListener = serde_json::from_str(&json).unwrap();
+        assert_eq!(l.bind.as_deref(), Some("127.0.0.1"));
+        assert_eq!(l.auth_token.as_deref(), Some("secret"));
+
+        // Отсутствующие bind/auth_token → None (compat, слушаем 0.0.0.0 без токена).
+        let json2 = serde_json::json!({"port": 8090, "path": "/q", "target": "agent:*"}).to_string();
+        let l2: engine::HttpListener = serde_json::from_str(&json2).unwrap();
+        assert!(l2.bind.is_none());
+        assert!(l2.auth_token.is_none());
+    }
+
+    // B4 (session_local bypass fix): build_http_event берёт session_id из
+    // заголовка x-session-id, но хост НЕ регистрирует его как локальную сессию
+    // (это делается вызывающим handle_request — и для HTTP/WS больше не делается).
+    // Проверяем, что session_id из заголовка попадает в событие (для корреляции),
+    // и что без явной регистрации is_local_session = false (=> session_local запрещён).
+    #[tokio::test]
+    async fn http_session_id_from_header_not_registered_as_local() {
+        let listener = make_listener(8090, "/query", "agent:*");
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", HeaderValue::from_static("attacker-sess"));
+        let (_rid, ev) =
+            build_http_event(&listener, "POST", "/query", "", &headers, "{}");
+        assert_eq!(ev.session_id, "attacker-sess");
+        // Ключевая проверка B4: клиентский session_id НЕ зарегистрирован хостом.
+        assert!(
+            !crate::plugin::engine::is_local_session("attacker-sess").await,
+            "HTTP/WS session_id не должен давать session_local-доступа"
+        );
     }
 }

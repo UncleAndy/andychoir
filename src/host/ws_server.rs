@@ -50,7 +50,13 @@ pub struct WsServerHandle {
 }
 
 /// Запустить WS-сервер на порту (для зарегистрированного слушателя).
-fn spawn_server(inner: Arc<WsServerInner>, port: u16, path: String) -> tokio::task::JoinHandle<()> {
+fn spawn_server(
+    inner: Arc<WsServerInner>,
+    port: u16,
+    path: String,
+    bind_addr: String,
+    auth_token: Option<String>,
+) -> tokio::task::JoinHandle<()> {
     let path = if path.is_empty() { "/ws".to_string() } else { path.clone() };
     let route_path = path.clone();
     tokio::spawn(async move {
@@ -59,31 +65,42 @@ fn spawn_server(inner: Arc<WsServerInner>, port: u16, path: String) -> tokio::ta
                 &route_path,
                 axum::routing::get({
                     let inner = inner.clone();
+                    let auth_token = auth_token.clone();
                     move |ws: WebSocketUpgrade| {
                         let inner = inner.clone();
-                        async move { ws.on_upgrade(move |socket| handle_socket(inner, socket)) }
+                        async move { ws.on_upgrade(move |socket| handle_socket(inner, socket, auth_token)) }
                     }
                 }),
             )
             .with_state(inner.clone());
 
-        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+        let addr: std::net::SocketAddr = match bind_addr.parse() {
+            Ok(a) => a,
+            Err(e) => {
+                error!("[Хост] WS: невалидный bind-адрес '{}': {}", bind_addr, e);
+                return;
+            }
+        };
         match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => {
-                info!("[Хост] WS-сервер слушает 0.0.0.0:{} (path {})", port, path);
+                info!("[Хост] WS-сервер слушает {}:{} (path {})", bind_addr, port, path);
                 if let Err(e) = axum::serve(listener, app).await {
                     error!("[Хост] WS-сервер на :{} упал: {}", port, e);
                 }
             }
             Err(e) => {
-                error!("[Хост] Не удалось занять WS-порт {}: {}", port, e);
+                error!("[Хост] Не удалось занять WS {}:{}: {}", bind_addr, port, e);
             }
         }
     })
 }
 
 /// Обработать одно WS-подключение.
-async fn handle_socket(inner: Arc<WsServerInner>, mut socket: WebSocket) {
+async fn handle_socket(
+    inner: Arc<WsServerInner>,
+    mut socket: WebSocket,
+    listener_auth_token: Option<String>,
+) {
     let socket_id = uuid::Uuid::new_v4().to_string();
     info!("[Хост] WS-подключение открыто: {}", socket_id);
 
@@ -141,11 +158,32 @@ async fn handle_socket(inner: Arc<WsServerInner>, mut socket: WebSocket) {
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-                // Регистрируем session_id как локальную сессию хоста и помечаем
-                // начало активного запроса (доступ к session_local-инструментам
-                // разрешён только пока есть незавершённый запрос от фронта).
-                // Фронт-агностичная точка — та же, что у http/console.
-                let request_id = engine::begin_frontend_request(&session_id).await;
+                // B4: аутентификация фронта (опционально, opt-in). Если у
+                // слушателя задан auth_token — требуем поле `auth` в JSON;
+                // несовпадение → закрываем сокет с ошибкой (fail-closed).
+                if let Some(expected) = &listener_auth_token {
+                    let ok = parsed
+                        .get("auth")
+                        .and_then(|v| v.as_str())
+                        .map(|v| v == expected)
+                        .unwrap_or(false);
+                    if !ok {
+                        let _ = socket
+                            .send(Message::Text(
+                                serde_json::json!({ "error": "unauthorized" }).to_string(),
+                            ))
+                            .await;
+                        break;
+                    }
+                }
+
+                // B4 (session_local bypass fix): НЕ регистрируем присланный
+                // клиентом session_id как локальную сессию хоста. session_id из
+                // JSON используется только для корреляции ответа, но не даёт
+                // доступа к session_local-инструментам (fail-closed: через
+                // сетевой фронт session_local недоступен). request_id
+                // генерируется хостом централизованно.
+                let request_id = uuid::Uuid::new_v4().to_string();
 
                 // Запоминаем: request_id -> (socket_id, session_id).
                 {
@@ -203,7 +241,8 @@ pub async fn start_ws_servers(tx: mpsc::Sender<Event>) -> WsServerHandle {
     let mut seen: std::collections::HashSet<u16> = std::collections::HashSet::new();
     for l in listeners {
         if seen.insert(l.port) {
-            handles.push(spawn_server(inner.clone(), l.port, l.path));
+            let bind = l.bind.clone().unwrap_or_else(|| "0.0.0.0".to_string());
+            handles.push(spawn_server(inner.clone(), l.port, l.path, bind, l.auth_token.clone()));
         }
     }
     WsServerHandle { handles }

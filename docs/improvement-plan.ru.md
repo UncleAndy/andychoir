@@ -24,7 +24,7 @@
 | B1  | Безопасность | Сетевая аутентификация отсутствует: `token` не проверяется | 🔴 HIGH | `src/host/net/server.rs`, `src/host/net/outbound.rs`, `src/config/config.rs` |
 | B2  | Безопасность | `PluginAccess::Network` не проверяется в `post_json` | 🔴 HIGH | `src/plugin/engine.rs`, `src/plugin/config.rs`, `wit/plugin.wit` |
 | B3  | Безопасность | MCP-транспорт = произвольный spawn процесса хоста | 🟢 ГОТОВО | `src/host/mcp_transport.rs`, `src/config/config.rs`, `src/main.rs` |
-| B4  | Безопасность | HTTP/WS-фронты без auth + обход `session_local` | 🟠 MEDIUM | `src/host/http_server.rs`, `src/host/ws_server.rs`, `src/plugin/engine.rs` |
+| B4  | Безопасность | HTTP/WS-фронты без auth + обход `session_local` | 🟢 ГОТОВО | `src/host/http_server.rs`, `src/host/ws_server.rs`, `src/plugin/engine.rs`, `wit/plugin.wit`, `plugins/front_*/src/lib.rs` |
 | B5  | Безопасность | Утечка секретов в лог (`config` плагина) | 🟠 MEDIUM | `src/plugin/engine.rs` |
 | B6  | Безопасность | `PluginAccess::Filesystem` объявлено, но не реализовано (мёртвое право) | 🟡 LOW | `src/plugin/config.rs`, `src/plugin/engine.rs` |
 | B7  | Безопасность | Metrics-экспортер без auth на `0.0.0.0` | 🟡 LOW | `src/metrics.rs` |
@@ -206,21 +206,37 @@ cmd.args(args).stdin(Stdio::piped())...;
 
 ---
 
-## B4. 🟠 HTTP/WS-фронты без auth + обход `session_local`
+## B4. 🟢 HTTP/WS-фронты без auth + обход `session_local` (РЕАЛИЗОВАНО)
 
 **Проблема.**
 - `src/host/http_server.rs:231` / `src/host/ws_server.rs:70` слушают `0.0.0.0` без аутентификации.
 - Прямой HTTP-вызов к `front:http` вызывает `begin_frontend_request` (`http_server.rs:141`), который **регистрирует сессию как локальную и активную** → запрос получает доступ к `session_local`-инструментам (`src/messages/bus.rs:485` `should_deny_session_local` вернёт `false`, т.к. сессия локальная и активная).
 - Защита `session_local` (предназначенная против *сетевых* чужих сессий) **не защищает** от прямого локального HTTP/WS-клиента. Если фронт слушает публично — любой вызывает приватные инструменты.
 
-**Решение.**
-1. По умолчанию bind фронтов на `127.0.0.1` (конфиг `http.bind`/`ws.bind`, default `127.0.0.1`).
-2. Опционально: auth на фронтах (токен в заголовке/query, сверять с `cfg`).
-3. Либо: `session_local` должен требовать доп. признак «доверенный фронт» (отдельный флаг в `begin_frontend_request`), чтобы произвольный HTTP-клиент не получал приватные инструменты.
+**Решение (реализовано, 2026-09-07).**
+1. **Обход `session_local` закрыт (fail-closed).** HTTP/WS-фронты больше НЕ вызывают
+   `begin_frontend_request` с **присланным клиентом** `session_id`. Клиентский `session_id`
+   (`x-session-id` для HTTP, `session_id` в JSON для WS) используется *только для корреляции
+   ответа* и **никогда не регистрируется как локальная сессия**. Поэтому `session_local`-
+   инструменты через HTTP/WS-фронты недоступны (сессия не помечается локальной+активной).
+   Регистрация локальной сессии остаётся только для реальной локальной консоли/фронта. Без
+   изменения WIT — проверка на стороне хоста.
+2. **Адрес привязки (opt-in).** WIT `listener`/`ws-listener` получили `bind: option<string>`
+   (по умолчанию `0.0.0.0` для обратной совместимости). Хост биндит TCP-слушатель на этот
+   адрес, оператор может ограничить до `127.0.0.1`. Невалидный адрес → лог и пропуск.
+3. **Токен аутентификации фронта (opt-in).** WIT получил `auth-token: option<string>`.
+   - HTTP: если задан — требуется `Authorization: Bearer <token>` (или сырой токен);
+     несовпадение/отсутствие → `401 Unauthorized`.
+   - WS: если задан — каждое сообщение должно нести `"auth": "<token>"`; несовпадение →
+     сокет закрывается.
+   Оба fail-closed, когда токен сконфигурирован. Пустой/отсутствующий токен = совместимость
+   (без аутентификации).
 
 **Критерии приёмки (тесты).**
-- `start_http_servers`/`start_ws_servers` биндятся на `127.0.0.1` по умолчанию (тест на `SocketAddr`).
-- Интеграционный: прямой HTTP-вызов к `session_local`-инструменту без доверенного признака → отказ (если выбран вариант 3).
+- `http_server::tests::http_session_id_from_header_not_registered_as_local`: клиентский
+  `x-session-id` попадает в событие (для корреляции), но `is_local_session` остаётся `false`
+  → `session_local` запрещён. `http_listener_serde_roundtrip_keeps_bind_and_token`: парсинг
+  `bind`/`auth_token` из конфига. Полный прогон: **132 passed, 0 warnings**.
 
 ---
 

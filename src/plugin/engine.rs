@@ -392,6 +392,12 @@ pub struct HttpListener {
     pub port: u16,
     pub path: String,
     pub target: String,
+    /// Адрес привязки (B4). `None` → "0.0.0.0" (все интерфейсы).
+    #[serde(default)]
+    pub bind: Option<String>,
+    /// Токен аутентификации (B4). `None` → без аутентификации (compat).
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 /// Один WebSocket-слушатель, зарегистрированный ws-фронтом.
@@ -400,6 +406,12 @@ pub struct WsListener {
     pub port: u16,
     pub path: String,
     pub target: String,
+    /// Адрес привязки (B4). `None` → "0.0.0.0" (все интерфейсы).
+    #[serde(default)]
+    pub bind: Option<String>,
+    /// Токен аутентификации (B4). `None` → без аутентификации (compat).
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 /// Глобальное хранилище HTTP-слушателей: (port, path) -> listener.
@@ -1044,15 +1056,19 @@ impl crate::ai::host::http_server::HostWithStore<ChoirHostState> for ChoirHostSt
         let port = l.port;
         let path = l.path.clone();
         let target = l.target.clone();
+        let bind = l.bind.clone();
+        let auth_token = l.auth_token.clone();
         let listener = HttpListener {
             port: l.port,
             path: l.path,
             target: l.target,
+            bind,
+            auth_token,
         };
         let ok = http_listen(listener);
         info!(
             "[Хост] HTTP-слушатель {}:{}/{} (target={}) -> {}",
-            "0.0.0.0",
+            l.bind.as_deref().unwrap_or("0.0.0.0"),
             port,
             path,
             target,
@@ -1080,6 +1096,8 @@ impl crate::ai::host::http_server::HostWithStore<ChoirHostState> for ChoirHostSt
                 port: l.port,
                 path: l.path,
                 target: l.target,
+                bind: l.bind.clone(),
+                auth_token: l.auth_token.clone(),
             })
             .collect()
     }
@@ -1097,15 +1115,19 @@ impl crate::ai::host::ws_server::HostWithStore<ChoirHostState> for ChoirHostStat
         let port = l.port;
         let path = l.path.clone();
         let target = l.target.clone();
+        let bind = l.bind.clone();
+        let auth_token = l.auth_token.clone();
         let listener = WsListener {
             port: l.port,
             path: l.path,
             target: l.target,
+            bind,
+            auth_token,
         };
         let ok = ws_listen(listener);
         info!(
             "[Хост] WS-слушатель {}:{}/{} (target={}) -> {}",
-            "0.0.0.0",
+            l.bind.as_deref().unwrap_or("0.0.0.0"),
             port,
             path,
             target,
@@ -1133,6 +1155,8 @@ impl crate::ai::host::ws_server::HostWithStore<ChoirHostState> for ChoirHostStat
                 port: l.port,
                 path: l.path,
                 target: l.target,
+                bind: l.bind.clone(),
+                auth_token: l.auth_token.clone(),
             })
             .collect()
     }
