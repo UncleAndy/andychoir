@@ -171,9 +171,10 @@ pub async fn start_response_payload_reaper() {
 
 /// Глобальное хранилище историй сессий (вариант A).
 /// session_id -> упорядоченные диалоговые события (request/response).
-/// RwLock: много читателей (агент history_get, saver-снимок), редкие короткие
-/// записи (append). Читатели идут параллельно, блокируются только на запись.
-static SESSION_HISTORIES: OnceLock<RwLock<HashMap<String, Vec<Event>>>> = OnceLock::new();
+/// DashMap: шардированные локи по ключу сессии — запись в сессию A не блокирует
+/// чтение/запись сессии B (A3 fix). Раньше был общий RwLock<HashMap>, где любой append
+/// держал глобальный write-лок и блокировал всех читателей/писателей других сессий.
+static SESSION_HISTORIES: OnceLock<dashmap::DashMap<String, Vec<Event>>> = OnceLock::new();
 
 /// Время последнего изменения каждой сессии (для TTL и решения о сохранении).
 /// std::sync::Mutex: почти всегда пишется append-ом, RwLock выигрыша не даёт.
@@ -183,8 +184,8 @@ static SESSION_MTIME: OnceLock<StdMutex<HashMap<String, std::time::Instant>>> = 
 /// DashSet: конкурентная структура, добавление/чтение без долгих блокировок.
 static DIRTY_SESSIONS: OnceLock<dashmap::DashSet<String>> = OnceLock::new();
 
-fn session_histories() -> &'static RwLock<HashMap<String, Vec<Event>>> {
-    SESSION_HISTORIES.get_or_init(|| RwLock::new(HashMap::new()))
+fn session_histories() -> &'static dashmap::DashMap<String, Vec<Event>> {
+    SESSION_HISTORIES.get_or_init(|| dashmap::DashMap::new())
 }
 
 fn session_mtimes() -> &'static StdMutex<HashMap<String, std::time::Instant>> {
@@ -349,8 +350,9 @@ pub async fn get_session_tools(session_id: &str) -> Vec<ToolDef> {
 /// (saver-цикл перепишет её файл).
 pub async fn history_append(session_id: &str, ev: &Event, max_events: usize) {
     {
-        let mut map = session_histories().write().await;
-        let entries = map.entry(session_id.to_string()).or_default();
+        // A3 fix: entry() берёт лок только на одну сессию (shard), не блокируя
+        // остальные сессии (чтение/запись). Раньше здесь был глобальный write().
+        let mut entries = session_histories().entry(session_id.to_string()).or_default();
         if entries.len() >= max_events {
             let overflow = entries.len() - (max_events.saturating_sub(1));
             entries.drain(..overflow);
@@ -367,16 +369,15 @@ pub async fn history_append(session_id: &str, ev: &Event, max_events: usize) {
 
 /// Получить копию истории сессии (в порядке: старые -> новые).
 pub async fn history_get(session_id: &str) -> Vec<Event> {
-    let map = session_histories().read().await;
-    map.get(session_id).cloned().unwrap_or_default()
+    session_histories()
+        .get(session_id)
+        .map(|e| e.value().clone())
+        .unwrap_or_default()
 }
 
 /// Очистить историю сессии (и убрать из набора изменённых).
 pub async fn history_clear(session_id: &str) {
-    {
-        let mut map = session_histories().write().await;
-        map.remove(session_id);
-    }
+    session_histories().remove(session_id);
     if let Ok(mut m) = session_mtimes().lock() {
         m.remove(session_id);
     }
@@ -385,21 +386,29 @@ pub async fn history_clear(session_id: &str) {
 
 /// Вернуть все истории (для сохранения на диск при shutdown).
 pub async fn history_all() -> HashMap<String, Vec<Event>> {
-    session_histories().read().await.clone()
+    session_histories()
+        .iter()
+        .map(|e| (e.key().clone(), e.value().clone()))
+        .collect()
 }
 
 /// Загрузить истории в хранилище (при старте из файла).
 pub async fn history_load(data: HashMap<String, Vec<Event>>) {
-    let mut map = session_histories().write().await;
-    map.extend(data);
+    let map = session_histories();
+    for (k, v) in data {
+        map.insert(k, v);
+    }
 }
 
 /// Сохранить ОДНУ сессию в файл <dir>/<sid>.json (если она существует).
 /// Используется saver-циклом. Запись на диск ВНЕ lock (только снимок под lock).
 pub async fn save_session_to_disk(dir: &str, sid: &str) {
     let events: Vec<Event> = {
-        let map = session_histories().read().await;
-        map.get(sid).cloned().unwrap_or_default()
+        // A3 fix: DashMap.get берёт лок только на одну сессию, не блокируя другие.
+        session_histories()
+            .get(sid)
+            .map(|e| e.value().clone())
+            .unwrap_or_default()
     };
     if events.is_empty() {
         return;
@@ -1929,5 +1938,38 @@ mod tests {
         // После сигнала ответа entry должен быть удалён.
         signal_response("sess-P", "req-P").await;
         assert_eq!(pending_responses().lock().await.get(&key).is_some(), false, "entry удалён после signal");
+    }
+
+    // A3: запись в одну сессию не блокирует запись/чтение другой (независимые локи
+    // DashMap). Проверяем параллельный append в разные сессии без deadlock.
+    #[tokio::test]
+    async fn a3_history_append_isolated_between_sessions() {
+        let ev = |rid: &str, sid: &str| Event {
+            request_id: rid.into(),
+            session_id: sid.into(),
+            source: "front:console".into(),
+            target: "agent:*".into(),
+            topic: "request".into(),
+            payload: "x".into(),
+        };
+        // Параллельно пишем в две разные сессии — не должно быть deadlock/блокировки.
+        let (a, b) = tokio::join!(
+            async {
+                for i in 0..50 {
+                    history_append("sess-A3-A", &ev(&format!("r{}", i), "sess-A3-A"), 1000).await;
+                }
+                history_get("sess-A3-A").await.len()
+            },
+            async {
+                for i in 0..50 {
+                    history_append("sess-A3-B", &ev(&format!("r{}", i), "sess-A3-B"), 1000).await;
+                }
+                history_get("sess-A3-B").await.len()
+            }
+        );
+        assert_eq!(a, 50, "sess-A3-A получила 50 событий");
+        assert_eq!(b, 50, "sess-A3-B получила 50 событий");
+        // Чтение одной сессии не смешивается с другой.
+        assert!(history_get("sess-A3-A").await.iter().all(|e| e.session_id == "sess-A3-A"));
     }
 }

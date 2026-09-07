@@ -19,7 +19,7 @@
 |-----|------|-------|----------|-------|
 | A1  | Algo | `node_url` for incoming connections = `"incoming"` breaks FIB to incoming neighbor | 🟡 LOW* | `src/host/net/server.rs`, `src/host/net/forward.rs`, `src/host/net/net.rs` |
 | A2  | Algo | `PENDING_RESPONSES` / `RESPONSE_PAYLOADS` leak per `request_id` | 🟢 DONE | `src/plugin/engine.rs`, `src/messages/bus.rs`, `wit/plugin.wit`, `plugins/agent_plugin/src/handle_event.rs` |
-| A3  | Algo | `history_append` holds write-lock for the whole push (contention) | 🟡 LOW | `src/plugin/engine.rs` |
+| A3  | Algo | `history_append` holds write-lock for the whole push (contention) | 🟢 DONE | `src/plugin/engine.rs` |
 | A4  | Algo | WIT doc bug: `request-id`/`session-id` comments swapped | 🟢 DONE | `wit/plugin.wit` |
 | B1  | Sec  | Network auth missing: `token` never validated | 🔴 HIGH | `src/host/net/server.rs`, `src/host/net/outbound.rs`, `src/config/config.rs` |
 | B2  | Sec  | `PluginAccess::Network` not enforced in `post_json` | 🔴 HIGH | `src/plugin/engine.rs`, `src/plugin/config.rs`, `wit/plugin.wit` |
@@ -91,23 +91,23 @@ For a long-lived host under high request rate — monotonic growth of two HashMa
 
 ---
 
-## A3. `history_append` holds write-lock for the whole push
+## A3. 🟢 `history_append` holds write-lock for the whole push (IMPLEMENTED)
 
-**Problem.** `src/plugin/engine.rs:305` `history_append`:
+**Problem.** `src/plugin/engine.rs:350` `history_append`:
 ```rust
 let mut map = session_histories().write().await;   // exclusive lock
 let entries = map.entry(...).or_default();
 if entries.len() >= max_events { ... drain ... }
 entries.push(ev.clone());
 ```
-Whole push is under a `write()` on the global `RwLock<HashMap<String, Vec<Event>>>`. Agent history reads (`get_session_history` from WASM) are blocked. Under high event rate — throughput bottleneck for the bus.
+Whole push was under a `write()` on the global `RwLock<HashMap<String, Vec<Event>>>`. Agent history reads (`history_get`) and writes to *other* sessions were blocked. Under high event rate — throughput bottleneck for the bus.
 
-**Fix.**
-- Move to per-session structures (`DashMap<String, SessionHistory>` with a local `Mutex` on `Vec<Event>`, analogous to `SESSION_TOOLS`/`LOCAL_TOOLS`) so one session's write doesn't block others' read/write.
-- Or: snapshot under read-lock, modify locally, replace under a short write (as already done in `save_session_to_disk`).
+**Fix (implemented, 2026-09-07).** Replaced the global `RwLock<HashMap>` with `dashmap::DashMap<String, Vec<Event>>` (already a dependency, used by `DIRTY_SESSIONS`). `history_append` now uses `entry(sid).or_default()` which takes a shard lock for **one** session only; `history_get`/`save_session_to_disk` use `.get(sid)` (per-session lock). Writes to session A no longer block reads/writes to session B. Public function signatures unchanged.
 
-**Acceptance.**
-- Benchmark/test: concurrent `history_append` for N sessions does not block `history_get` (no deadlock + per-session order preserved).
+**Acceptance (tests).**
+- `a3_history_append_isolated_between_sessions`: parallel `history_append` to two different sessions (`tokio::join!`) — both complete, each gets exactly its 50 events; no deadlock, per-session isolation preserved.
+- (Prior) `history_append_marks_dirty_and_mtime` still green; `save_session_to_disk_writes_file` green.
+- Full suite: **138 passed, 0 warnings**.
 
 ---
 

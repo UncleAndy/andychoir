@@ -19,7 +19,7 @@
 |-----|--------|-----------|-----------|------------------|
 | A1  | Алгоритм | `node_url` для входящих соединений = `"incoming"` ломает FIB-маршрутизацию к входящему соседу | 🟡 LOW* | `src/host/net/server.rs`, `src/host/net/forward.rs`, `src/host/net/net.rs` |
 | A2  | Алгоритм | Утечка `PENDING_RESPONSES` / `RESPONSE_PAYLOADS` по `request_id` | 🟢 ГОТОВО | `src/plugin/engine.rs`, `src/messages/bus.rs`, `wit/plugin.wit`, `plugins/agent_plugin/src/handle_event.rs` |
-| A3  | Алгоритм | `history_append` держит write-lock на весь push (узкое место) | 🟡 LOW | `src/plugin/engine.rs` |
+| A3  | Алгоритм | `history_append` держит write-lock на весь push (узкое место) | 🟢 ГОТОВО | `src/plugin/engine.rs` |
 | A4  | Алгоритм | Док-баг в WIT: `request-id`/`session-id` перепутаны в комментариях | 🟢 ГОТОВО | `wit/plugin.wit` |
 | B1  | Безопасность | Сетевая аутентификация отсутствует: `token` не проверяется | 🔴 HIGH | `src/host/net/server.rs`, `src/host/net/outbound.rs`, `src/config/config.rs` |
 | B2  | Безопасность | `PluginAccess::Network` не проверяется в `post_json` | 🔴 HIGH | `src/plugin/engine.rs`, `src/plugin/config.rs`, `wit/plugin.wit` |
@@ -92,24 +92,24 @@ if let Some(url) = node_url_map.get(&next_hop) {       // next_hop = "incoming"
 
 ---
 
-## A3. `history_append` держит write-lock на весь push
+## A3. 🟢 `history_append` держит write-lock на весь push (РЕАЛИЗОВАНО)
 
 **Проблема.**
-`src/plugin/engine.rs:305` `history_append`:
+`src/plugin/engine.rs:350` `history_append`:
 ```rust
 let mut map = session_histories().write().await;   // эксклюзивный lock
 let entries = map.entry(...).or_default();
 if entries.len() >= max_events { ... drain ... }
 entries.push(ev.clone());
 ```
-Весь push идёт под `write()` на глобальном `RwLock<HashMap<String, Vec<Event>>>`. Чтение истории агентом (`get_session_history` из WASM) блокируется. При высокой частоте событий — узкое место пропускной способности шины.
+Весь push шёл под `write()` на глобальном `RwLock<HashMap<String, Vec<Event>>>`. Чтение истории (`history_get`) и запись в **другие** сессии блокировались. При высокой частоте событий — узкое место пропускной способности шины.
 
-**Решение.**
-- Вынесено как известное ограничение; для исправления — перейти на per-session структуры (`DashMap<String, SessionHistory>`) с локальным `Mutex` на `Vec<Event>` (аналогично `SESSION_TOOLS`/`LOCAL_TOOLS`), чтобы запись в одну сессию не блокировала чтение/запись других.
-- Либо: снимать snapshot под read-lock, модифицировать локально, заменять под кратким write (как уже сделано в `save_session_to_disk`).
+**Решение (реализовано, 2026-09-07).** Глобальный `RwLock<HashMap>` заменён на `dashmap::DashMap<String, Vec<Event>>` (уже есть в зависимостях, используется в `DIRTY_SESSIONS`). `history_append` теперь использует `entry(sid).or_default()`, который берёт шардированный лок только на **одну** сессию; `history_get`/`save_session_to_disk` используют `.get(sid)` (лок на сессию). Запись в сессию A больше не блокирует чтение/запись сессии B. Публичные сигнатуры функций не изменились.
 
-**Критерии приёмки.**
-- Бенчмарк/тест: concurrent `history_append` для N сессий не блокирует `history_get` (достаточно проверки отсутствия deadlock + сохранения порядка внутри сессии).
+**Критерии приёмки (тесты).**
+- `a3_history_append_isolated_between_sessions`: параллельный `history_append` в две разные сессии (`tokio::join!`) — обе завершаются, каждая получает ровно свои 50 событий; нет deadlock, изоляция по сессиям сохранена.
+- (Ранее) `history_append_marks_dirty_and_mtime` зелёный; `save_session_to_disk_writes_file` зелёный.
+- Полный прогон: **138 passed, 0 warnings**.
 
 ---
 
