@@ -16,6 +16,7 @@ pub(crate) mod discovery;
 pub(crate) mod server;
 pub(crate) mod outbound;
 pub(crate) mod forward;
+pub(crate) mod orchestrator;
 pub(crate) mod net;
 
 use crate::ai::host::types::Event;

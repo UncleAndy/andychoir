@@ -906,4 +906,42 @@ mod tests {
         let nb = inner.lsdb.read().await.get(&b).unwrap().0.clone();
         assert!(nb.is_empty(), "повторный flood с тем же seq не перезаписывает");
     }
+
+    // OP (Origin-Aware): инструмент на узле-источнике (Tier 1) имеет приоритет.
+    #[tokio::test]
+    async fn resolve_tool_target_prefers_source() {
+        let inner = NetInner::new_test();
+        let a = "00000000-0000-0000-0000-0000000000a1".to_string();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        // Сессия пришла от A.
+        inner.session_origin.write().await.insert("sess-x".into(), a.clone());
+        // И калькулятор есть и у A (источник), и у B (другой узел).
+        inner.origin_tools.write().await.insert(a.clone(), vec![ToolDef { name: "calculator".into(), description: "".into(), parameters_json: "{}".into() }]);
+        inner.origin_tools.write().await.insert(b.clone(), vec![ToolDef { name: "calculator".into(), description: "".into(), parameters_json: "{}".into() }]);
+        let resolved = crate::host::net::orchestrator::resolve_tool_target(&inner, "sess-x", "calculator").await;
+        assert_eq!(resolved, Some(format!("host:{}:tool:calculator", a)), "Tier 1: инструмент источника");
+    }
+
+    // OP (Origin-Aware): если у источника нет инструмента, выбирается другой узел сети (Tier 3).
+    #[tokio::test]
+    async fn resolve_tool_target_falls_back_to_mesh() {
+        let inner = NetInner::new_test();
+        let a = "00000000-0000-0000-0000-0000000000a1".to_string();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        inner.session_origin.write().await.insert("sess-x".into(), a.clone());
+        // У источника A инструмента нет; у B — есть.
+        inner.origin_tools.write().await.insert(b.clone(), vec![ToolDef { name: "calculator".into(), description: "".into(), parameters_json: "{}".into() }]);
+        let resolved = crate::host::net::orchestrator::resolve_tool_target(&inner, "sess-x", "calculator").await;
+        assert_eq!(resolved, Some(format!("host:{}:tool:calculator", b)), "Tier 3: инструмент другого узла");
+    }
+
+    // OP (Origin-Aware): инструмент вообще нигде в сети не найден → None.
+    #[tokio::test]
+    async fn resolve_tool_target_none_when_absent() {
+        let inner = NetInner::new_test();
+        let a = "00000000-0000-0000-0000-0000000000a1".to_string();
+        inner.session_origin.write().await.insert("sess-x".into(), a.clone());
+        let resolved = crate::host::net::orchestrator::resolve_tool_target(&inner, "sess-x", "calculator").await;
+        assert!(resolved.is_none(), "инструмент не найден в сети → None");
+    }
 }

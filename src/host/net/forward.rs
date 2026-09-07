@@ -34,7 +34,20 @@ pub(crate) async fn forward_inner(inner: &Arc<NetInner>, ev: &Event) -> bool {
             .or_else(|| s.get(&ev.session_id).cloned())
     };
 
-    let target = ev.target.clone();
+    let mut target = ev.target.clone();
+
+    // --- Приоритезация инструментов (Origin-Aware, docs/tool-prioritization) ---
+    // Агент просит инструмент по имени (`tool:<name>`). Хост разрешает его в
+    // сетевой target `host:<node_id>:tool:<name>`, выбирая узел-источник
+    // (приоритет 1) или другой узел сети (приоритет 3). Локальный приоритет
+    // (Tier 2) уже обработан шиной до вызова forward. Явный `host:<node>:...`
+    // таргет НЕ переопределяем (агент сам выбрал конкретный узел).
+    if let Some(tool_name) = target.strip_prefix("tool:") {
+        if let Some(resolved) = super::orchestrator::resolve_tool_target(inner, &ev.session_id, tool_name).await {
+            info!("[Хост] Net: инструмент '{}' разрешён в {} (приоритет источника/сети)", tool_name, resolved);
+            target = resolved;
+        }
+    }
 
     // --- P5.1: маршрутизация через FIB по целевому узлу ---
     // Формат target: `host:<node_id>:<tool>` (см. NET-concept.md §6).
