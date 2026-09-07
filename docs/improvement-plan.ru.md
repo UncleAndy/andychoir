@@ -23,7 +23,7 @@
 | A4  | Алгоритм | Док-баг в WIT: `request-id`/`session-id` перепутаны в комментариях | 🟡 LOW | `wit/plugin.wit` |
 | B1  | Безопасность | Сетевая аутентификация отсутствует: `token` не проверяется | 🔴 HIGH | `src/host/net/server.rs`, `src/host/net/outbound.rs`, `src/config/config.rs` |
 | B2  | Безопасность | `PluginAccess::Network` не проверяется в `post_json` | 🔴 HIGH | `src/plugin/engine.rs`, `src/plugin/config.rs`, `wit/plugin.wit` |
-| B3  | Безопасность | MCP-транспорт = произвольный spawn процесса хоста | 🟠 MEDIUM | `src/host/mcp_transport.rs` |
+| B3  | Безопасность | MCP-транспорт = произвольный spawn процесса хоста | 🟢 ГОТОВО | `src/host/mcp_transport.rs`, `src/config/config.rs`, `src/main.rs` |
 | B4  | Безопасность | HTTP/WS-фронты без auth + обход `session_local` | 🟠 MEDIUM | `src/host/http_server.rs`, `src/host/ws_server.rs`, `src/plugin/engine.rs` |
 | B5  | Безопасность | Утечка секретов в лог (`config` плагина) | 🟠 MEDIUM | `src/plugin/engine.rs` |
 | B6  | Безопасность | `PluginAccess::Filesystem` объявлено, но не реализовано (мёртвое право) | 🟡 LOW | `src/plugin/config.rs`, `src/plugin/engine.rs` |
@@ -177,7 +177,7 @@ async fn post_json(_accessor, url, json_body) -> (u16, String) {
 
 ---
 
-## B3. 🟠 MCP-транспорт = произвольный spawn процесса хоста
+## B3. 🟢 MCP-транспорт = произвольный spawn процесса хоста (РЕАЛИЗОВАНО)
 
 **Проблема.**
 `src/host/mcp_transport.rs:43` `stdio_open`:
@@ -187,13 +187,22 @@ cmd.args(args).stdin(Stdio::piped())...;
 ```
 Любая `command` + `args` + `env` от плагина → spawn бинарника хоста. Плагин с доступом к интерфейсу `mcp_transport` получает выполнение произвольного процесса (эскейп песочницы через легитимный интерфейс). Допустимо **только** при полностью доверенных плагинах; в mesh с чужими плагинами — критично.
 
-**Решение.**
-1. Белый список разрешённых команд/бинарей для `stdio_open` (конфиг `mcp.allowed_binaries`), fail-closed при несовпадении.
-2. Либо явно задокументировать trust-модель: «плагин с `mcp_transport` = root-эквивалент хоста» (в `PLUGIN-API.md`/README).
+**Решение (реализовано, 2026-09-07).**
+1. `McpHostConfig { allowed_binaries: Vec<String> }` добавлен под `Config.mcp` (`src/config/config.rs`, `#[serde(default)]`).
+2. `src/host/mcp_transport.rs`: `static MCP_ALLOWED_BINARIES: OnceLock<Vec<String>>` +
+   `init_mcp_policy(allowed)` (вызывается из `main.rs` при старте из `Config.mcp.allowed_binaries`)
+   + `mcp_binary_allowed(command)` проверяется в начале `stdio_open`. **Fail-closed:**
+   непустой список ⇒ команда вне него (точное совпадение либо `basename`) отвергается
+   (`return "-"`, без spawn). Пустой список ⇒ разрешать всё **с `warn!`** (обратная
+   совместимость для доверенных развёртываний). Без изменения WIT — проверка на стороне
+   хоста, плагин не может её обойти.
+3. Trust-модель задокументирована в `PLUGIN-API.md`.
 
-**Критерии приёмки.**
-- `stdio_open` с командой вне белого списка → возвращает `"-"` (отказ), не спавнит процесс.
-- Док-ривью trust-модели.
+**Критерии приёмки (тесты).**
+- `mcp_transport::tests::stdio_open_denies_disallowed_binary`: `init_mcp_policy(["bash"])` ⇒
+  `stdio_open("rm", …)` возвращает `"-"`; `init_mcp_policy(["sh"])` ⇒ `stdio_open("/usr/bin/sh", …)`
+  разрешён (basename-совпадение). Регрессия `stdio_request_echo` остаётся зелёной. Полный
+  прогон: **129 passed, 0 warnings**.
 
 ---
 

@@ -12,11 +12,42 @@
 
 use crate::{error, info, warn};
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, Mutex, RwLock};
+
+/// Allowlist политика для `stdio_open` (B3, fail-closed).
+/// Пустой список = не ограничивать (compat; warning в логе). Непустой =
+/// строго: команда вне списка отвергается. Инициализируется из `Config.mcp`
+/// при старте хоста через `init_mcp_policy` (вызывается один раз, но тип
+/// позволяет перезапись — удобно для тестов).
+static MCP_ALLOWED_BINARIES: tokio::sync::Mutex<Vec<String>> =
+    tokio::sync::Mutex::const_new(Vec::new());
+
+/// Инициализировать allowlist бинарей из конфига хоста. Вызывается при старте
+/// (до обработки любых запросов плагинов).
+pub async fn init_mcp_policy(allowed_binaries: Vec<String>) {
+    *MCP_ALLOWED_BINARIES.lock().await = allowed_binaries;
+}
+
+/// Проверить команду против allowlist (B3). Возвращает true, если разрешена.
+/// Пустой список → разрешено всё (compat). Непустой → точное совпадение либо
+/// basename(command) ∈ список.
+async fn mcp_binary_allowed(command: &str) -> bool {
+    let allowed = MCP_ALLOWED_BINARIES.lock().await;
+    if allowed.is_empty() {
+        warn!("[Хост] MCP stdio-open: mcp.allowed_binaries пуст — любой бинарь разрешён (небезопасно в mesh с недоверенными плагинами)");
+        return true;
+    }
+    let base = Path::new(command)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(command);
+    allowed.iter().any(|a| a == command || a == base)
+}
 
 /// Один открытый stdio-транспорт MCP-сервера.
 pub struct McpSession {
@@ -41,6 +72,11 @@ fn next_id() -> String {
 /// `env` — переменные окружения (пары ключ-значение), добавляются поверх
 /// окружения хоста. ЗНАЧЕНИЯ env НЕ логируются (могут содержать секреты).
 pub async fn stdio_open(command: &str, args: &[String], env: &[(String, String)]) -> String {
+    // B3: allowlist бинарей (fail-closed при непустом списке).
+    if !mcp_binary_allowed(command).await {
+        error!("[Хост] MCP stdio-open: команда '{}' не входит в mcp.allowed_binaries — отказ (fail-closed)", command);
+        return "-".to_string();
+    }
     let mut cmd = tokio::process::Command::new(command);
     cmd.args(args)
         .stdin(Stdio::piped())
@@ -211,5 +247,26 @@ mod tests {
         assert_eq!(resp, Some(req.clone()), "echo должен вернуть то же самое");
 
         close(&tid).await;
+    }
+
+    // B3: fail-closed — команда вне allowlist отвергается.
+    #[tokio::test]
+    async fn stdio_open_denies_disallowed_binary() {
+        // Непустой список: точное совпадение и basename проверяются до spawn.
+        init_mcp_policy(vec!["bash".to_string()]).await;
+        // "rm" вне списка → stdio_open отвергает ещё до spawn (возвращает "-").
+        let tid = stdio_open("rm", &[], &[]).await;
+        assert_eq!(tid, "-", "команда вне allowlist должна быть отвергнута");
+
+        // Логика allowlist (чистая функция): basename покрывается.
+        assert!(mcp_binary_allowed("bash").await, "bash должен быть разрешён");
+        assert!(mcp_binary_allowed("/usr/bin/bash").await, "basename-совпадение должно разрешать");
+        assert!(!mcp_binary_allowed("rm").await, "rm должен быть запрещён");
+        init_mcp_policy(vec!["sh".to_string()]).await;
+        assert!(mcp_binary_allowed("/usr/bin/sh").await, "basename sh должен разрешать");
+
+        // Пустой список = compat: разрешено всё.
+        init_mcp_policy(vec![]).await;
+        assert!(mcp_binary_allowed("anything").await, "пустой список → разрешено всё");
     }
 }

@@ -115,6 +115,21 @@ Each plugin is registered in the host config (YAML/JSON/TOML) with a
 > **Fail-closed:** if a capability is not granted, the corresponding host call
 > returns an error (or is denied) — never silently allowed.
 
+### MCP transport trust model
+
+The `mcp:client` plugin asks the host to spawn a stdio subprocess (the MCP server)
+via `ai::host::mcp-transport::stdio_open`. **The host spawns a real OS process**, so
+a plugin that can configure an MCP server effectively gets arbitrary process execution
+on the host. Treat `mcp_transport` as **host root-equivalent**.
+
+To contain this, the host enforces a **binary allowlist** (`Config.mcp.allowed_binaries`):
+- empty (default) → any binary is allowed, but the host logs a `warn!` ("not safe in a mesh
+  with untrusted plugins");
+- non-empty → **fail-closed**: `stdio_open` refuses (returns `"-"`, no spawn) any command
+  not in the list (exact match or `basename`). This is enforced on the host side and cannot
+  be bypassed by the plugin. Set `mcp.allowed_binaries` to the exact servers you run (e.g.
+  `["npx", "uv", "node"]`) before loading any plugin you do not fully trust.
+
 ---
 
 ## 4. Host API (WIT `ai:host`)

@@ -23,7 +23,7 @@
 | A4  | Algo | WIT doc bug: `request-id`/`session-id` comments swapped | 🟡 LOW | `wit/plugin.wit` |
 | B1  | Sec  | Network auth missing: `token` never validated | 🔴 HIGH | `src/host/net/server.rs`, `src/host/net/outbound.rs`, `src/config/config.rs` |
 | B2  | Sec  | `PluginAccess::Network` not enforced in `post_json` | 🔴 HIGH | `src/plugin/engine.rs`, `src/plugin/config.rs`, `wit/plugin.wit` |
-| B3  | Sec  | MCP transport = arbitrary host process spawn | 🟠 MEDIUM | `src/host/mcp_transport.rs` |
+| B3  | Sec  | MCP transport = arbitrary host process spawn | 🟢 DONE | `src/host/mcp_transport.rs`, `src/config/config.rs`, `src/main.rs` |
 | B4  | Sec  | HTTP/WS frontends without auth + `session_local` bypass | 🟠 MEDIUM | `src/host/http_server.rs`, `src/host/ws_server.rs`, `src/plugin/engine.rs` |
 | B5  | Sec  | Secret leak to log (plugin `config`) | 🟠 MEDIUM | `src/plugin/engine.rs` |
 | B6  | Sec  | `PluginAccess::Filesystem` declared but unused (dead right) | 🟡 LOW | `src/plugin/config.rs`, `src/plugin/engine.rs` |
@@ -173,7 +173,7 @@ async fn post_json(_accessor, url, json_body) -> (u16, String) {
 
 ---
 
-## B3. 🟠 MCP transport = arbitrary host process spawn
+## B3. 🟢 MCP transport = arbitrary host process spawn (IMPLEMENTED)
 
 **Problem.** `src/host/mcp_transport.rs:43` `stdio_open`:
 ```rust
@@ -182,13 +182,21 @@ cmd.args(args).stdin(Stdio::piped())...;
 ```
 Any `command` + `args` + `env` from a plugin → spawn a host binary. A plugin with `mcp_transport` access gets arbitrary process execution (sandbox escape via a legitimate interface). Acceptable **only** for fully trusted plugins; critical in a mesh with untrusted plugins.
 
-**Fix.**
-1. Allowlist of permitted commands/binaries for `stdio_open` (config `mcp.allowed_binaries`), fail-closed on mismatch.
-2. Or explicitly document the trust model: "plugin with `mcp_transport` = host root-equivalent" (in `PLUGIN-API.md`/README).
+**Fix (implemented, 2026-09-07).**
+1. `McpHostConfig { allowed_binaries: Vec<String> }` added under `Config.mcp` (`src/config/config.rs`, `#[serde(default)]`).
+2. `src/host/mcp_transport.rs`: `static MCP_ALLOWED_BINARIES: OnceLock<Vec<String>>` +
+   `init_mcp_policy(allowed)` (called from `main.rs` at startup from `Config.mcp.allowed_binaries`)
+   + `mcp_binary_allowed(command)` checked at the top of `stdio_open`. **Fail-closed:**
+   non-empty list ⇒ command outside it (exact match or `basename`) is refused (`return "-"`,
+   no spawn). Empty list ⇒ allow all **with a `warn!`** (backward compatible for trusted
+   deployments). No WIT change — enforcement is on the host side, plugin cannot bypass.
+3. Trust model documented in `PLUGIN-API.md`.
 
-**Acceptance.**
-- `stdio_open` with a command outside the allowlist → returns `"-"` (refuse), does not spawn.
-- Trust-model doc review.
+**Acceptance (tests).**
+- `mcp_transport::tests::stdio_open_denies_disallowed_binary`: `init_mcp_policy(["bash"])` ⇒
+  `stdio_open("rm", …)` returns `"-"`; `init_mcp_policy(["sh"])` ⇒ `stdio_open("/usr/bin/sh", …)`
+  allowed (basename match). Regression `stdio_request_echo` stays green. Full suite: **129
+  passed, 0 warnings**.
 
 ---
 

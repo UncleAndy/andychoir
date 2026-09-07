@@ -32,7 +32,9 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
 
     let config = AppConfig::new_from_file(args.config).await?;
 
-    // Инициализация логов
+    // B3: инициализировать allowlist бинарей для MCP-транспорта (fail-closed
+    // при непустом списке). Вызывается до старта плагинов/обработки запросов.
+    andychoir::host::mcp_transport::init_mcp_policy(config.mcp.allowed_binaries.clone()).await;
     let log_res = host::log::init_log(
         &config.logger
     );

@@ -33,6 +33,23 @@ pub struct Config {
     pub startup: StartupConfig,
     #[serde(default)]
     pub history: HistoryConfig,
+    /// Конфигурация MCP-транспорта хоста (allowlist бинарей для stdio-подпроцессов).
+    /// `#[serde(default)]` — пустой список = разрешать любой бинарь (compat, warning).
+    #[serde(default)]
+    pub mcp: McpHostConfig,
+}
+
+/// Конфигурация MCP-транспорта хоста (см. `src/host/mcp_transport.rs`, B3).
+/// Защита от того, что плагин `mcp:client` (возможно недоверенный, в mesh)
+/// заставит хост спавнить произвольный процесс (эскейп песочницы).
+#[derive(Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct McpHostConfig {
+    /// Белый список разрешённых команд/бинарей для `stdio_open`.
+    /// Пустой = не ограничивать (обратная совместимость; warning в логе).
+    /// Непустой = fail-closed: команда вне списка отвергается (`stdio_open` → "-").
+    /// Сравнение: точное совпадение ИЛИ basename(command) ∈ список.
+    pub allowed_binaries: Vec<String>,
 }
 
 /// Параметры старта (готовность плагинов).
