@@ -18,6 +18,38 @@ use crate::config::config::NetConfig;
 
 /// Запустить сетевой мост: входящий WS-сервер + исходящие соединения к remotes.
 pub async fn start_net(tx: mpsc::Sender<Event>, cfg: NetConfig) -> super::NetHandle {
+    // mTLS (B1+): при включении — убедиться, что TLS-материалы присутствуют.
+    // При первом старте (файлов нет) CA + сертификат ноды генерируются
+    // автоматически. Fail-fast при ошибке (сеть не поднимается в полузашифрованном виде).
+    if cfg.mtls.enabled {
+        if let Err(e) = super::tls::ensure_certificates(&cfg.mtls, &cfg.node_id) {
+            error!("[Хост] Net: не удалось подготовить mTLS-сертификаты: {:#}", e);
+            // Не поднимаем сеть без шифрования, если mTLS явно включён.
+            return super::NetHandle {
+                server: tokio::spawn(async {}),
+                outbound: Vec::new(),
+                inner: Arc::new(NetInner {
+                    tx,
+                    cfg: cfg.clone(),
+                    session_origin: Arc::new(RwLock::new(HashMap::new())),
+                    request_origin: Arc::new(RwLock::new(HashMap::new())),
+                    outbound: Arc::new(RwLock::new(HashMap::new())),
+                    pending_outbound: Arc::new(RwLock::new(HashMap::new())),
+                    origin_tools: Arc::new(RwLock::new(HashMap::new())),
+                    incoming_senders: Arc::new(RwLock::new(HashMap::new())),
+                    dedup: Arc::new(RwLock::new(
+                        BloomFilter::with_num_bits(super::dedup::DEDUP_BITS).expected_items(1024),
+                    )),
+                    dedup_last_reset: Arc::new(RwLock::new(super::dedup::current_unix_secs())),
+                    lsdb: Arc::new(RwLock::new(HashMap::new())),
+                    hello_seq: Arc::new(RwLock::new(HashMap::new())),
+                    fib: Arc::new(RwLock::new(HashMap::new())),
+                    node_url: Arc::new(RwLock::new(HashMap::new())),
+                }),
+            };
+        }
+    }
+
     let inner = Arc::new(NetInner {
         tx,
         cfg: cfg.clone(),
@@ -146,8 +178,8 @@ mod tests {
     #[test]
     fn remote_matching() {
         let remotes = vec![
-            NetRemote { url: "ws://b".into(), token: "".into(), targets: vec!["tool:calculator".into()], retry_interval_secs: 0, connect_timeout_secs: 0 },
-            NetRemote { url: "ws://c".into(), token: "".into(), targets: vec!["tool:file".into()], retry_interval_secs: 0, connect_timeout_secs: 0 },
+            NetRemote { url: "ws://b".into(), token: "".into(), targets: vec!["tool:calculator".into()], retry_interval_secs: 0, connect_timeout_secs: 0, mtls: Default::default() },
+            NetRemote { url: "ws://c".into(), token: "".into(), targets: vec!["tool:file".into()], retry_interval_secs: 0, connect_timeout_secs: 0, mtls: Default::default() },
         ];
         // tool:calculator -> хост b
         let r = remotes.iter().find(|r| r.targets.iter().any(|t| {
@@ -541,6 +573,7 @@ mod tests {
                 targets: vec!["tool:pinned".into()],
                 retry_interval_secs: 0,
                 connect_timeout_secs: 0,
+                mtls: Default::default(),
             });
             c
         };

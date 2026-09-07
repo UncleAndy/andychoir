@@ -202,6 +202,33 @@ fn default_save_period_secs() -> u64 {
 }
 
 /// Настройки сетевого моста между экземплярами andychour.
+/// Настройки mTLS для межнодового соединения (внутренний приватный CA системы).
+/// Сертификаты лежат на диске; при первом старте (если файлов нет) CA и
+/// сертификат ноды генерируются автоматически (см. host/net/tls.rs).
+#[derive(Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct MtlsConfig {
+    /// Включить mTLS. false/None → plain ws (обратная совместимость).
+    pub enabled: bool,
+    /// Каталог для хранения сгенерированных/заданных TLS-файлов (CA, cert, key).
+    /// При генерации файлы пишутся сюда: `<dir>/ca.pem`, `<dir>/node.pem`,
+    /// `<dir>/node.key`. Можно задать готовые файлы по явным путям ниже
+    /// (тогда dir игнорируется для загрузки, но используется для генерации).
+    pub dir: String,
+    /// Путь к внутреннему CA (PEM, root cert), которому доверяем.
+    /// Пусто → `<dir>/ca.pem`.
+    pub ca_cert: String,
+    /// Путь к сертификату ЭТОЙ ноды (PEM, выпущен внутренним CA).
+    /// Пусто → `<dir>/node.pem`.
+    pub cert: String,
+    /// Путь к приватному ключу ЭТОЙ ноды (PEM).
+    /// Пусто → `<dir>/node.key`.
+    pub key: String,
+    /// Строго требовать, чтобы SAN/subject сертификата партнёра == его node_id.
+    /// false → достаточно «сертификат от нашего CA».
+    pub require_node_id_in_san: bool,
+}
+
 #[derive(Deserialize, Default, Clone)]
 #[serde(default)]
 pub struct NetConfig {
@@ -221,6 +248,8 @@ pub struct NetConfig {
     /// Окно попыток подключения (секунды). После его истечения remote
     /// считается недоступным и задача завершается. 0 → бесконечные попытки.
     pub connect_timeout_secs: u64,
+    /// Настройки mTLS (внутренний CA системы). Отключён по умолчанию.
+    pub mtls: MtlsConfig,
 }
 
 /// Значение по умолчанию для интервала retry (если 0 в конфиге).
@@ -242,6 +271,30 @@ pub struct NetRemote {
     pub retry_interval_secs: u64,
     /// Окно подключения для этого remote (секунды). 0 → из NetConfig.connect_timeout_secs.
     pub connect_timeout_secs: u64,
+    /// Настройки mTLS для этого remote (переопределяют NetConfig.mtls, если заданы).
+    /// Пусто/disabled → берётся NetConfig.mtls.
+    pub mtls: MtlsConfig,
+}
+
+impl NetRemote {
+    /// Извлечь hostname из URL (напр. "wss://host-b:8092/net" → "host-b").
+    /// Для mesh договоримся: hostname == node_id удалённого узла.
+    pub fn url_host(&self) -> Option<String> {
+        // Схема://host[:port]/path
+        let after = self.url.split("://").nth(1)?;
+        let authority = after.split(['/', '?']).next().unwrap_or(after);
+        let host = authority.split(':').next().unwrap_or(authority);
+        if host.is_empty() {
+            None
+        } else {
+            Some(host.to_string())
+        }
+    }
+
+    /// node_id удалённого узла по договору == hostname из URL.
+    pub fn url_host_node_id(&self) -> String {
+        self.url_host().unwrap_or_default()
+    }
 }
 
 impl Default for NetRemote {
@@ -252,6 +305,7 @@ impl Default for NetRemote {
             targets: Vec::new(),
             retry_interval_secs: 0,
             connect_timeout_secs: 0,
+            mtls: MtlsConfig::default(),
         }
     }
 }
@@ -293,8 +347,11 @@ mod tests {
     use std::io::Write;
 
     /// Записать конфиг во временный файл и загрузить через new_from_file.
+    /// Использует каталог `tmp/` в корне проекта (CARGO_MANIFEST_DIR), чтобы не
+    /// засорять системный /tmp и корень проекта при запуске в nix-shell.
     async fn load_temp(ext: &str, body: &str) -> Config {
-        let dir = std::env::temp_dir();
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tmp");
+        let _ = std::fs::create_dir_all(&dir);
         let path = dir.join(format!("andychoir-test-{}.{}", uuid::Uuid::new_v4(), ext));
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(body.as_bytes()).unwrap();

@@ -27,7 +27,14 @@ tokio = { version = "1.52", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }
 uuid = { version = "1", features = ["v4"] }
 axum = { version = "0.7", features = ["ws"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = { version = "0.24", features = ["__rustls-tls"] }
+# mTLS (B1+): внутренний приватный CA системы для межнодового соединения.
+# pure-rust (rustls), без openssl — собирается в NixOS-flake окружении.
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+# Генерация внутреннего CA + node-сертификатов при первом старте.
+rcgen = "0.13"
 futures-util = "0.3"
 termimad = "0.31"
 # P2: Bloom filter для дедупликации сетевых событий (фиксированный размер, SIMD).

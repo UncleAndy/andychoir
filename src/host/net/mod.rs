@@ -18,13 +18,13 @@ pub(crate) mod outbound;
 pub(crate) mod forward;
 pub(crate) mod orchestrator;
 pub(crate) mod net;
+pub(crate) mod tls;
 
 use crate::ai::host::types::Event;
 use crate::config::config::NetConfig;
 use crate::error;
 use crate::info;
 use crate::warn;
-use axum::extract::ws::WebSocketUpgrade;
 use fastbloom::BloomFilter;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;

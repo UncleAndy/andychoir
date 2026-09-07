@@ -4,8 +4,28 @@ use super::*;
 use super::dedup::check_dedup;
 use super::discovery::handle_hello;
 use super::message::{pack_capabilities, unpack_message, value_to_event, NetMessage};
-use crate::config::config::{DEFAULT_CONNECT_RETRY_INTERVAL_SECS, DEFAULT_CONNECT_TIMEOUT_SECS, NetRemote};
+use crate::config::config::{DEFAULT_CONNECT_RETRY_INTERVAL_SECS, DEFAULT_CONNECT_TIMEOUT_SECS, MtlsConfig, NetRemote};
 use tokio_tungstenite;
+use rustls::ClientConfig;
+use tokio_tungstenite::Connector;
+
+/// Разрешить mTLS-конфиг для исходящего соединения: приоритет — `remote.mtls`,
+/// затем `inner.cfg.mtls`. Возвращает Some(client_cfg), если mTLS включён.
+fn resolve_outbound_mtls(remote: &NetRemote, cfg: &MtlsConfig) -> Option<Arc<ClientConfig>> {
+    let m = if remote.mtls.enabled { &remote.mtls } else { cfg };
+    if !m.enabled {
+        return None;
+    }
+    // expected node_id сервера = hostname из URL (договор: wss://<node_id>:port/net).
+    let expected = remote.url_host();
+    match super::tls::load_client_config(m, expected.as_deref()) {
+        Ok(c) => Some(std::sync::Arc::new(c)),
+        Err(e) => {
+            error!("[Хост] Net: не удалось загрузить mTLS-клиент для {}: {:#}", remote.url, e);
+            None
+        }
+    }
+}
 
 /// Исходящее персистентное соединение к одному remote (с автопереподключением).
 ///
@@ -48,9 +68,26 @@ pub(crate) async fn run_outbound_loop(inner: Arc<NetInner>, remote: NetRemote) {
             }
         }
         // Пытаемся подключиться.
-        match tokio_tungstenite::connect_async(&remote.url).await {
+        let client_cfg = resolve_outbound_mtls(&remote, &inner.cfg.mtls);
+        let connect_result = match &client_cfg {
+            Some(cc) => {
+                // mTLS: подключаемся по wss:// с нашим клиентским сертификатом.
+                tokio_tungstenite::connect_async_tls_with_config(
+                    &remote.url,
+                    None,
+                    false,
+                    Some(Connector::Rustls(cc.clone())),
+                )
+                .await
+            }
+            None => {
+                // Plain ws (обратная совместимость).
+                tokio_tungstenite::connect_async(&remote.url).await
+            }
+        };
+        match connect_result {
             Ok((ws, _resp)) => {
-                info!("[Хост] Net: подключились к {}", remote.url);
+                info!("[Хост] Net: подключились к {} ({})", remote.url, if client_cfg.is_some() { "mTLS" } else { "plain" });
                 // Канал для отправки обёрток в это соединение.
                 let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
                 inner
