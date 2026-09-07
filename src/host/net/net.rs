@@ -1132,4 +1132,31 @@ mod tests {
         assert!(rx_a.try_recv().is_err(), "ничего не ушло в канал A");
         crate::plugin::engine::local_tools().write().await.remove("calculator");
     }
+
+    // A1: асимметричная mesh-связь — сосед пришёл к нам (входящий), у него нет
+    // исходящего url. FIB строит к нему маршрут, но node_url НЕ содержит
+    // фиктивный "incoming" (после A1-fix). Событие, адресованное ему, должно
+    // уйти обратно по уже открытому входящему каналу (incoming_senders), а НЕ
+    // буферизироваться в pending_outbound["incoming"] (старый баг).
+    #[tokio::test]
+    async fn a1_incoming_neighbor_routes_via_incoming_senders() {
+        let inner = NetInner::new_test();
+        let b = "00000000-0000-0000-0000-0000000000b2".to_string();
+        // B — входящий сосед: в FIB через Hello, но node_url пуст (нет исходящего).
+        super::discovery::handle_hello(&inner, b.clone(), vec![inner.cfg.node_id.clone()], vec![], 0).await;
+        // Ключ A1: node_url[B] пуст для входящего (заглушка "incoming" удалена).
+        assert!(inner.node_url.read().await.get(&b).is_none(), "node_url[B] пуст для входящего");
+        // Открытый входящий канал к B.
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        inner.incoming_senders.write().await.insert(b.clone(), tx);
+
+        let ev = make_event("host:00000000-0000-0000-0000-0000000000b2:tool:x", "sess-x");
+        let sent = forward_inner(&inner, &ev).await;
+        assert!(sent, "событие для входящего соседа должно уйти");
+        // Ушло именно во входящий канал B.
+        let _ = rx.try_recv().expect("сообщение ушло в incoming_senders[B]");
+        // И НЕ попало в pending_outbound (старый баг с "incoming").
+        let pending = inner.pending_outbound.read().await;
+        assert!(pending.get("incoming").is_none(), "не буферизируется в pending_outbound[\"incoming\"]");
+    }
 }

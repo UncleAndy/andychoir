@@ -66,6 +66,22 @@ pub(crate) async fn forward_inner(inner: &Arc<NetInner>, ev: &Event) -> bool {
         // Извлекаем <node_id> (до следующего ':').
         let target_node = node_id.split(':').next().unwrap_or(node_id);
         if let Some(next_hop) = route_next_hop(inner, target_node).await {
+            // A1 FIX: если next_hop — входящий сосед (он сам пришёл к нам), шлём
+            // обратно по уже открытому входящему каналу, а НЕ пытаемся dial-ить
+            // исходящий url (которого нет). Без этого FIB брал бы фиктивный
+            // node_url=="incoming" и буферизировал событие в pending_outbound["incoming"].
+            {
+                let incoming = inner.incoming_senders.read().await;
+                if let Some(tx) = incoming.get(&next_hop) {
+                    let origin = origin_host.clone().unwrap_or_else(|| inner.cfg.node_id.clone());
+                    let ttl = decrement_ttl(16).unwrap_or(0);
+                    let payload = pack_event_with_ttl(&origin, 0, ev, ttl);
+                    if tx.try_send(payload).is_ok() {
+                        info!("[Хост] Net: событие {} → входящий узел {} (next-hop {}) по открытому каналу", ev.target, target_node, next_hop);
+                        return true;
+                    }
+                }
+            }
             // next_hop -> url исходящего соединения (P4: node_url мапа).
             let node_url_map = inner.node_url.read().await;
             if let Some(url) = node_url_map.get(&next_hop) {

@@ -198,7 +198,11 @@ async fn process_netmsg(
             }
             info!("[Хост] Net: получены возможности хоста {}: {:?} инструментов", origin, tools.len());
             inner.origin_tools.write().await.insert(origin.clone(), tools);
-            inner.node_url.write().await.insert(origin.clone(), "incoming".to_string());
+            // A1 FIX: для входящего соседа НЕ пишем фиктивный "incoming" в node_url.
+            // node_url используется FIB как «куда слать исходящее»; запись "incoming"
+            // ломала маршрутизацию к входящему соседу (forward.rs брал "incoming" как
+            // url и буферизировал событие в pending_outbound["incoming"], теряя его).
+            // Маршрутизация к входящему соседу идёт через incoming_senders (ниже).
             inner.incoming_senders.write().await.insert(origin.clone(), out_tx.clone());
             *this_origin = Some(origin);
             // Отвечаем своими возможностями.

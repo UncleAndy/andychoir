@@ -38,7 +38,7 @@
 
 # Part A. Algorithmic / logical defects
 
-## A1. `node_url` for incoming connections = `"incoming"` breaks FIB to incoming neighbor
+## A1. 🟢 `node_url` for incoming connections = `"incoming"` breaks FIB to incoming neighbor (IMPLEMENTED)
 
 **Problem.** In `src/host/net/server.rs:73`, when registering a node connected via an *incoming* WS, the code writes:
 ```rust
@@ -61,9 +61,13 @@ Consequence: for a node known *only* as an incoming connection (asymmetric link:
 2. Minimal: in `server.rs` `handle_incoming`, register `node_url[origin] = "<incoming>:<peer-addr>"` (or add `incoming_return_path: Arc<RwLock<HashMap<String, mpsc::Sender<String>>>>`), and in `forward.rs` P5.1 check `incoming_senders.get(&next_hop)` first (as already done in P5.2), then `outbound`.
 3. Clean variant: `forward_inner` after `route_next_hop` tries `incoming_senders → outbound` uniformly for any `next_hop`, not relying on the string `"incoming"` in `node_url`.
 
+**Fix (implemented, 2026-09-07).**
+- Removed the bogus `node_url[origin] = "incoming"` write in `server.rs` `handle_incoming` (Capabilities handler). The incoming neighbor is still registered in `incoming_senders` and exposed to discovery via `incoming_senders` (so `pack_hello` keeps listing it as a direct link — no topology regression).
+- In `forward.rs` P5.1, after `route_next_hop` we now check `incoming_senders.get(&next_hop)` **first**; if present, the event is delivered back over the already-open incoming channel and returns `true`. Only then falls through to the `node_url`/outbound path. This makes asymmetric (incoming-only) neighbors routable via mesh, not just as reply-to-origin.
+
 **Acceptance (tests).**
-- New unit test `p5_forward_to_incoming_neighbor`: build a topology where `next_hop` is known *only* as an incoming connection (registered via `incoming_senders`, `node_url` has no real url), assert `forward_inner` delivers to `incoming_senders[next_hop]`.
-- Existing FIB tests stay green.
+- New unit test `a1_incoming_neighbor_routes_via_incoming_senders`: topology where `next_hop` is known only as incoming (`incoming_senders` registered, `node_url` has no real url, and explicitly no `"incoming"` stub) → `forward_inner` delivers to `incoming_senders[next_hop]` and does **not** buffer into `pending_outbound["incoming"]`.
+- Existing FIB tests stay green. Full suite: **134 passed, 0 warnings**.
 
 ---
 

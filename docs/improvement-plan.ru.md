@@ -38,7 +38,7 @@
 
 # Часть A. Алгоритмические / логические дефекты
 
-## A1. `node_url` для входящих соединений = `"incoming"` ломает FIB к входящему соседу
+## A1. 🟢 `node_url` для входящих соединений = `"incoming"` ломает FIB к входящему соседу (РЕАЛИЗОВАНО)
 
 **Проблема.**
 В `src/host/net/server.rs:73` при регистрации узла, подключившегося *входящим* WS-соединением, пишется:
@@ -62,9 +62,13 @@ if let Some(url) = node_url_map.get(&next_hop) {       // next_hop = "incoming"
 2. Минимальный вариант: в `server.rs` при `handle_incoming` регистрировать `node_url[origin] = "<incoming>:<peer-addr>"` (или добавить поле `incoming_return_path: Arc<RwLock<HashMap<String, mpsc::Sender<String>>>>`), и в `forward.rs` P5.1 проверять сначала `incoming_senders.get(&next_hop)` (как уже сделано в P5.2), затем `outbound`.
 3. Либо (чистый вариант): `forward_inner` после `route_next_hop` пробует в порядке `incoming_senders → outbound`, единообразно для любого `next_hop`, не полагаясь на строку `"incoming"` в `node_url`.
 
+**Решение (реализовано, 2026-09-07).**
+- Удалена ложная запись `node_url[origin] = "incoming"` в `server.rs` `handle_incoming` (обработчик Capabilities). Входящий сосед по-прежнему регистрируется в `incoming_senders` и отдаётся в discovery через `incoming_senders` (поэтому `pack_hello` продолжает перечислять его как прямого соседа — регрессии топологии нет).
+- В `forward.rs` P5.1 после `route_next_hop` теперь сначала проверяется `incoming_senders.get(&next_hop)`; если есть — событие отправляется обратно по уже открытому входящему каналу и возвращается `true`. Только затем — ветка `node_url`/outbound. Так асимметричные (только входящие) соседи стали маршрутизируемы через mesh, а не только как ответ-на-origin.
+
 **Критерии приёмки (тесты).**
-- Новый юнит-тест `p5_forward_to_incoming_neighbor`: построить топологию, где `next_hop` известен **только** как входящее соединение (зарегистрирован через `incoming_senders`, `node_url` не содержит реального url), и проверить, что `forward_inner` доставляет событие в `incoming_senders[next_hop]`.
-- Существующие тесты FIB остаются зелёными.
+- Новый юнит-тест `a1_incoming_neighbor_routes_via_incoming_senders`: топология, где `next_hop` известен только как входящий (`incoming_senders` зарегистрирован, `node_url` не содержит реального url и явно не содержит заглушку `"incoming"`) → `forward_inner` доставляет событие в `incoming_senders[next_hop]` и **не** буферизирует в `pending_outbound["incoming"]`.
+- Существующие тесты FIB остаются зелёными. Полный прогон: **134 passed, 0 warnings**.
 
 ---
 
