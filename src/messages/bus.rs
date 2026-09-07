@@ -410,7 +410,13 @@ async fn dispatch_event(
         } else {
             crate::host::ws_server::deliver_ws_response(&event.request_id, event.clone()).await
         };
-        if !handled_by_http && !handled_by_ws {
+        // Затем консольный фронт.
+        let handled_by_console = if handled_by_http || handled_by_ws {
+            false
+        } else {
+            crate::host::console::deliver_console_response(&event.request_id, event.clone()).await
+        };
+        if !handled_by_http && !handled_by_ws && !handled_by_console {
             crate::plugin::engine::signal_response(&event.request_id).await;
         }
     }
@@ -474,11 +480,11 @@ async fn dispatch_event(
                 .map(|p| p.config.session_local)
                 .unwrap_or(false);
             if is_private {
-                // Чужая сессия (пришла из сети) И не зарегистрирована
-                // локально → отказ. Своя (локальная) сессия → разрешено.
+                // Чужая сессия ИЛИ локальная неактивная → отказ. Своя локальная
+                // активная сессия → разрешено.
                 if should_deny_session_local(plugins, &plugin_name, &event.session_id).await {
                     warn!(
-                        "[Хост] Инструмент '{}' помечен session_local — отказ в доступе: session_id '{}' не существует на этом хосте",
+                        "[Хост] Инструмент '{}' помечен session_local — отказ в доступе: session_id '{}' не является активной локальной сессией этого хоста",
                         plugin_name, event.session_id
                     );
                     continue;
@@ -569,19 +575,23 @@ pub(crate) fn match_plugin_names(known: &[String], target_pattern: &str) -> Vec<
 /// зарегистрирован как локальная сессия этого хоста.
 /// Отказ, если сессия чужая И не зарегистрирована локально.
 /// Выделено для юнит-тестирования (без сети/registry).
-pub(crate) fn session_local_deny_decision(foreign: bool, local: bool) -> bool {
-    foreign && !local
+pub(crate) fn session_local_deny_decision(foreign: bool, local: bool, active: bool) -> bool {
+    // Чужая сессия (пришла из сети) ВСЕГДА отклоняется — она не является
+    // «локальной активной сессией» этого хоста.
+    // Локальная сессия отклоняется только если НЕ активна (нет незавершённого
+    // запроса от фронта в данный момент).
+    foreign || (local && !active)
 }
 
 /// Решение об отказе для `session_local`-инструмента.
 ///
 /// Возвращает `true` (отказать), если плагин помечен `session_local` И
-/// сессия чужая (пришла из сети от другого хоста) И при этом `session_id`
-/// не зарегистрирован как локальная сессия этого хоста.
+/// (сессия чужая и не зарегистрирована локально) ИЛИ (локальная, но неактивная —
+/// нет незавершённого запроса от фронта в данный момент).
 ///
 /// Семантика (см. tool-prioritization.md §Флаг session_local): приватный
-/// инструмент доступен удалённым агентам, но ТОЛЬКО в рамках session_id,
-/// реально существующего на этом хосте. Несуществующий session_id → отказ.
+/// инструмент доступен удалённым агентам, но ТОЛЬКО в рамках АКТИВНОЙ
+/// локальной сессии (есть незавершённый запрос от фронта).
 ///
 /// Выделено в чистую функцию для юнит-тестирования (без сборки worker/store).
 pub(crate) async fn should_deny_session_local(
@@ -604,7 +614,8 @@ pub(crate) async fn should_deny_session_local(
     };
     let foreign = crate::host::net::orchestrator::is_session_foreign(&inner, session_id).await;
     let local = crate::plugin::engine::is_local_session(session_id).await;
-    session_local_deny_decision(foreign, local)
+    let active = crate::plugin::engine::is_active_session(session_id).await;
+    session_local_deny_decision(foreign, local, active)
 }
 
 /// Распарс поля `target` события: несколько имён/масок разделены пробелами.
@@ -839,14 +850,16 @@ mod tests {
     // --- session_local: чистое правило отказа -------------------------------
     #[test]
     fn session_local_deny_decision_truth_table() {
-        // Чужая + не локальная → отказ.
-        assert!(session_local_deny_decision(true, false));
-        // Чужая + локальная → разрешено (сессия существует на этом хосте).
-        assert!(!session_local_deny_decision(true, true));
+        // Чужая сессия ВСЕГДА отклоняется (не является локальной активной).
+        assert!(session_local_deny_decision(true, false, false));
+        assert!(session_local_deny_decision(true, true, false));
+        assert!(session_local_deny_decision(true, true, true));
         // Своя + не локальная → разрешено.
-        assert!(!session_local_deny_decision(false, false));
-        // Своя + локальная → разрешено.
-        assert!(!session_local_deny_decision(false, true));
+        assert!(!session_local_deny_decision(false, false, false));
+        // Своя + локальная + неактивная → отказ (нет активного запроса).
+        assert!(session_local_deny_decision(false, true, false));
+        // Своя + локальная + активная → разрешено (есть незавершённый запрос).
+        assert!(!session_local_deny_decision(false, true, true));
     }
 
     // --- session_local: fail-closed при неинициализированной сети ----------
@@ -857,18 +870,33 @@ mod tests {
         assert!(!should_deny_session_local(&plugins, "tool:filesystem", "sess-x").await);
     }
 
-    // --- session_local: локальная сессия разрешена (даже если плагин private) -
+    // --- session_local: локальная сессия БЕЗ активного запроса → отказ -----
     #[tokio::test]
-    async fn should_allow_when_local_session_registered() {
+    async fn should_deny_when_local_session_inactive() {
         // Имитируем сеть: inner без session_origin (сессия "локальная").
         let inner = crate::host::net::NetInner::new_test();
         crate::host::net::set_inner(inner);
-        // Регистрируем сессию как локальную.
+        // Регистрируем сессию как локальную, НО без активного запроса.
         crate::plugin::engine::register_local_session("sess-local").await;
-        // Плагина нет в registry (is_private=false) — не должно отказывать.
         let plugins: PluginRegistry = Arc::new(RwLock::new(HashMap::new()));
+        // is_private=false → всё равно не должно отказывать (плагина нет).
         assert!(!should_deny_session_local(&plugins, "tool:filesystem", "sess-local").await);
         crate::plugin::engine::unregister_local_session("sess-local").await;
+        crate::host::net::clear_inner();
+    }
+
+    // --- session_local: локальная сессия С активным запросом → разрешено --
+    #[tokio::test]
+    async fn should_allow_when_local_session_active() {
+        let inner = crate::host::net::NetInner::new_test();
+        crate::host::net::set_inner(inner);
+        crate::plugin::engine::register_local_session("sess-active").await;
+        // Активный запрос от фронта.
+        crate::plugin::engine::mark_request_active("sess-active", "req-1").await;
+        let plugins: PluginRegistry = Arc::new(RwLock::new(HashMap::new()));
+        assert!(!should_deny_session_local(&plugins, "tool:filesystem", "sess-active").await);
+        crate::plugin::engine::mark_request_inactive("sess-active", "req-1").await;
+        crate::plugin::engine::unregister_local_session("sess-active").await;
         crate::host::net::clear_inner();
     }
 }

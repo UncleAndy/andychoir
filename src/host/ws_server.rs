@@ -141,13 +141,11 @@ async fn handle_socket(inner: Arc<WsServerInner>, mut socket: WebSocket) {
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-                let request_id = uuid::Uuid::new_v4().to_string();
-
-                // Регистрируем session_id как локальную сессию хоста (нужно для
-                // флага session_local инструментов: чужие сетевые запросы к
-                // приватному инструменту допускаются только в рамках реально
-                // существующей на этом хосте сессии).
-                engine::register_local_session(&session_id).await;
+                // Регистрируем session_id как локальную сессию хоста и помечаем
+                // начало активного запроса (доступ к session_local-инструментам
+                // разрешён только пока есть незавершённый запрос от фронта).
+                // Фронт-агностичная точка — та же, что у http/console.
+                let request_id = engine::begin_frontend_request(&session_id).await;
 
                 // Запоминаем: request_id -> (socket_id, session_id).
                 {
@@ -234,6 +232,8 @@ pub async fn deliver_ws_response(request_id: &str, ev: Event) -> bool {
             "[Хост] WS: ответ доставлен сокету {} для request_id={} (session={})",
             socket_id, request_id, session_id
         );
+        // Запрос завершён — сессия перестаёт быть активной для этого request_id.
+        engine::end_frontend_request(&session_id, request_id).await;
         let payload = build_ws_response_json(request_id, &session_id, &ev.payload);
         let sockets = inner.sockets.lock().await;
         if let Some(tx) = sockets.get(&socket_id) {

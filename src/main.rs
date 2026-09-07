@@ -15,7 +15,9 @@ use andychoir::ai::host::types::Event;
 use andychoir::config::Config as AppConfig;
 use andychoir::messages::bus::{EventBusConfig, start_event_bus};
 use andychoir::metrics::{Metrics, MetricsConfig, start_metrics_exporter};
-use andychoir::plugin::engine::{create_engine, create_linker, load_plugins};
+use andychoir::plugin::engine::{
+    begin_frontend_request, create_engine, create_linker, end_frontend_request, load_plugins,
+};
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -109,6 +111,10 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     let _ws_handle = andychoir::host::ws_server::start_ws_servers(tx.clone()).await;
     // Запускаем сетевой мост (входящий /net + исходящие соединения к remotes).
     let _net_handle = andychoir::host::net::start_net(tx.clone(), config.net.clone()).await;
+    // Запускаем консольный фронт (REPL): читает ввод пользователя, публикует
+    // запросы в шину и ждёт ответы. Использует те же begin/end_frontend_request,
+    // что ws/http — защита session_local единообразна для всех фронтов.
+    let _console_handle = tokio::spawn(run_console_frontend(tx.clone()));
 
     // ============ Таймер готовности: ждём status:"ready" от ВСЕХ плагинов ============
     // Если за startup.timeout_secs не все плагины отчитались о готовности —
@@ -193,4 +199,60 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
 
     info!("[Хост] Выход из процесса.");
     std::process::exit(0);
+}
+
+/// Консольный фронт (REPL): читает строки от пользователя, публикует их как
+/// запросы `agent:*` в шину и выводит ответы. Использует ту же точку
+/// регистрации активной сессии (`begin_frontend_request`), что ws/http, чтобы
+/// защита `session_local` работала единообразно на любом фронте.
+async fn run_console_frontend(tx: mpsc::Sender<Event>) {
+    let session_id = "console";
+    crate::info!("[Хост] Консольный фронт запущен (сессия '{}')", session_id);
+    loop {
+        let line = match crate::host::console::read_prompted_line("prompt> ".to_string()).await {
+            Some(l) => l,
+            None => break, // Ctrl-C / Ctrl-D / EOF
+        };
+        let text = line.trim();
+        if text.is_empty() {
+            continue;
+        }
+
+        // Регистрируем начало активного запроса (session_local доступен пока жив).
+        let request_id = begin_frontend_request(session_id).await;
+
+        let event = Event {
+            request_id: request_id.clone(),
+            session_id: session_id.to_string(),
+            source: "host:console".to_string(),
+            target: "agent:*".to_string(),
+            topic: "request".to_string(),
+            payload: text.to_string(),
+        };
+
+        // Ждём ответ по request_id.
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<Event>();
+        crate::host::console::register_console_pending(request_id.clone(), resp_tx);
+
+        if tx.send(event).await.is_err() {
+            crate::error!("[Хост] Консоль: шина закрыта, выход.");
+            break;
+        }
+
+        match tokio::time::timeout(std::time::Duration::from_secs(120), resp_rx).await {
+            Ok(Ok(ev)) => {
+                crate::host::console::print_markdown(&ev.payload);
+            }
+            Ok(Err(_)) => {
+                crate::error!("[Хост] Консоль: канал ответа закрыт.");
+            }
+            Err(_) => {
+                crate::error!("[Хост] Консоль: таймаут ожидания ответа (120с).");
+            }
+        }
+
+        // Завершаем активный запрос (снимаем активность сессии).
+        end_frontend_request(session_id, &request_id).await;
+    }
+    crate::info!("[Хост] Консольный фронт завершён.");
 }

@@ -195,6 +195,59 @@ pub async fn is_local_session(id: &str) -> bool {
     local_sessions().read().await.contains_key(id)
 }
 
+/// Активные запросы локальных сессий: (session_id, request_id) -> время старта.
+/// Сессия считается «активной» (допускается доступ к session_local-инструментам)
+/// только пока у неё есть хотя бы один незавершённый запрос от фронта.
+/// Это защищает от обращения к внутренним инструментам в «тихие» периоды
+/// (когда сессия создана, но запроса нет). См. tool-prioritization.md §session_local.
+static ACTIVE_REQUESTS: OnceLock<RwLock<HashMap<(String, String), u64>>> = OnceLock::new();
+
+fn active_requests() -> &'static RwLock<HashMap<(String, String), u64>> {
+    ACTIVE_REQUESTS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Отметить начало запроса от фронта для локальной сессии (старт активности).
+pub async fn mark_request_active(session_id: &str, request_id: &str) {
+    active_requests().write().await.insert(
+        (session_id.to_string(), request_id.to_string()),
+        crate::host::net::dedup::current_unix_secs(),
+    );
+}
+
+/// Отметить завершение запроса (ответ доставлен или таймаут) — сессия
+/// перестаёт быть активной для этого request_id.
+pub async fn mark_request_inactive(session_id: &str, request_id: &str) {
+    active_requests().write().await.remove(&(session_id.to_string(), request_id.to_string()));
+}
+
+/// Есть ли у локальной сессии хотя бы один активный (незавершённый) запрос?
+pub async fn is_active_session(id: &str) -> bool {
+    active_requests().read().await.keys().any(|(sid, _)| sid == id)
+}
+
+/// Универсальная точка регистрации запроса от ЛЮБОГО фронта (ws/http/console).
+///
+/// Регистрирует session_id как локальную сессию хоста и помечает начало
+/// активного запроса (session_local-инструменты доступны только пока есть
+/// незавершённый запрос от фронта). Возвращает сгенерированный request_id,
+/// который фронт должен положить в `Event.request_id`.
+///
+/// Это делает защиту session_local фронт-агностичной: все фронты вызывают
+/// одну и ту же функцию, и поведение для ws/http/console идентично.
+pub async fn begin_frontend_request(session_id: &str) -> String {
+    let request_id = crate::plugin::engine::new_session_id(); // uuid v4
+    register_local_session(session_id).await;
+    mark_request_active(session_id, &request_id).await;
+    request_id
+}
+
+/// Завершить активный запрос фронта (ответ доставлен / таймаут / закрытие).
+/// Сессия перестаёт быть активной для этого request_id; локальная регистрация
+/// сессии сохраняется (фронт может открыть новый запрос в той же сессии).
+pub async fn end_frontend_request(session_id: &str, request_id: &str) {
+    mark_request_inactive(session_id, request_id).await;
+}
+
 pub fn local_tools() -> &'static RwLock<HashMap<String, ToolDef>> {
     LOCAL_TOOLS.get_or_init(|| RwLock::new(HashMap::new()))
 }
@@ -1515,5 +1568,55 @@ mod tests {
         // По умолчанию (отсутствие поля) — false.
         let def2: ToolDef = serde_json::from_str(r#"{"name":"x","description":"","parameters_json":"{}"}"#).unwrap();
         assert!(!def2.session_local, "отсутствие поля → false (обратная совместимость)");
+    }
+
+    // --- Активные запросы сессии (session_local) --------------------------
+    #[tokio::test]
+    async fn active_request_marks_session_active() {
+        let sid = "sess-act-1";
+        let rid = "req-act-1";
+        assert!(!is_active_session(sid).await, "до запроса — неактивна");
+        mark_request_active(sid, rid).await;
+        assert!(is_active_session(sid).await, "пока есть запрос — активна");
+        // Другой request_id той же сессии тоже держит активность.
+        mark_request_active(sid, "req-act-2").await;
+        assert!(is_active_session(sid).await);
+        // Завершаем один — всё ещё активна (второй жив).
+        mark_request_inactive(sid, rid).await;
+        assert!(is_active_session(sid).await);
+        // Завершаем второй — неактивна.
+        mark_request_inactive(sid, "req-act-2").await;
+        assert!(!is_active_session(sid).await, "все запросы завершены — неактивна");
+    }
+
+    #[tokio::test]
+    async fn active_request_per_session_isolation() {
+        mark_request_active("sess-X", "r1").await;
+        assert!(is_active_session("sess-X").await);
+        assert!(!is_active_session("sess-Y").await, "другая сессия не затронута");
+        mark_request_inactive("sess-X", "r1").await;
+        assert!(!is_active_session("sess-X").await);
+    }
+
+    // --- begin/end_frontend_request: фронт-агностичная точка ----------------
+    #[tokio::test]
+    async fn begin_end_frontend_request_marks_active() {
+        let sid = "fe-sess-1";
+        assert!(!is_local_session(sid).await);
+        assert!(!is_active_session(sid).await);
+        // Имитируем старт запроса от ЛЮБОГО фронта (ws/http/console).
+        let rid = begin_frontend_request(sid).await;
+        assert!(is_local_session(sid).await, "сессия зарегистрирована как локальная");
+        assert!(is_active_session(sid).await, "запрос активен");
+        // Завершаем запрос — активность снимается, регистрация сессии сохраняется.
+        end_frontend_request(sid, &rid).await;
+        assert!(!is_active_session(sid).await, "после завершения — неактивна");
+        assert!(is_local_session(sid).await, "регистрация сессии сохранена");
+        // Повторный запрос в той же сессии работает.
+        let rid2 = begin_frontend_request(sid).await;
+        assert!(is_active_session(sid).await);
+        end_frontend_request(sid, &rid2).await;
+        unregister_local_session(sid).await;
+        assert!(!is_local_session(sid).await);
     }
 }

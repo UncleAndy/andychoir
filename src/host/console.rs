@@ -1,6 +1,6 @@
 use std::fmt;
 use std::future;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::{println as std_println};
 
 use rustyline::error::ReadlineError;
@@ -10,6 +10,9 @@ use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
 use rustyline::{Editor, ExternalPrinter, Helper, Result as RlResult};
 use tokio::sync::Notify;
+use tokio::sync::oneshot;
+
+use crate::ai::host::types::Event;
 
 static CONSOLE: Mutex<ConsoleState> = Mutex::new(ConsoleState {
     active_printer: None,
@@ -355,6 +358,35 @@ pub(crate) fn yellow(s: &str) -> String {
     format!("{}{}{}", YELLOW, s, RESET)
 }
 
+/// Ожидающие ответа консольного фронта: request_id -> канал ответа.
+/// Консольный REPL регистрирует oneshot при старте запроса и ждёт ответа.
+static CONSOLE_PENDING: OnceLock<Mutex<std::collections::HashMap<String, oneshot::Sender<Event>>>> =
+    OnceLock::new();
+
+fn console_pending(
+) -> &'static Mutex<std::collections::HashMap<String, oneshot::Sender<Event>>> {
+    CONSOLE_PENDING.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Зарегистрировать ожидающий ответ консоли для request_id.
+pub fn register_console_pending(request_id: String, tx: oneshot::Sender<Event>) {
+    console_pending().lock().unwrap().insert(request_id, tx);
+}
+
+/// Вызывается из dispatch_event, когда пришёл ответ, ожидаемый консолью.
+/// Отправляет ответ в зарегистрированный канал и снимает активность запроса.
+pub async fn deliver_console_response(request_id: &str, ev: Event) -> bool {
+    let tx = console_pending().lock().unwrap().remove(request_id);
+    if let Some(tx) = tx {
+        let _ = tx.send(ev);
+        // Запрос завершён — сессия перестаёт быть активной для этого request_id.
+        crate::plugin::engine::end_frontend_request("console", request_id).await;
+        true
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,5 +424,33 @@ mod tests {
         // \mathbf{r} -> r (убираем команду шрифта)
         assert!(!out.contains("\\mathbf"), "\\mathbf должен быть убран: {}", out);
         assert!(out.contains("Ψ(r,t)"), "ожидался Ψ(r,t), получили: {}", out);
+    }
+
+    // --- deliver_console_response: доставляет ответ и снимает активность ------
+    #[tokio::test]
+    async fn deliver_console_response_signals_and_ends() {
+        use tokio::sync::oneshot;
+        // Сессия "console" активна (имитируем запрос от консольного фронта).
+        // begin_frontend_request сам генерирует request_id — используем его.
+        let rid = crate::plugin::engine::begin_frontend_request("console").await;
+        assert!(crate::plugin::engine::is_active_session("console").await);
+
+        let (tx, rx) = oneshot::channel::<Event>();
+        register_console_pending(rid.clone(), tx);
+        let ev = Event {
+            request_id: rid.clone(),
+            session_id: "console".to_string(),
+            source: "agent:*".to_string(),
+            target: "host:console".to_string(),
+            topic: "response".to_string(),
+            payload: "ok".to_string(),
+        };
+        assert!(deliver_console_response(&rid, ev).await, "ответ доставлен");
+        // Канал получил событие.
+        let got = rx.await.unwrap();
+        assert_eq!(got.payload, "ok");
+        // Активность снята (запрос завершён).
+        assert!(!crate::plugin::engine::is_active_session("console").await);
+        crate::plugin::engine::unregister_local_session("console").await;
     }
 }
