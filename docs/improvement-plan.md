@@ -273,8 +273,9 @@ This makes secret logging opt-in and explicit, consistent with `mcp_transport`'s
 
 **Acceptance.**
 - `can_plugin_fs` unit tests: read allowed under root, denied outside root (`/srv/data/../etc/passwd`, `/etc/passwd`), write denied with `ro`, denied without `filesystem` perm.
+- FS-operation integration tests (real temp files via `fs_op_with_perm`): `fs_write_then_read_roundtrip_allowed_under_root`, `fs_write_denied_outside_root`, `fs_append_and_patch_work` (fail-closed patch), `fs_list_and_stat_work`, `fs_move_copy_remove_work`, `fs_read_denied_with_ro_perm_but_write_allowed_with_rw`.
 - Host builds; `plugins/filesystem_plugin` builds for `wasm32-wasip2`.
-- `cargo test --lib`: 142 passed (incl. B6 tests), 0 failed.
+- `cargo test --lib`: 148 passed (incl. B6 tests), 0 failed.
 
 ---
 

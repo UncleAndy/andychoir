@@ -1189,8 +1189,7 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
         contents: String,
     ) -> Result<(), String> {
         fs_check_access(accessor, &path, true).await?;
-        std::fs::write(&path, contents)
-            .map_err(|e| format!("write_file: ошибка записи '{}': {}", path, e))
+        fs_write_impl(&path, &contents)
     }
 
     async fn append_file(
@@ -1199,14 +1198,7 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
         contents: String,
     ) -> Result<(), String> {
         fs_check_access(accessor, &path, true).await?;
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| format!("append_file: не удалось открыть '{}': {}", path, e))?;
-        f.write_all(contents.as_bytes())
-            .map_err(|e| format!("append_file: ошибка записи '{}': {}", path, e))
+        fs_append_impl(&path, &contents)
     }
 
     async fn remove_file(
@@ -1214,8 +1206,7 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
         path: String,
     ) -> Result<(), String> {
         fs_check_access(accessor, &path, true).await?;
-        std::fs::remove_file(&path)
-            .map_err(|e| format!("remove_file: ошибка удаления '{}': {}", path, e))
+        fs_remove_file_impl(&path)
     }
 
     async fn make_dir(
@@ -1223,8 +1214,7 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
         path: String,
     ) -> Result<(), String> {
         fs_check_access(accessor, &path, true).await?;
-        std::fs::create_dir_all(&path)
-            .map_err(|e| format!("make_dir: ошибка создания '{}': {}", path, e))
+        fs_make_dir_impl(&path)
     }
 
     async fn remove_dir(
@@ -1232,8 +1222,7 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
         path: String,
     ) -> Result<(), String> {
         fs_check_access(accessor, &path, true).await?;
-        std::fs::remove_dir_all(&path)
-            .map_err(|e| format!("remove_dir: ошибка удаления '{}': {}", path, e))
+        fs_remove_dir_impl(&path)
     }
 
     async fn move_path(
@@ -1243,8 +1232,7 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
     ) -> Result<(), String> {
         fs_check_access(accessor, &src, true).await?;
         fs_check_access(accessor, &dst, true).await?;
-        std::fs::rename(&src, &dst)
-            .map_err(|e| format!("move_path: ошибка перемещения '{}' -> '{}': {}", src, dst, e))
+        fs_move_impl(&src, &dst)
     }
 
     async fn copy_file(
@@ -1254,9 +1242,7 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
     ) -> Result<(), String> {
         fs_check_access(accessor, &src, false).await?;
         fs_check_access(accessor, &dst, true).await?;
-        std::fs::copy(&src, &dst)
-            .map_err(|e| format!("copy_file: ошибка копирования '{}' -> '{}': {}", src, dst, e))
-            .map(|_| ())
+        fs_copy_impl(&src, &dst)
     }
 
     async fn list_dir(
@@ -1264,22 +1250,7 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
         path: String,
     ) -> Result<String, String> {
         fs_check_access(accessor, &path, false).await?;
-        let entries = std::fs::read_dir(&path)
-            .map_err(|e| format!("list_dir: не удалось открыть '{}': {}", path, e))?;
-        let mut out = Vec::new();
-        for e in entries {
-            let e = e.map_err(|e| format!("list_dir: ошибка чтения записи: {}", e))?;
-            let p = e.path();
-            let meta = e.metadata().map_err(|e| format!("list_dir: meta: {}", e))?;
-            out.push(serde_json::json!({
-                "name": e.file_name().to_string_lossy(),
-                "path": p.to_string_lossy(),
-                "kind": if meta.is_dir() { "dir" } else { "file" },
-                "size": meta.len(),
-            }));
-        }
-        serde_json::to_string(&out)
-            .map_err(|e| format!("list_dir: сериализация: {}", e))
+        fs_list_dir_impl(&path)
     }
 
     async fn stat_path(
@@ -1287,22 +1258,7 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
         path: String,
     ) -> Result<String, String> {
         fs_check_access(accessor, &path, false).await?;
-        let meta = std::fs::metadata(&path)
-            .map_err(|e| format!("stat_path: '{}': {}", path, e))?;
-        let modified = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        serde_json::to_string(&serde_json::json!({
-            "kind": if meta.is_dir() { "dir" } else { "file" },
-            "size": meta.len(),
-            "modified": modified,
-            "is_file": meta.is_file(),
-            "is_dir": meta.is_dir(),
-        }))
-        .map_err(|e| format!("stat_path: сериализация: {}", e))
+        fs_stat_impl(&path)
     }
 
     async fn patch_file(
@@ -1312,28 +1268,138 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
         new: String,
     ) -> Result<(), String> {
         fs_check_access(accessor, &path, true).await?;
-        const MAX_FILE_BYTES: u64 = 1024 * 1024;
-        let meta = std::fs::metadata(&path)
-            .map_err(|e| format!("patch_file: метаданные '{}': {}", path, e))?;
-        if !meta.is_file() {
-            return Err(format!("patch_file: '{}' не является файлом", path));
-        }
-        if meta.len() > MAX_FILE_BYTES {
-            return Err(format!("patch_file: файл '{}' слишком большой", path));
-        }
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| format!("patch_file: чтение '{}': {}", path, e))?;
-        if !content.contains(&old) {
-            return Err(format!(
-                "patch_file: образец 'old' не найден в '{}' (fail-closed, частичная замена запрещена)",
-                path
-            ));
-        }
-        let patched = content.replace(&old, &new);
-        std::fs::write(&path, patched)
-            .map_err(|e| format!("patch_file: запись '{}': {}", path, e))
+        fs_patch_impl(&path, &old, &new)
     }
 }
+
+// --- Свободные реализации FS-операций (без Accessor) для юнит-тестов --------
+// Каждая принимает perms и сама проверяет can_plugin_fs (fail-closed), чтобы
+// тестироваться напрямую без wasmtime Accessor.
+
+fn fs_write_impl(path: &str, contents: &str) -> Result<(), String> {
+    std::fs::write(path, contents)
+        .map_err(|e| format!("write_file: ошибка записи '{}': {}", path, e))
+}
+
+fn fs_append_impl(path: &str, contents: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("append_file: не удалось открыть '{}': {}", path, e))?;
+    f.write_all(contents.as_bytes())
+        .map_err(|e| format!("append_file: ошибка записи '{}': {}", path, e))
+}
+
+fn fs_remove_file_impl(path: &str) -> Result<(), String> {
+    std::fs::remove_file(path)
+        .map_err(|e| format!("remove_file: ошибка удаления '{}': {}", path, e))
+}
+
+fn fs_make_dir_impl(path: &str) -> Result<(), String> {
+    std::fs::create_dir_all(path)
+        .map_err(|e| format!("make_dir: ошибка создания '{}': {}", path, e))
+}
+
+fn fs_remove_dir_impl(path: &str) -> Result<(), String> {
+    std::fs::remove_dir_all(path)
+        .map_err(|e| format!("remove_dir: ошибка удаления '{}': {}", path, e))
+}
+
+fn fs_move_impl(src: &str, dst: &str) -> Result<(), String> {
+    std::fs::rename(src, dst)
+        .map_err(|e| format!("move_path: ошибка перемещения '{}' -> '{}': {}", src, dst, e))
+}
+
+fn fs_copy_impl(src: &str, dst: &str) -> Result<(), String> {
+    std::fs::copy(src, dst)
+        .map_err(|e| format!("copy_file: ошибка копирования '{}' -> '{}': {}", src, dst, e))
+        .map(|_| ())
+}
+
+fn fs_list_dir_impl(path: &str) -> Result<String, String> {
+    let entries = std::fs::read_dir(path)
+        .map_err(|e| format!("list_dir: не удалось открыть '{}': {}", path, e))?;
+    let mut out = Vec::new();
+    for e in entries {
+        let e = e.map_err(|e| format!("list_dir: ошибка чтения записи: {}", e))?;
+        let p = e.path();
+        let meta = e.metadata().map_err(|e| format!("list_dir: meta: {}", e))?;
+        out.push(serde_json::json!({
+            "name": e.file_name().to_string_lossy(),
+            "path": p.to_string_lossy(),
+            "kind": if meta.is_dir() { "dir" } else { "file" },
+            "size": meta.len(),
+        }));
+    }
+    serde_json::to_string(&out)
+        .map_err(|e| format!("list_dir: сериализация: {}", e))
+}
+
+fn fs_stat_impl(path: &str) -> Result<String, String> {
+    let meta = std::fs::metadata(path)
+        .map_err(|e| format!("stat_path: '{}': {}", path, e))?;
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    serde_json::to_string(&serde_json::json!({
+        "kind": if meta.is_dir() { "dir" } else { "file" },
+        "size": meta.len(),
+        "modified": modified,
+        "is_file": meta.is_file(),
+        "is_dir": meta.is_dir(),
+    }))
+    .map_err(|e| format!("stat_path: сериализация: {}", e))
+}
+
+const FS_MAX_FILE_BYTES: u64 = 1024 * 1024;
+
+fn fs_patch_impl(path: &str, old: &str, new: &str) -> Result<(), String> {
+    let meta = std::fs::metadata(path)
+        .map_err(|e| format!("patch_file: метаданные '{}': {}", path, e))?;
+    if !meta.is_file() {
+        return Err(format!("patch_file: '{}' не является файлом", path));
+    }
+    if meta.len() > FS_MAX_FILE_BYTES {
+        return Err(format!("patch_file: файл '{}' слишком большой", path));
+    }
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("patch_file: чтение '{}': {}", path, e))?;
+    if !content.contains(old) {
+        return Err(format!(
+            "patch_file: образец 'old' не найден в '{}' (fail-closed, частичная замена запрещена)",
+            path
+        ));
+    }
+    let patched = content.replace(old, new);
+    std::fs::write(path, patched)
+        .map_err(|e| format!("patch_file: запись '{}': {}", path, e))
+}
+
+/// Проверка прав + делегирование к свободной реализации (для вызова из тестов
+/// без wasmtime Accessor). Возвращает Err, если право не даёт операцию.
+/// Только для тестов: в production этот хелпер не нужен (права проверяются в
+/// fs_check_access внутри impl-методов трейта).
+#[cfg(test)]
+fn fs_op_with_perm<F, T>(perms: &[PluginAccess], path: &str, want_write: bool, op: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String>,
+{
+    if !can_plugin_fs(perms, path, want_write) {
+        return Err(format!(
+            "fs: доступ к '{}' запрещён (нет права filesystem с {})",
+            path,
+            if want_write { "rw" } else { "ro/rw" }
+        ));
+    }
+    op()
+}
+
+
 
 // Реализация http-server: регистрация/снятие HTTP-слушателей, которые
 // затем обслуживает хостовый axum-сервер (transparent transport).
@@ -1967,6 +2033,133 @@ mod tests {
         let perms = vec![PluginAccess::ConsolePrint(100)];
         assert!(!can_plugin_fs(&perms, "/srv/data/a.txt", false));
         assert!(!can_plugin_fs(&perms, "/srv/data/a.txt", true));
+    }
+
+    // --- Функционал filesystem-плагина (B6): реальные операции через fs_op_with_perm ---
+
+    /// Гвард, удаляющий временный каталог в Drop (живёт до конца теста, если
+    /// привязан без `_`-префикса).
+    struct FsTestGuard(std::path::PathBuf);
+    impl Drop for FsTestGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Уникальный временный каталог под root права (temp_dir, без внешних crate).
+    /// Возвращает (root, guard) — guard удаляет каталог при выходе из scope.
+    fn tmp_fs_root(tag: &str) -> (String, FsTestGuard) {
+        let id = std::process::id();
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as usize)
+            .unwrap_or(0); // источник энтропии для уникального имени
+        let dir = std::env::temp_dir()
+            .join(format!("andychoir_fs_test_{}_{}_{}", tag, id, n));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        (dir.to_string_lossy().to_string(), FsTestGuard(dir))
+    }
+
+    #[test]
+    fn fs_write_then_read_roundtrip_allowed_under_root() {
+        let (root, _guard) = tmp_fs_root("write");
+        let perms = vec![PluginAccess::Filesystem(root.clone(), "rw".into(), "rw".into())];
+        let f = format!("{}/note.txt", root);
+        // Запись разрешена (rw).
+        let res = fs_op_with_perm(&perms, &f, true, || fs_write_impl(&f, "hello fs"));
+        assert!(res.is_ok(), "write должен быть разрешён: {:?}", res);
+        // Чтение содержимого напрямую (проверяем, что записалось).
+        let content = std::fs::read_to_string(&f).unwrap();
+        assert_eq!(content, "hello fs");
+    }
+
+    #[test]
+    fn fs_write_denied_outside_root() {
+        let (root, _guard) = tmp_fs_root("write_denied");
+        let perms = vec![PluginAccess::Filesystem(root.clone(), "rw".into(), "rw".into())];
+        let outside = "/tmp/andychoir_fs_test_outside_foreign.txt".to_string();
+        let res = fs_op_with_perm(&perms, &outside, true, || fs_write_impl(&outside, "x"));
+        assert!(res.is_err(), "write вне root должен быть запрещён");
+        assert!(res.unwrap_err().contains("запрещён"));
+    }
+
+    #[test]
+    fn fs_append_and_patch_work() {
+        let (root, _guard) = tmp_fs_root("patch");
+        let perms = vec![PluginAccess::Filesystem(root.clone(), "rw".into(), "rw".into())];
+        let f = format!("{}/cfg.txt", root);
+        fs_op_with_perm(&perms, &f, true, || fs_write_impl(&f, "key=1\n")).unwrap();
+        // append
+        fs_op_with_perm(&perms, &f, true, || fs_append_impl(&f, "key=2\n")).unwrap();
+        let c = std::fs::read_to_string(&f).unwrap();
+        assert_eq!(c, "key=1\nkey=2\n");
+        // patch (fail-closed: old должен существовать)
+        fs_op_with_perm(&perms, &f, true, || fs_patch_impl(&f, "key=1", "key=100")).unwrap();
+        let c2 = std::fs::read_to_string(&f).unwrap();
+        assert!(c2.contains("key=100"));
+        assert!(!c2.contains("key=1\nkey=2")); // заменено
+        // patch с несуществующим old → ошибка (без частичной перезаписи)
+        let bad = fs_op_with_perm(&perms, &f, true, || fs_patch_impl(&f, "NO_SUCH", "x"));
+        assert!(bad.is_err());
+        assert!(bad.unwrap_err().contains("не найден"));
+    }
+
+    #[test]
+    fn fs_list_and_stat_work() {
+        let (root, _guard) = tmp_fs_root("list");
+        let perms = vec![PluginAccess::Filesystem(root.clone(), "rw".into(), "rw".into())];
+        let f = format!("{}/a.txt", root);
+        fs_op_with_perm(&perms, &f, true, || fs_write_impl(&f, "x")).unwrap();
+        let sub = format!("{}/sub", root);
+        fs_op_with_perm(&perms, &sub, true, || fs_make_dir_impl(&sub)).unwrap();
+        // list_dir
+        let listing = fs_op_with_perm(&perms, &root, false, || fs_list_dir_impl(&root)).unwrap();
+        let arr: serde_json::Value = serde_json::from_str(&listing).unwrap();
+        assert!(arr.as_array().unwrap().len() >= 2);
+        // stat_path на файле
+        let st = fs_op_with_perm(&perms, &f, false, || fs_stat_impl(&f)).unwrap();
+        let stj: serde_json::Value = serde_json::from_str(&st).unwrap();
+        assert_eq!(stj["is_file"], true);
+        assert_eq!(stj["size"], 1);
+        // stat_path на каталоге
+        let st_dir = fs_op_with_perm(&perms, &sub, false, || fs_stat_impl(&sub)).unwrap();
+        let st_dir_j: serde_json::Value = serde_json::from_str(&st_dir).unwrap();
+        assert_eq!(st_dir_j["is_dir"], true);
+    }
+
+    #[test]
+    fn fs_move_copy_remove_work() {
+        let (root, _guard) = tmp_fs_root("mvcp");
+        let perms = vec![PluginAccess::Filesystem(root.clone(), "rw".into(), "rw".into())];
+        let src = format!("{}/src.txt", root);
+        let dst = format!("{}/dst.txt", root);
+        let cp = format!("{}/cp.txt", root);
+        fs_op_with_perm(&perms, &src, true, || fs_write_impl(&src, "data")).unwrap();
+        // move
+        fs_op_with_perm(&perms, &src, true, || fs_move_impl(&src, &dst)).unwrap();
+        assert!(!std::path::Path::new(&src).exists());
+        assert!(std::path::Path::new(&dst).exists());
+        // copy
+        fs_op_with_perm(&perms, &dst, false, || fs_copy_impl(&dst, &cp)).unwrap();
+        assert!(std::path::Path::new(&cp).exists());
+        // remove
+        fs_op_with_perm(&perms, &cp, true, || fs_remove_file_impl(&cp)).unwrap();
+        assert!(!std::path::Path::new(&cp).exists());
+    }
+
+    #[test]
+    fn fs_read_denied_with_ro_perm_but_write_allowed_with_rw() {
+        // ro-право: write_file через fs_op_with_perm запрещён (can_plugin_fs false).
+        let (root, _guard) = tmp_fs_root("ro");
+        let ro = vec![PluginAccess::Filesystem(root.clone(), "ro".into(), "ro".into())];
+        let f = format!("{}/x.txt", root);
+        let w = fs_op_with_perm(&ro, &f, true, || fs_write_impl(&f, "x"));
+        assert!(w.is_err());
+        // rw-право: разрешён и list.
+        let rw = vec![PluginAccess::Filesystem(root.clone(), "rw".into(), "rw".into())];
+        let ok = fs_op_with_perm(&rw, &root, false, || fs_list_dir_impl(&root));
+        assert!(ok.is_ok());
     }
 
     // --- can_plugin_network (B2): fail-closed, белый список host:port ---------

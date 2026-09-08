@@ -282,8 +282,9 @@ info!("[Хост] Конфигурация плагина: {:?}", config_str);
 
 **Критерии приёмки.**
 - Юнит-тесты `can_plugin_fs`: чтение разрешено под root, запрещено вне root (`/srv/data/../etc/passwd`, `/etc/passwd`), запись запрещена при `ro`, запрещено без права `filesystem`.
+- Интеграционные тесты FS-операций (реальные temp-файлы через `fs_op_with_perm`): `fs_write_then_read_roundtrip_allowed_under_root`, `fs_write_denied_outside_root`, `fs_append_and_patch_work` (fail-closed патч), `fs_list_and_stat_work`, `fs_move_copy_remove_work`, `fs_read_denied_with_ro_perm_but_write_allowed_with_rw`.
 - Хост собирается; `plugins/filesystem_plugin` собирается под `wasm32-wasip2`.
-- `cargo test --lib`: 142 passed (вкл. B6-тесты), 0 failed.
+- `cargo test --lib`: 148 passed (вкл. B6-тесты), 0 failed.
 
 ---
 
