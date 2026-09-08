@@ -41,6 +41,10 @@ termimad = "0.31"
 fastbloom = "0.10"
 # P4: граф топологии и кратчайший путь (Дейкстра) для маршрутизации.
 petgraph = "0.6"
+# Генерация случайных данных (плагин random). 0.8 — уже в Cargo.lock (0.8.8),
+# чтобы не тянуть 0.9/0.10 и не получить "multiple versions of crate rand".
+rand = "0.8"
+base64 = "0.22"
 
 [dev-dependencies]
 filetime = "0.2"

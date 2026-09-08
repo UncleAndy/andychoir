@@ -1270,7 +1270,108 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
         fs_check_access(accessor, &path, true).await?;
         fs_patch_impl(&path, &old, &new)
     }
+
+    // --- Генерация случайных данных (плагин random) ---
+    // Тонкая обёртка: вся логика в свободной функции random_impl (тестируемо
+    // без Accessor, минимально по коду).
+    async fn random(
+        _accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        kind: String,
+        params_json: String,
+    ) -> Result<String, String> {
+        random_impl(&kind, &params_json)
+    }
 }
+
+/// Свободная реализация генерации случайных данных (без Accessor, для тестов).
+/// Возвращает значение ВСЕГДА в текстовом виде (пригодно для LLM).
+fn random_impl(kind: &str, params_json: &str) -> Result<String, String> {
+        use rand::Rng;
+        let p: serde_json::Value = serde_json::from_str(&params_json)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let mut rng = rand::thread_rng();
+
+        match kind {
+            "int" => {
+                let min = p["min"].as_i64().unwrap_or(0);
+                let max = p["max"].as_i64().unwrap_or(100);
+                if min > max { return Err(format!("random int: min({}) > max({})", min, max)); }
+                Ok(rng.gen_range(min..=max).to_string())
+            }
+            "uint" => {
+                let min = p["min"].as_u64().unwrap_or(0);
+                let max = p["max"].as_u64().unwrap_or(100);
+                if min > max { return Err(format!("random uint: min({}) > max({})", min, max)); }
+                Ok(rng.gen_range(min..=max).to_string())
+            }
+            "float" => {
+                let min = p["min"].as_f64().unwrap_or(0.0);
+                let max = p["max"].as_f64().unwrap_or(1.0);
+                if min > max { return Err(format!("random float: min({}) > max({})", min, max)); }
+                Ok(rng.gen_range(min..max).to_string())
+            }
+            "bool" => Ok(rng.gen_bool(0.5).to_string()),
+            "uuid" => Ok(uuid::Uuid::new_v4().to_string()),
+            "bytes" => {
+                let size = p["size"].as_u64().unwrap_or(16) as usize;
+                if size == 0 { return Err("random bytes: size == 0".to_string()); }
+                if size > 16 * 1024 * 1024 {
+                    return Err(format!("random bytes: size({}) слишком велик (лимит 16 MiB)", size));
+                }
+                let mut buf = vec![0u8; size];
+                rng.fill(&mut buf[..]);
+                let enc = p["encoding"].as_str().unwrap_or("hex");
+                match enc {
+                    "hex" => Ok(buf.iter().map(|b| format!("{:02x}", b)).collect::<String>()),
+                    "base64" => Ok(base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD, &buf)),
+                    "base59" => {
+                        // Base59 (Безье): алфавит без похожих символов (0/O/1/I/l).
+                        const A: &[u8] = b"23456789abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ$%*+-./:";
+                        Ok(buf.iter()
+                            .map(|&b| format!("{}{}", A[(b as usize / 59) % 59] as char,
+                                                   A[b as usize % 59] as char))
+                            .collect::<String>())
+                    }
+                    other => Err(format!("random bytes: неизвестный encoding '{}' (hex|base64|base59)", other)),
+                }
+            }
+            "string" => {
+                let length = p["length"].as_u64().unwrap_or(16) as usize;
+                if length == 0 { return Err("random string: length == 0".to_string()); }
+                let cs = p["charset"].as_str().unwrap_or("");
+                let chars: Vec<char> = if cs.is_empty() {
+                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNPQRSTUVWXYZ0123456789".chars().collect()
+                } else {
+                    cs.chars().collect()
+                };
+                if chars.is_empty() { return Err("random string: пустой charset".to_string()); }
+                Ok((0..length)
+                    .map(|_| chars[rng.gen_range(0..chars.len())])
+                    .collect::<String>())
+            }
+            "choice" | "shuffle" => {
+                let items: Vec<String> = p["items"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                if items.is_empty() { return Err("random choice/shuffle: пустой items".to_string()); }
+                if kind == "choice" {
+                    let i = rng.gen_range(0..items.len());
+                    Ok(items[i].clone())
+                } else {
+                    let mut v = items;
+                    for i in (1..v.len()).rev() {
+                        let j = rng.gen_range(0..=i);
+                        v.swap(i, j);
+                    }
+                    serde_json::to_string(&v)
+                        .map_err(|e| format!("random shuffle: сериализация: {}", e))
+                }
+            }
+            _ => Err(format!("random: неизвестный kind '{}'", kind)),
+        }
+    }
 
 // --- Свободные реализации FS-операций (без Accessor) для юнит-тестов --------
 // Каждая принимает perms и сама проверяет can_plugin_fs (fail-closed), чтобы
@@ -2160,6 +2261,89 @@ mod tests {
         let rw = vec![PluginAccess::Filesystem(root.clone(), "rw".into(), "rw".into())];
         let ok = fs_op_with_perm(&rw, &root, false, || fs_list_dir_impl(&root));
         assert!(ok.is_ok());
+    }
+
+    // --- random (плагин random): текстовая генерация, fail-closed на мин/макс ----
+
+    fn random_logic(kind: &str, params_json: &str) -> Result<String, String> {
+        // Логика вынесена в свободную функцию, чтобы тестировать без Accessor.
+        random_impl(kind, params_json)
+    }
+
+    #[test]
+    fn random_int_in_range_and_rejects_bad_range() {
+        let v = random_logic("int", r#"{"min":5,"max":9}"#).unwrap();
+        let n: i64 = v.parse().unwrap();
+        assert!((5..=9).contains(&n), "int вне диапазона: {}", v);
+        // min > max — ошибка (fail-closed).
+        assert!(random_logic("int", r#"{"min":9,"max":5}"#).is_err());
+    }
+
+    #[test]
+    fn random_uint_and_float_and_bool() {
+        let u: u64 = random_logic("uint", r#"{"min":1,"max":3}"#).unwrap().parse().unwrap();
+        assert!((1..=3).contains(&u));
+        let f: f64 = random_logic("float", r#"{"min":0.0,"max":1.0}"#).unwrap().parse().unwrap();
+        assert!((0.0..1.0).contains(&f));
+        let b = random_logic("bool", "{}").unwrap();
+        assert!(b == "true" || b == "false");
+    }
+
+    #[test]
+    fn random_uuid_is_v4() {
+        let u = random_logic("uuid", "{}").unwrap();
+        assert_eq!(u.len(), 36, "uuid должен быть каноническим: {}", u);
+        assert_eq!(&u[14..15], "4", "версия v4: {}", u);
+    }
+
+    #[test]
+    fn random_bytes_encodings() {
+        // hex: 2 символа на байт.
+        let hex = random_logic("bytes", r#"{"size":8,"encoding":"hex"}"#).unwrap();
+        assert_eq!(hex.len(), 16);
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+        // base64: непустая строка, корректный алфавит.
+        let b64 = random_logic("bytes", r#"{"size":8,"encoding":"base64"}"#).unwrap();
+        assert!(!b64.is_empty() && b64.len() % 4 == 0);
+        // base59: 2 символа на байт из алфавита.
+        let b59 = random_logic("bytes", r#"{"size":8,"encoding":"base59"}"#).unwrap();
+        assert_eq!(b59.len(), 16);
+        // неизвестный encoding — ошибка.
+        assert!(random_logic("bytes", r#"{"size":8,"encoding":"bad"}"#).is_err());
+        // size=0 — ошибка.
+        assert!(random_logic("bytes", r#"{"size":0}"#).is_err());
+    }
+
+    #[test]
+    fn random_string_length_and_charset() {
+        let s = random_logic("string", r#"{"length":12}"#).unwrap();
+        assert_eq!(s.chars().count(), 12);
+        assert!(s.chars().all(|c| c.is_ascii_alphanumeric()));
+        // свой charset.
+        let s2 = random_logic("string", r#"{"length":5,"charset":"ab"}"#).unwrap();
+        assert!(s2.chars().all(|c| c == 'a' || c == 'b'));
+        // length=0 — ошибка.
+        assert!(random_logic("string", r#"{"length":0}"#).is_err());
+    }
+
+    #[test]
+    fn random_choice_and_shuffle() {
+        let c = random_logic("choice", r#"{"items":["x","y","z"]}"#).unwrap();
+        assert!(["x", "y", "z"].contains(&c.as_str()));
+        let sh: Vec<String> =
+            serde_json::from_str(&random_logic("shuffle", r#"{"items":["1","2","3"]}"#).unwrap())
+                .unwrap();
+        assert_eq!(sh.len(), 3);
+        let mut sorted = sh.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["1".to_string(), "2".to_string(), "3".to_string()]);
+        // пустой items — ошибка.
+        assert!(random_logic("choice", r#"{"items":[]}"#).is_err());
+    }
+
+    #[test]
+    fn random_unknown_kind_is_error() {
+        assert!(random_logic("nope", "{}").is_err());
     }
 
     // --- can_plugin_network (B2): fail-closed, белый список host:port ---------

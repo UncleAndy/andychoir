@@ -1,0 +1,20 @@
+[package]
+name = "random_plugin"
+version = "0.1.0"
+edition = "2024"
+description = "Random data generation plugin (text-only results for LLM tools)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/UncleAndy/andychoir"
+authors = ["Andrey Velikoredchanin"]
+resolver = "2"
+
+[lib]
+# cdylib — собираем динамическую C-библиотеку, которую утилиты WASM
+# превращают в компонент (аналогично остальным плагинам).
+crate-type = ["cdylib"]
+
+[dependencies]
+# Версия как в filesystem_plugin (совместима с wasmtime 46 / нашим WIT).
+wit-bindgen = "0.58"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"

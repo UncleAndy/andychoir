@@ -236,13 +236,13 @@ impl Guest for FrontConsolePluginImplementation {
                     }
                     // wait/queue: отправляем запрос и ждём ответ (async, не
                     // блокирует wasm). Пока ждём — ввод НЕ читается (нет промпта).
-                    let pending = publish_request(&trimmed).await;
-                    crate::ai::host::host_control::wait_for_response(pending).await;
+                    let (pending, pending_session) = publish_request(&trimmed).await;
+                    crate::ai::host::host_control::wait_for_response(pending, pending_session).await;
                     // queue: если есть накопленное — отправляем следующее.
                     if mode == "queue" {
                         while let Some(next) = queue.pop_front() {
-                            let qprid = publish_request(&next).await;
-                            crate::ai::host::host_control::wait_for_response(qprid).await;
+                            let (qprid, qsession) = publish_request(&next).await;
+                            crate::ai::host::host_control::wait_for_response(qprid, qsession).await;
                         }
                     }
                 }
@@ -294,8 +294,10 @@ impl Guest for FrontConsolePluginImplementation {
 
 export!(FrontConsolePluginImplementation);
 
-/// Отправить пользовательский запрос агенту (target:"agent:*") и вернуть request_id.
-async fn publish_request(payload: &str) -> String {
+/// Отправить пользовательский запрос агенту (target:"agent:*") и вернуть
+/// (request_id, session_id). Пара нужна для wait_for_response (A2: ключ
+/// (request_id, session_id) — только своя сессия).
+async fn publish_request(payload: &str) -> (String, String) {
     let request_id = Uuid::new_v4().to_string();
     // Используем стабильный session_id текущей сессии.
     let session_id = CURRENT_SESSION
@@ -305,14 +307,14 @@ async fn publish_request(payload: &str) -> String {
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let host_event = Event {
         request_id: request_id.clone(),
-        session_id,
+        session_id: session_id.clone(),
         source: PLUGIN_NAME.to_string(),
         target: "agent:*".to_string(),
         topic: "request".to_string(),
         payload: payload.to_string(),
     };
     ai::host::event_bus::publish_event(&host_event);
-    request_id
+    (request_id, session_id)
 }
 
 /// Обработать команду пользователя (начинается с '/').

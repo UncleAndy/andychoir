@@ -156,6 +156,19 @@ interface host-control {
   // Точечная правка файла: заменить `old` на `new` (требует rw). Ошибка, если
   // `old` не найден (fail-closed — не частичная перезапись).
   patch-file: async func(path: string, old: string, new: string) -> result<_, string>;
+
+  // --- Генерация случайных данных (плагин random) ---
+  // Возвращает случайное значение в текстовом виде (как просил пользователь:
+  // только то, что можно представить строкой).
+  // kind: "int" | "uint" | "float" | "bool" | "bytes" | "uuid" | "string" | "choice" | "shuffle"
+  // params-json: JSON с параметрами:
+  //   int/uint: {"min":N,"max":N}      float: {"min":N,"max":N}
+  //   bool: {}
+  //   bytes: {"size":N,"encoding":"hex"|"base64"|"base59"}
+  //   uuid: {}
+  //   string: {"length":N,"charset":"abc"}   (charset пустой = [a-zA-Z0-9])
+  //   choice: {"items":["a","b"]}            shuffle: {"items":["a","b"]}
+  random: async func(kind: string, params-json: string) -> result<string, string>;
 }
 
 // Регистрация HTTP-слушателей: http-фронт объявляет хосту, какие порты/URI

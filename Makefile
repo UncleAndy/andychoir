@@ -10,6 +10,8 @@ plugins:
 	cd plugins/tool_calculator_plugin && cargo build --target wasm32-wasip2
 	cd plugins/agent_plugin && cargo build --target wasm32-wasip2
 	cd plugins/mcp_client_plugin && cargo build --target wasm32-wasip2
+	cd plugins/filesystem_plugin && cargo build --target wasm32-wasip2
+	cd plugins/random_plugin && cargo build --target wasm32-wasip2
 
 all: host plugins
 
@@ -21,3 +23,5 @@ clean:
 	cd plugins/tool_calculator_plugin && cargo clean
 	cd plugins/agent_plugin && cargo clean
 	cd plugins/mcp_client_plugin && cargo clean
+	cd plugins/filesystem_plugin && cargo clean
+	cd plugins/random_plugin && cargo clean
