@@ -17,19 +17,19 @@
 
 | ID  | Область | Заголовок | Приоритет | Затронутые файлы |
 |-----|--------|-----------|-----------|------------------|
-| A1  | Алгоритм | `node_url` для входящих соединений = `"incoming"` ломает FIB-маршрутизацию к входящему соседу | 🟡 LOW* | `src/host/net/server.rs`, `src/host/net/forward.rs`, `src/host/net/net.rs` |
+| A1  | Алгоритм | `node_url` для входящих соединений = `"incoming"` ломает FIB-маршрутизацию к входящему соседу | 🟢 ГОТОВО | `src/host/net/server.rs`, `src/host/net/forward.rs`, `src/host/net/net.rs` |
 | A2  | Алгоритм | Утечка `PENDING_RESPONSES` / `RESPONSE_PAYLOADS` по `request_id` | 🟢 ГОТОВО | `src/plugin/engine.rs`, `src/messages/bus.rs`, `wit/plugin.wit`, `plugins/agent_plugin/src/handle_event.rs` |
 | A3  | Алгоритм | `history_append` держит write-lock на весь push (узкое место) | 🟢 ГОТОВО | `src/plugin/engine.rs` |
 | A4  | Алгоритм | Док-баг в WIT: `request-id`/`session-id` перепутаны в комментариях | 🟢 ГОТОВО | `wit/plugin.wit` |
-| B1  | Безопасность | Сетевая аутентификация отсутствует: `token` не проверяется | 🔴 HIGH | `src/host/net/server.rs`, `src/host/net/outbound.rs`, `src/config/config.rs` |
-| B2  | Безопасность | `PluginAccess::Network` не проверяется в `post_json` | 🔴 HIGH | `src/plugin/engine.rs`, `src/plugin/config.rs`, `wit/plugin.wit` |
+| B1  | Безопасность | Сетевая аутентификация отсутствует: `token` не проверяется | 🟢 ГОТОВО | `src/host/net/server.rs`, `src/host/net/outbound.rs`, `src/config/config.rs` |
+| B2  | Безопасность | `PluginAccess::Network` не проверяется в `post_json` | 🟢 ГОТОВО | `src/plugin/engine.rs`, `src/plugin/config.rs`, `wit/plugin.wit` |
 | B3  | Безопасность | MCP-транспорт = произвольный spawn процесса хоста | 🟢 ГОТОВО | `src/host/mcp_transport.rs`, `src/config/config.rs`, `src/main.rs` |
 | B4  | Безопасность | HTTP/WS-фронты без auth + обход `session_local` | 🟢 ГОТОВО | `src/host/http_server.rs`, `src/host/ws_server.rs`, `src/plugin/engine.rs`, `wit/plugin.wit`, `plugins/front_*/src/lib.rs` |
 | B5  | Безопасность | Утечка секретов в лог (`config` плагина) | 🟢 ГОТОВО | `src/plugin/engine.rs` |
 | B6  | Безопасность | `PluginAccess::Filesystem` объявлено, но не реализовано (мёртвое право) | 🟢 ГОТОВО | `src/plugin/config.rs`, `src/plugin/engine.rs`, `wit/plugin.wit`, `plugins/filesystem_plugin` |
 | B7  | Безопасность | Metrics-экспортер без auth на `0.0.0.0` | 🟢 ГОТОВО | `src/metrics.rs`, `src/config/config.rs`, `src/main.rs` |
 | B8  | Безопасность | `build_http_response`: `unwrap` на невалидном `status` из payload | 🟢 ГОТОВО | `src/host/http_server.rs` |
-| B9  | Безопасность | `std::process::exit(1)` внутри tokio-задачи при стартовом таймауте | 🟡 LOW | `src/main.rs` |
+| B9  | Безопасность | `std::process::exit(1)` внутри tokio-задачи при стартовом таймауте | 🟢 ГОТОВО | `src/main.rs` |
 | B10 | Безопасность | mTLS для межхозяйских линков (внутренний CA, взаимная аутентификация, опц. привязка SAN) | 🟢 ГОТОВО | `src/host/net/tls.rs`, `src/host/net/server.rs`, `src/host/net/outbound.rs`, `src/config/config.rs` |
 
 > \*A1 технически не security, но ломает корректность mesh для асимметричных связей — выделен отдельно по просьбе.
@@ -133,7 +133,7 @@ session-id: string, // Сквозной ID пользовательского з
 
 # Часть B. Безопасность (по приоритету)
 
-## B1. 🔴 Сетевая аутентификация отсутствует: `token` не проверяется
+## B1. 🟢 Сетевая аутентификация отсутствует: `token` не проверяется (РЕАЛИЗОВАНО)
 
 **Проблема.**
 - `src/config/config.rs` определяет `NetConfig.token: Vec<String>` (токены для входящих) и `NetRemote.token: String` (токен на удалённый хост).
@@ -158,9 +158,16 @@ session-id: string, // Сквозной ID пользовательского з
 - Соединение с верным токеном → обмен `Capabilities`/`Hello` проходит (существующие тесты discovery остаются зелёными).
 - Тест на стороне `outbound`: исходящее соединение шлёт `Auth` первым.
 
+**Статус: РЕАЛИЗОВАНО (2026-09-07).** Добавлен `NetMessage::Auth { token }`; `handle_incoming`
+требует `Auth` первым сообщением и сверяет с `inner.cfg.token` (открытый режим, если список
+токенов пуст); `run_outbound_loop` шлёт `Auth` первым. Тесты: модуль `b1_auth_tests` в
+`src/host/net/server.rs` — `b1_rejects_without_auth`, `b1_rejects_wrong_token`,
+`b1_accepts_valid_token`, `b1_open_mode_no_token_required`, а также mTLS-тесты
+(`mtls_accepts_valid_cert_and_registers`, `mtls_rejects_plain_ws`).
+
 ---
 
-## B2. 🔴 `PluginAccess::Network` не проверяется в `post_json`
+## B2. 🟢 `PluginAccess::Network` не проверяется в `post_json` (РЕАЛИЗОВАНО)
 
 **Проблема.**
 `src/plugin/engine.rs:756` (`HostWithStore::post_json`):
@@ -182,6 +189,11 @@ async fn post_json(_accessor, url, json_body) -> (u16, String) {
 **Критерии приёмки (тесты).**
 - `can_plugin_network` разрешает точное `(host, port)` совпадение, запрещает всё остальное при пустом списке, запрещает без права `Network`.
 - Интеграционный: плагин без `Network` получает `(403, …)` на любой `post_json`.
+
+**Статус: РЕАЛИЗОВАНО (2026-09-07).** Добавлена `can_plugin_network(perms, url) -> bool`
+(`src/plugin/engine.rs:856`, fail-closed, белый список по `host`+`port`, чувствительна к схеме);
+`post_json` проверяет права через `accessor.with(...)` и возвращает `403` при отказе.
+8 юнит-тестов в `src/plugin/engine.rs` (модуль `tests`, блок `can_plugin_network (B2)`).
 
 ---
 
@@ -319,7 +331,7 @@ builder.body(Body::from(response_body)).unwrap()
 
 ---
 
-## B9. 🟡 `std::process::exit(1)` внутри tokio-задачи при стартовом таймауте
+## B9. 🟢 `std::process::exit(1)` внутри tokio-задачи при стартовом таймауте (РЕАЛИЗОВАНО)
 
 **Проблема.** `src/main.rs:154` внутри `tokio::spawn` при стартовом таймауте готовности:
 ```rust
@@ -334,6 +346,16 @@ std::process::exit(1);
 
 **Критерии приёмки.**
 - Поведенческий тест/smoke: при неготовности плагинов за `startup.timeout_secs` процесс завершается с кодом 1, логи дописаны.
+
+**Статус: РЕАЛИЗОВАНО (2026-09-08).** `std::process::exit(1)` удалён из tokio-задачи.
+Добавлен канал `tokio::sync::watch` (`shutdown_tx`/`shutdown_rx`): при стартовом таймауте
+задача только логирует ошибку и отправляет `true` — процесс она больше не убивает.
+В главный `tokio::select!` добавлена третья ветка (`shutdown_rx.changed()`), которая
+выставляет флаг `startup_failed`. Далее выполняется общий graceful shutdown (остановка
+saver, сохранение сессий и историй на диск, остановка фоновых плагинов,
+`event_bus.shutdown()`), и `main` возвращает `Err(...)` — код выхода 1, но с корректным
+завершением. Обычный выход возвращает `Ok(())` (код 0) вместо `std::process::exit(0)`.
+Проверено: `cargo check --all-targets` чисто, `cargo test --lib` → 155 passed, 0 warnings.
 
 ---
 

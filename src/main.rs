@@ -123,7 +123,11 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
 
     // ============ Таймер готовности: ждём status:"ready" от ВСЕХ плагинов ============
     // Если за startup.timeout_secs не все плагины отчитались о готовности —
-    // выходим из приложения с ошибкой и списком неготовых (fail-fast).
+    // инициируем graceful shutdown (B9) и выходим с кодом ошибки.
+    // Раньше здесь был std::process::exit(1) ВНУТРИ tokio-задачи: он убивал
+    // процесс мгновенно, не давая плагинам/шине/истории корректно завершиться
+    // (терялись логи и несохранённые сессии). Теперь только сигнал.
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     {
         let readiness = event_bus.readiness.clone();
         let all_names = all_plugin_names.clone();
@@ -150,13 +154,13 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
                 .collect();
             error!(
                 "[Хост] СТАРТОВЫЙ ТАЙМАУТ ({}с) истёк, не все плагины инициализировались. \
-                 Неготовые плагины: {:?}. Выход.",
+                 Неготовые плагины: {:?}. Инициирую корректное завершение.",
                 timeout.as_secs(),
                 not_ready
             );
-            // Даём время профлашить stderr/лог перед выходом.
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            std::process::exit(1);
+            // B9: НЕ exit(1). Сигналим основному циклу — он выполнит shutdown
+            // (сохранение историй, остановка плагинов и шины) и вернёт ошибку.
+            let _ = shutdown_tx.send(true);
         });
     }
 
@@ -179,10 +183,20 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
         }
     });
 
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result?,
-        () = host::console::wait_for_interrupt() => (),
-    }
+    // B9: ждём либо сигнал ОС/консоли (обычный выход), либо сигнал от
+    // стартового таймера (выход с ошибкой). В обоих случаях выполняется
+    // один и тот же graceful shutdown ниже — без std::process::exit в задаче.
+    let startup_failed = tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result?;
+            false
+        }
+        () = host::console::wait_for_interrupt() => false,
+        _ = shutdown_rx.changed() => {
+            // Стартовый таймаут: плагины не инициализировались.
+            true
+        }
+    };
     info!("[Хост] Завершение работы...");
 
     // Останавливаем saver-цикл.
@@ -202,8 +216,15 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     }
     event_bus.shutdown().await;
 
+    if startup_failed {
+        // B9: корректный выход с кодом 1 (без std::process::exit внутри задачи).
+        // Всё уже сохранено и остановлено — процесс завершится сам.
+        error!("[Хост] Выход из процесса с кодом 1 (стартовый таймаут).");
+        return Err("стартовый таймаут: не все плагины инициализировались".into());
+    }
+
     info!("[Хост] Выход из процесса.");
-    std::process::exit(0);
+    Ok(())
 }
 
 /// Консольный фронт (REPL): читает строки от пользователя, публикует их как

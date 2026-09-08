@@ -17,19 +17,19 @@
 
 | ID  | Area | Title | Priority | Files |
 |-----|------|-------|----------|-------|
-| A1  | Algo | `node_url` for incoming connections = `"incoming"` breaks FIB to incoming neighbor | 🟡 LOW* | `src/host/net/server.rs`, `src/host/net/forward.rs`, `src/host/net/net.rs` |
+| A1  | Algo | `node_url` for incoming connections = `"incoming"` breaks FIB to incoming neighbor | 🟢 DONE | `src/host/net/server.rs`, `src/host/net/forward.rs`, `src/host/net/net.rs` |
 | A2  | Algo | `PENDING_RESPONSES` / `RESPONSE_PAYLOADS` leak per `request_id` | 🟢 DONE | `src/plugin/engine.rs`, `src/messages/bus.rs`, `wit/plugin.wit`, `plugins/agent_plugin/src/handle_event.rs` |
 | A3  | Algo | `history_append` holds write-lock for the whole push (contention) | 🟢 DONE | `src/plugin/engine.rs` |
 | A4  | Algo | WIT doc bug: `request-id`/`session-id` comments swapped | 🟢 DONE | `wit/plugin.wit` |
-| B1  | Sec  | Network auth missing: `token` never validated | 🔴 HIGH | `src/host/net/server.rs`, `src/host/net/outbound.rs`, `src/config/config.rs` |
-| B2  | Sec  | `PluginAccess::Network` not enforced in `post_json` | 🔴 HIGH | `src/plugin/engine.rs`, `src/plugin/config.rs`, `wit/plugin.wit` |
+| B1  | Sec  | Network auth missing: `token` never validated | 🟢 DONE | `src/host/net/server.rs`, `src/host/net/outbound.rs`, `src/config/config.rs` |
+| B2  | Sec  | `PluginAccess::Network` not enforced in `post_json` | 🟢 DONE | `src/plugin/engine.rs`, `src/plugin/config.rs`, `wit/plugin.wit` |
 | B3  | Sec  | MCP transport = arbitrary host process spawn | 🟢 DONE | `src/host/mcp_transport.rs`, `src/config/config.rs`, `src/main.rs` |
 | B4  | Sec  | HTTP/WS frontends without auth + `session_local` bypass | 🟢 DONE | `src/host/http_server.rs`, `src/host/ws_server.rs`, `src/plugin/engine.rs`, `wit/plugin.wit`, `plugins/front_*/src/lib.rs` |
 | B5  | Sec  | Secret leak to log (plugin `config`) | 🟢 DONE | `src/plugin/engine.rs` |
 | B6  | Sec  | `PluginAccess::Filesystem` declared but unused (dead right) | 🟢 DONE | `src/plugin/config.rs`, `src/plugin/engine.rs`, `wit/plugin.wit`, `plugins/filesystem_plugin` |
 | B7  | Sec  | Metrics exporter without auth on `0.0.0.0` | 🟢 DONE | `src/metrics.rs`, `src/config/config.rs`, `src/main.rs` |
 | B8  | Sec  | `build_http_response`: `unwrap` on invalid `status` from payload | 🟢 DONE | `src/host/http_server.rs` |
-| B9  | Sec  | `std::process::exit(1)` inside tokio task on startup timeout | 🟡 LOW | `src/main.rs` |
+| B9  | Sec  | `std::process::exit(1)` inside tokio task on startup timeout | 🟢 DONE | `src/main.rs` |
 | B10 | Sec  | mTLS for inter-host links (internal CA, mutual auth, optional SAN binding) | 🟢 DONE | `src/host/net/tls.rs`, `src/host/net/server.rs`, `src/host/net/outbound.rs`, `src/config/config.rs` |
 
 > \*A1 is not security but breaks mesh correctness for asymmetric links — listed separately per request.
@@ -131,7 +131,7 @@ No schema change — fully backward compatible. (Doc-only; no behavior change, s
 
 # Part B. Security (by priority)
 
-## B1. 🔴 Network authentication missing: `token` never validated
+## B1. 🟢 Network authentication missing: `token` never validated (IMPLEMENTED)
 
 **Problem.**
 - `src/config/config.rs` defines `NetConfig.token: Vec<String>` (incoming tokens) and `NetRemote.token: String` (token to remote).
@@ -156,9 +156,16 @@ The `token` field creates a false sense of security.
 - Connection with valid token → `Capabilities`/`Hello` exchange proceeds (existing discovery tests stay green).
 - Outbound-side test: outgoing connection sends `Auth` first.
 
+**Status: IMPLEMENTED (2026-09-07).** `NetMessage::Auth { token }` added; `handle_incoming`
+requires `Auth` as first message and validates against `inner.cfg.token` (open mode when
+token list is empty); `run_outbound_loop` sends `Auth` first. Tests: module `b1_auth_tests`
+in `src/host/net/server.rs` — `b1_rejects_without_auth`, `b1_rejects_wrong_token`,
+`b1_accepts_valid_token`, `b1_open_mode_no_token_required`, plus mTLS tests
+(`mtls_accepts_valid_cert_and_registers`, `mtls_rejects_plain_ws`).
+
 ---
 
-## B2. 🔴 `PluginAccess::Network` not enforced in `post_json`
+## B2. 🟢 `PluginAccess::Network` not enforced in `post_json` (IMPLEMENTED)
 
 **Problem.** `src/plugin/engine.rs:756` (`HostWithStore::post_json`):
 ```rust
@@ -178,6 +185,11 @@ async fn post_json(_accessor, url, json_body) -> (u16, String) {
 **Acceptance (tests).**
 - `can_plugin_network` allows exact `(host, port)`, denies everything else on empty list, denies without `Network` right.
 - Integration: plugin without `Network` gets `(403, …)` on any `post_json`.
+
+**Status: IMPLEMENTED (2026-09-07).** `can_plugin_network(perms, url) -> bool` added
+(`src/plugin/engine.rs:856`, fail-closed, whitelist by `host`+`port`, scheme-sensitive);
+`post_json` validates permissions via `accessor.with(...)` and returns `403` on denial.
+8 unit tests in `src/plugin/engine.rs` (module `tests`, block `can_plugin_network (B2)`).
 
 ---
 
@@ -310,7 +322,7 @@ builder.body(Body::from(response_body)).unwrap()
 
 ---
 
-## B9. 🟡 `std::process::exit(1)` inside tokio task on startup timeout
+## B9. 🟢 `std::process::exit(1)` inside tokio task on startup timeout (IMPLEMENTED)
 
 **Problem.** `src/main.rs:154` inside `tokio::spawn` on startup readiness timeout:
 ```rust
@@ -325,6 +337,16 @@ Abrupt exit from a task (without waiting for other tasks'/logger's graceful shut
 
 **Acceptance.**
 - Behavioral/smoke: on plugin unreadiness within `startup.timeout_secs`, process exits code 1, logs flushed.
+
+**Status: IMPLEMENTED (2026-09-08).** `std::process::exit(1)` removed from the tokio task.
+Added a `tokio::sync::watch` channel (`shutdown_tx`/`shutdown_rx`): on startup timeout the
+task only logs the error and sends `true` — it no longer kills the process. The main
+`tokio::select!` now has a third branch (`shutdown_rx.changed()`) and records
+`startup_failed`. Afterwards the common graceful shutdown runs (saver stopped, sessions
+and histories saved to disk, background plugins stopped, `event_bus.shutdown()`), and
+`main` returns `Err(...)` — exit code 1, but with a clean shutdown. Normal exit path
+returns `Ok(())` (code 0) instead of `std::process::exit(0)`. Verified: `cargo check
+--all-targets` clean, `cargo test --lib` → 155 passed, 0 warnings.
 
 ---
 
