@@ -26,7 +26,7 @@
 | B3  | Sec  | MCP transport = arbitrary host process spawn | 🟢 DONE | `src/host/mcp_transport.rs`, `src/config/config.rs`, `src/main.rs` |
 | B4  | Sec  | HTTP/WS frontends without auth + `session_local` bypass | 🟢 DONE | `src/host/http_server.rs`, `src/host/ws_server.rs`, `src/plugin/engine.rs`, `wit/plugin.wit`, `plugins/front_*/src/lib.rs` |
 | B5  | Sec  | Secret leak to log (plugin `config`) | 🟢 DONE | `src/plugin/engine.rs` |
-| B6  | Sec  | `PluginAccess::Filesystem` declared but unused (dead right) | 🟡 LOW | `src/plugin/config.rs`, `src/plugin/engine.rs` |
+| B6  | Sec  | `PluginAccess::Filesystem` declared but unused (dead right) | 🟢 DONE | `src/plugin/config.rs`, `src/plugin/engine.rs`, `wit/plugin.wit`, `plugins/filesystem_plugin` |
 | B7  | Sec  | Metrics exporter without auth on `0.0.0.0` | 🟢 DONE | `src/metrics.rs`, `src/config/config.rs`, `src/main.rs` |
 | B8  | Sec  | `build_http_response`: `unwrap` on invalid `status` from payload | 🟢 DONE | `src/host/http_server.rs` |
 | B9  | Sec  | `std::process::exit(1)` inside tokio task on startup timeout | 🟡 LOW | `src/main.rs` |
@@ -261,16 +261,20 @@ This makes secret logging opt-in and explicit, consistent with `mcp_transport`'s
 
 ---
 
-## B6. 🟡 `PluginAccess::Filesystem` declared but unused
+## B6. 🟢 `PluginAccess::Filesystem` implemented as a real, scoped FS right (IMPLEMENTED)
 
-**Problem.** `src/plugin/config.rs:9` `Filesystem(String, String, String)` (path, dir_perms, file_perms) — dead right; WIT/WASI only has `read_file` (read-only). No write from WASM. Misleading (implies write control that doesn't exist).
+**Problem.** `src/plugin/config.rs:9` `Filesystem(String, String, String)` (path, dir_perms, file_perms) was a dead right — only `read_file` existed (read-only via the separate `ReadFile` allowlist). The `filesystem` right did nothing; WASM plugins had no write/delete/list/move/copy/stat/patch access at all.
 
-**Fix.**
-1. Either remove `Filesystem` from `PluginAccess` (and WIT) until implemented.
-2. Or implement `write_file` with the same allowlist (fail-closed) — but that widens the surface, not required by this audit. Variant 1 (honest contract) recommended.
+**Fix.** Made `PluginAccess::Filesystem` the single source of truth for plugin FS access (scoped, fail-closed):
+1. `can_plugin_fs(perms, path, want_write)` checks the requested `path` lies under `root` (normalized without touching disk, so it works for not-yet-existing paths; `..` is folded via `normalize_prefix`, defeating traversal) and that `want_write` ⇒ both `dir_perms` and `file_perms` == `"rw"`. Read ⇒ `ro` or `rw`. Fail-closed.
+2. `read_file` WIT-impl now permits either the `ReadFile` allowlist **or** `Filesystem(root, …)` with the path under root.
+3. Added 10 FS host-control functions to `wit/plugin.wit` + `src/plugin/engine.rs` (all gated by `fs_check_access`): `write-file`, `append-file`, `remove-file`, `make-dir`, `remove-dir`, `move-path`, `copy-file`, `list-dir` (JSON), `stat-path` (JSON), `patch-file` (fail-closed: `old` substring must exist, no partial replace).
+4. New plugin `plugins/filesystem_plugin` (cdylib → wasm component) exposes 11 tools: `fs-read`, `fs-write`, `fs-append`, `fs-remove`, `fs-mkdir`, `fs-rmdir`, `fs-move`, `fs-copy`, `fs-list`, `fs-stat`, `fs-patch`. Each calls the corresponding `host_control::*` function; the host enforces `Filesystem` perms. Agent config grants e.g. `access: [{ filesystem: ["/srv/data", "rw", "rw"] }]`.
 
 **Acceptance.**
-- `cargo build` without the unused enum variant (or documented `#[allow(dead_code)]` marked "planned").
+- `can_plugin_fs` unit tests: read allowed under root, denied outside root (`/srv/data/../etc/passwd`, `/etc/passwd`), write denied with `ro`, denied without `filesystem` perm.
+- Host builds; `plugins/filesystem_plugin` builds for `wasm32-wasip2`.
+- `cargo test --lib`: 142 passed (incl. B6 tests), 0 failed.
 
 ---
 

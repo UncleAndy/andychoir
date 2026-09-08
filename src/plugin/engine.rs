@@ -748,6 +748,53 @@ pub(crate) fn can_plugin_read_file(perms: &[PluginAccess], path: &str) -> bool {
     })
 }
 
+/// Нормализация пути БЕЗ обращения к файловой системе (путь может не
+/// существовать). Убирает `.` и сворачивает `..`, возвращая абсолютный
+/// путь-префикс компонентов. Это позволяет проверять root-ограничение права
+/// `filesystem` до реального доступа к диску (в отличие от canonical_abs,
+/// который требует существования пути).
+fn normalize_prefix(path: &str) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for comp in std::path::Path::new(path).components() {
+        match comp {
+            Component::CurDir => {} // "."
+            Component::ParentDir => { out.pop(); } // ".."
+            Component::Normal(s) => out.push(s),
+            Component::RootDir => out.push("/"),
+            Component::Prefix(p) => out.push(p.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Проверка права плагина на доступ к файловой системе (Filesystem).
+/// `PluginAccess::Filesystem(root, dir_perms, file_perms)`:
+/// - path должен лежать под `root` (нормализованно, защита от `..`);
+/// - `want_write=true` требует оба perms == "rw".
+/// Fail-closed: без права / путь вне root → false.
+/// Проверка через normalize_prefix (без обращения к диску), поэтому работает
+/// и для ещё не созданных путей (например, перед записью нового файла).
+pub(crate) fn can_plugin_fs(perms: &[PluginAccess], path: &str, want_write: bool) -> bool {
+    let req = normalize_prefix(path);
+    perms.iter().any(|p| {
+        if let PluginAccess::Filesystem(root, dir_perms, file_perms) = p {
+            let root_norm = normalize_prefix(root);
+            let under_root = req.starts_with(&root_norm);
+            if !under_root {
+                return false;
+            }
+            if want_write {
+                file_perms == "rw" && dir_perms == "rw"
+            } else {
+                file_perms == "ro" || file_perms == "rw"
+            }
+        } else {
+            false
+        }
+    })
+}
+
 /// Извлечь (host, port) из URL для проверки сетевых прав.
 /// Поддерживает схемы http/https/ws/wss, IPv4 и IPv6 (`[..]:port`),
 /// а также дефолтные порты (http=80, https/ws=443, wss=443).
@@ -967,6 +1014,31 @@ impl crate::ai::host::console::HostWithStore<ChoirHostState> for ChoirHostState 
     }
 }
 
+// Вспомогательная проверка права filesystem (свободная функция, как can_plugin_fs).
+// Возвращает Err(строка), если доступ запрещён (fail-closed).
+async fn fs_check_access(
+    accessor: &wasmtime::component::Accessor<ChoirHostState, ChoirHostState>,
+    path: &str,
+    want_write: bool,
+) -> Result<(), String> {
+    let has_access = accessor.with(|mut access| {
+        access
+            .get()
+            .current_plugin_permissions
+            .as_ref()
+            .map(|perms| can_plugin_fs(perms, path, want_write))
+            .unwrap_or(false)
+    });
+    if !has_access {
+        return Err(format!(
+            "fs: доступ к '{}' запрещён (нет права filesystem с {})",
+            path,
+            if want_write { "rw" } else { "ro/rw" }
+        ));
+    }
+    Ok(())
+}
+
 // Реализация host-control.wait-for-ready: блокирует до сигнала готовности.
 impl crate::ai::host::host_control::Host for ChoirHostState {}
 
@@ -1078,17 +1150,21 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
         accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
         path: String,
     ) -> Result<String, String> {
-        // Проверяем право плагина на чтение этого пути (белый список read_file).
+        // Проверяем право плагина на чтение этого пути:
+        // - белый список `read_file` ИЛИ
+        // - право `filesystem` с path под root (ro/rw).
         let has_access = accessor.with(|mut access| {
             let host_state = access.get();
             host_state
                 .current_plugin_permissions
                 .as_ref()
-                .map(|perms| can_plugin_read_file(perms, &path))
+                .map(|perms| {
+                    can_plugin_read_file(perms, &path) || can_plugin_fs(perms, &path, false)
+                })
                 .unwrap_or(false)
         });
         if !has_access {
-            return Err(format!("read_file: доступ к '{}' запрещён (нет права read_file)", path));
+            return Err(format!("read_file: доступ к '{}' запрещён (нет права read_file/filesystem)", path));
         }
         // Лимит размера файла — защита от чтения гигантских файлов.
         const MAX_FILE_BYTES: u64 = 1024 * 1024; // 1 МБ
@@ -1105,6 +1181,157 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
         }
         std::fs::read_to_string(&path)
             .map_err(|e| format!("read_file: ошибка чтения '{}': {}", path, e))
+    }
+
+    async fn write_file(
+        accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        path: String,
+        contents: String,
+    ) -> Result<(), String> {
+        fs_check_access(accessor, &path, true).await?;
+        std::fs::write(&path, contents)
+            .map_err(|e| format!("write_file: ошибка записи '{}': {}", path, e))
+    }
+
+    async fn append_file(
+        accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        path: String,
+        contents: String,
+    ) -> Result<(), String> {
+        fs_check_access(accessor, &path, true).await?;
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("append_file: не удалось открыть '{}': {}", path, e))?;
+        f.write_all(contents.as_bytes())
+            .map_err(|e| format!("append_file: ошибка записи '{}': {}", path, e))
+    }
+
+    async fn remove_file(
+        accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        path: String,
+    ) -> Result<(), String> {
+        fs_check_access(accessor, &path, true).await?;
+        std::fs::remove_file(&path)
+            .map_err(|e| format!("remove_file: ошибка удаления '{}': {}", path, e))
+    }
+
+    async fn make_dir(
+        accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        path: String,
+    ) -> Result<(), String> {
+        fs_check_access(accessor, &path, true).await?;
+        std::fs::create_dir_all(&path)
+            .map_err(|e| format!("make_dir: ошибка создания '{}': {}", path, e))
+    }
+
+    async fn remove_dir(
+        accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        path: String,
+    ) -> Result<(), String> {
+        fs_check_access(accessor, &path, true).await?;
+        std::fs::remove_dir_all(&path)
+            .map_err(|e| format!("remove_dir: ошибка удаления '{}': {}", path, e))
+    }
+
+    async fn move_path(
+        accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        src: String,
+        dst: String,
+    ) -> Result<(), String> {
+        fs_check_access(accessor, &src, true).await?;
+        fs_check_access(accessor, &dst, true).await?;
+        std::fs::rename(&src, &dst)
+            .map_err(|e| format!("move_path: ошибка перемещения '{}' -> '{}': {}", src, dst, e))
+    }
+
+    async fn copy_file(
+        accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        src: String,
+        dst: String,
+    ) -> Result<(), String> {
+        fs_check_access(accessor, &src, false).await?;
+        fs_check_access(accessor, &dst, true).await?;
+        std::fs::copy(&src, &dst)
+            .map_err(|e| format!("copy_file: ошибка копирования '{}' -> '{}': {}", src, dst, e))
+            .map(|_| ())
+    }
+
+    async fn list_dir(
+        accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        path: String,
+    ) -> Result<String, String> {
+        fs_check_access(accessor, &path, false).await?;
+        let entries = std::fs::read_dir(&path)
+            .map_err(|e| format!("list_dir: не удалось открыть '{}': {}", path, e))?;
+        let mut out = Vec::new();
+        for e in entries {
+            let e = e.map_err(|e| format!("list_dir: ошибка чтения записи: {}", e))?;
+            let p = e.path();
+            let meta = e.metadata().map_err(|e| format!("list_dir: meta: {}", e))?;
+            out.push(serde_json::json!({
+                "name": e.file_name().to_string_lossy(),
+                "path": p.to_string_lossy(),
+                "kind": if meta.is_dir() { "dir" } else { "file" },
+                "size": meta.len(),
+            }));
+        }
+        serde_json::to_string(&out)
+            .map_err(|e| format!("list_dir: сериализация: {}", e))
+    }
+
+    async fn stat_path(
+        accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        path: String,
+    ) -> Result<String, String> {
+        fs_check_access(accessor, &path, false).await?;
+        let meta = std::fs::metadata(&path)
+            .map_err(|e| format!("stat_path: '{}': {}", path, e))?;
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        serde_json::to_string(&serde_json::json!({
+            "kind": if meta.is_dir() { "dir" } else { "file" },
+            "size": meta.len(),
+            "modified": modified,
+            "is_file": meta.is_file(),
+            "is_dir": meta.is_dir(),
+        }))
+        .map_err(|e| format!("stat_path: сериализация: {}", e))
+    }
+
+    async fn patch_file(
+        accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        path: String,
+        old: String,
+        new: String,
+    ) -> Result<(), String> {
+        fs_check_access(accessor, &path, true).await?;
+        const MAX_FILE_BYTES: u64 = 1024 * 1024;
+        let meta = std::fs::metadata(&path)
+            .map_err(|e| format!("patch_file: метаданные '{}': {}", path, e))?;
+        if !meta.is_file() {
+            return Err(format!("patch_file: '{}' не является файлом", path));
+        }
+        if meta.len() > MAX_FILE_BYTES {
+            return Err(format!("patch_file: файл '{}' слишком большой", path));
+        }
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("patch_file: чтение '{}': {}", path, e))?;
+        if !content.contains(&old) {
+            return Err(format!(
+                "patch_file: образец 'old' не найден в '{}' (fail-closed, частичная замена запрещена)",
+                path
+            ));
+        }
+        let patched = content.replace(&old, &new);
+        std::fs::write(&path, patched)
+            .map_err(|e| format!("patch_file: запись '{}': {}", path, e))
     }
 }
 
@@ -1706,6 +1933,40 @@ mod tests {
         assert!(!can_plugin_read_file(&perms, "./README.md"));
         let perms2 = vec![PluginAccess::ConsolePrint(100)];
         assert!(!can_plugin_read_file(&perms2, "./README.md"));
+    }
+
+    // --- can_plugin_fs (B6): право filesystem, root + ro/rw, защита от path-traversal ---
+
+    #[test]
+    fn fs_read_allowed_under_root() {
+        let perms = vec![PluginAccess::Filesystem("/srv/data".into(), "rw".into(), "rw".into())];
+        assert!(can_plugin_fs(&perms, "/srv/data/a.txt", false));
+        assert!(can_plugin_fs(&perms, "/srv/data/sub/b.txt", false));
+        assert!(can_plugin_fs(&perms, "/srv/data/a.txt", true)); // rw => запись тоже
+    }
+
+    #[test]
+    fn fs_read_denied_outside_root() {
+        let perms = vec![PluginAccess::Filesystem("/srv/data".into(), "rw".into(), "rw".into())];
+        // path traversal вне root
+        assert!(!can_plugin_fs(&perms, "/srv/data/../etc/passwd", false));
+        assert!(!can_plugin_fs(&perms, "/etc/passwd", false));
+        assert!(!can_plugin_fs(&perms, "/srv/other/x", false));
+    }
+
+    #[test]
+    fn fs_write_denied_with_ro_perms() {
+        // dir_perms/file_perms = "ro": чтение разрешено, запись — нет.
+        let perms = vec![PluginAccess::Filesystem("/srv/data".into(), "ro".into(), "ro".into())];
+        assert!(can_plugin_fs(&perms, "/srv/data/a.txt", false));
+        assert!(!can_plugin_fs(&perms, "/srv/data/a.txt", true));
+    }
+
+    #[test]
+    fn fs_denied_without_filesystem_perm() {
+        let perms = vec![PluginAccess::ConsolePrint(100)];
+        assert!(!can_plugin_fs(&perms, "/srv/data/a.txt", false));
+        assert!(!can_plugin_fs(&perms, "/srv/data/a.txt", true));
     }
 
     // --- can_plugin_network (B2): fail-closed, белый список host:port ---------

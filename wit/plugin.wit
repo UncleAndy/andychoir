@@ -120,12 +120,42 @@ interface host-control {
   // фоновым, а конфиг должен быть одинаковым. Хост хранит конфиг плагина.
   get-plugin-config: async func() -> string;
 
-  // Прочитать файл. Плагину доступны ТОЛЬКО пути из его права `read_file`
-  // (белый список). И запрошенный путь, и пути из прав приводятся к
-  // абсолютному каноническому виду перед сравнением (иначе можно обойти
-  // белый список через `..`/относительные пути). Лимит размера — как у
-  // console_print. Возвращает Ok(содержимое) или Err(причина).
+  // Прочитать файл. Доступны ТОЛЬКО пути под root права `filesystem`
+  // (или из белого списка `read_file`). Path приводится к каноническому
+  // абсолютному виду (защита от `..`). Лимит размера — как у console_print.
   read-file: async func(path: string) -> result<string, string>;
+
+  // Записать файл (только при праве `filesystem` с rw). Path под root.
+  write-file: async func(path: string, contents: string) -> result<_, string>;
+
+  // Дописать в конец файла (append, требует rw).
+  append-file: async func(path: string, contents: string) -> result<_, string>;
+
+  // Удалить файл (требует rw).
+  remove-file: async func(path: string) -> result<_, string>;
+
+  // Создать каталог (рекурсивно, требует rw).
+  make-dir: async func(path: string) -> result<_, string>;
+
+  // Удалить каталог рекурсивно (требует rw).
+  remove-dir: async func(path: string) -> result<_, string>;
+
+  // Переименовать/переместить файл или каталог (требует rw).
+  move-path: async func(src: string, dst: string) -> result<_, string>;
+
+  // Скопировать файл (требует rw в целевом каталоге).
+  copy-file: async func(src: string, dst: string) -> result<_, string>;
+
+  // Список содержимого каталога (read-only, path под root).
+  // Возвращает JSON-массив записей {name, path, kind: "file"|"dir", size}.
+  list-dir: async func(path: string) -> result<string, string>;
+
+  // Статус файла/каталога (read-only): JSON {kind, size, modified, is_file, is_dir}.
+  stat-path: async func(path: string) -> result<string, string>;
+
+  // Точечная правка файла: заменить `old` на `new` (требует rw). Ошибка, если
+  // `old` не найден (fail-closed — не частичная перезапись).
+  patch-file: async func(path: string, old: string, new: string) -> result<_, string>;
 }
 
 // Регистрация HTTP-слушателей: http-фронт объявляет хосту, какие порты/URI

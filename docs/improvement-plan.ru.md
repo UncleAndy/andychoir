@@ -26,7 +26,7 @@
 | B3  | Безопасность | MCP-транспорт = произвольный spawn процесса хоста | 🟢 ГОТОВО | `src/host/mcp_transport.rs`, `src/config/config.rs`, `src/main.rs` |
 | B4  | Безопасность | HTTP/WS-фронты без auth + обход `session_local` | 🟢 ГОТОВО | `src/host/http_server.rs`, `src/host/ws_server.rs`, `src/plugin/engine.rs`, `wit/plugin.wit`, `plugins/front_*/src/lib.rs` |
 | B5  | Безопасность | Утечка секретов в лог (`config` плагина) | 🟢 ГОТОВО | `src/plugin/engine.rs` |
-| B6  | Безопасность | `PluginAccess::Filesystem` объявлено, но не реализовано (мёртвое право) | 🟡 LOW | `src/plugin/config.rs`, `src/plugin/engine.rs` |
+| B6  | Безопасность | `PluginAccess::Filesystem` объявлено, но не реализовано (мёртвое право) | 🟢 ГОТОВО | `src/plugin/config.rs`, `src/plugin/engine.rs`, `wit/plugin.wit`, `plugins/filesystem_plugin` |
 | B7  | Безопасность | Metrics-экспортер без auth на `0.0.0.0` | 🟢 ГОТОВО | `src/metrics.rs`, `src/config/config.rs`, `src/main.rs` |
 | B8  | Безопасность | `build_http_response`: `unwrap` на невалидном `status` из payload | 🟢 ГОТОВО | `src/host/http_server.rs` |
 | B9  | Безопасность | `std::process::exit(1)` внутри tokio-задачи при стартовом таймауте | 🟡 LOW | `src/main.rs` |
@@ -270,16 +270,20 @@ info!("[Хост] Конфигурация плагина: {:?}", config_str);
 
 ---
 
-## B6. 🟡 `PluginAccess::Filesystem` объявлено, но не реализовано
+## B6. 🟢 `PluginAccess::Filesystem` реализовано как настоящее, изолированное право ФС (РЕАЛИЗОВАНО)
 
-**Проблема.** `src/plugin/config.rs:9` `Filesystem(String, String, String)` (path, dir_perms, file_perms) — мёртвое право; в WIT/WASI только `read_file` (read-only). Запись из WASM не предусмотрена. Вводит в заблуждение (намёкает на контроль записи, которого нет).
+**Проблема.** `src/plugin/config.rs:9` `Filesystem(String, String, String)` (path, dir_perms, file_perms) было мёртвым правом — существовал только `read_file` (read-only через отдельный белый список `ReadFile`). Право `filesystem` ничего не делало; WASM-плагины не имели доступа на запись/удаление/листинг/перемещение/копирование/stat/patch.
 
-**Решение.**
-1. Либо удалить `Filesystem` из `PluginAccess` (и WIT), пока не реализовано.
-2. Либо реализовать `write_file` с этим же белым списком (fail-closed) — но это расширение поверхности, не требуемое текущим аудитом. Рекомендуется вариант 1 (честность контракта).
+**Решение.** Сделано `PluginAccess::Filesystem` единственным источником истины для FS-доступа плагина (изолированно, fail-closed):
+1. `can_plugin_fs(perms, path, want_write)` проверяет, что запрошенный `path` лежит под `root` (нормализуется БЕЗ обращения к диску — работает и для ещё не созданных путей; `..` сворачивается через `normalize_prefix`, блокируя traversal) и что `want_write` ⇒ оба `dir_perms` и `file_perms` == `"rw"`. Чтение ⇒ `ro` или `rw`. Fail-closed.
+2. `read_file` WIT-impl теперь разрешает либо белый список `ReadFile`, либо `Filesystem(root, …)` с path под root.
+3. Добавлены 10 FS host-control функций в `wit/plugin.wit` + `src/plugin/engine.rs` (все под `fs_check_access`): `write-file`, `append-file`, `remove-file`, `make-dir`, `remove-dir`, `move-path`, `copy-file`, `list-dir` (JSON), `stat-path` (JSON), `patch-file` (fail-closed: подстрока `old` должна существовать, без частичной замены).
+4. Новый плагин `plugins/filesystem_plugin` (cdylib → wasm-компонент) экспонирует 11 инструментов: `fs-read`, `fs-write`, `fs-append`, `fs-remove`, `fs-mkdir`, `fs-rmdir`, `fs-move`, `fs-copy`, `fs-list`, `fs-stat`, `fs-patch`. Каждый вызывает соответствующий `host_control::*`; хост применяет права `Filesystem`. В конфиге агента даётся напр. `access: [{ filesystem: ["/srv/data", "rw", "rw"] }]`.
 
 **Критерии приёмки.**
-- `cargo build` без неиспользуемого варианта enum (или документированный `#[allow(dead_code)]` с пометкой «planned»).
+- Юнит-тесты `can_plugin_fs`: чтение разрешено под root, запрещено вне root (`/srv/data/../etc/passwd`, `/etc/passwd`), запись запрещена при `ro`, запрещено без права `filesystem`.
+- Хост собирается; `plugins/filesystem_plugin` собирается под `wasm32-wasip2`.
+- `cargo test --lib`: 142 passed (вкл. B6-тесты), 0 failed.
 
 ---
 

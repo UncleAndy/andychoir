@@ -1,0 +1,19 @@
+[package]
+name = "filesystem_plugin"
+version = "0.1.0"
+edition = "2024"
+description = "Filesystem access plugin (scoped by PluginAccess::Filesystem)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/UncleAndy/andychoir"
+authors = ["Andrey Velikoredchanin"]
+resolver = "2"
+
+[lib]
+# Важно: cdylib указывает компилятору собрать динамическую C-библиотеку,
+# которую затем утилиты WASM превращают в компонент.
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.58"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
