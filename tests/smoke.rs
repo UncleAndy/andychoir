@@ -21,9 +21,10 @@ const HOST_PORT: u16 = 18090;
 const MOCK_PORT: u16 = 18100;
 const CONFIG: &str = "ci/smoke.yaml";
 
-const REQUIRED_PLUGINS: [&str; 3] = [
+const REQUIRED_PLUGINS: [&str; 4] = [
     "plugins/front_http_plugin/target/wasm32-wasip2/debug/front_http_plugin.wasm",
     "plugins/tool_calculator_plugin/target/wasm32-wasip2/debug/tool_calculator_plugin.wasm",
+    "plugins/tool_env_plugin/target/wasm32-wasip2/debug/tool_env_plugin.wasm",
     "plugins/agent_plugin/target/wasm32-wasip2/debug/agent_plugin.wasm",
 ];
 
@@ -94,25 +95,45 @@ fn serve_one(mut stream: TcpStream, calls: &AtomicUsize) -> std::io::Result<()> 
         .and_then(|m| m.as_array())
         .cloned()
         .unwrap_or(empty);
-    let tool_result = messages
+    // Collect every tool result in call order; the final answer joins them.
+    let tool_results: Vec<String> = messages
         .iter()
-        .rev()
-        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .map(|s| s.to_string());
+        .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .filter_map(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
 
-    let message = match tool_result {
-        Some(content) => json!({ "role": "assistant", "content": format!("RESULT:{}", content) }),
-        None => json!({
+    let message = if tool_results.is_empty() {
+        // First round: ask for calculator + env:get + env:time in one go.
+        json!({
             "role": "assistant",
             "content": serde_json::Value::Null,
-            "tool_calls": [{
-                "id": "call_smoke",
-                "type": "function",
-                "function": { "name": "calculator", "arguments": "{\"expression\":\"2+2\"}" }
-            }]
-        }),
+            "tool_calls": [
+                {
+                    "id": "call_calc",
+                    "type": "function",
+                    "function": { "name": "calculator", "arguments": "{\"expression\":\"2+2\"}" }
+                },
+                {
+                    "id": "call_env",
+                    "type": "function",
+                    "function": { "name": "env:get", "arguments": "{\"name\":\"PATH\"}" }
+                },
+                {
+                    "id": "call_time",
+                    "type": "function",
+                    "function": { "name": "env:time", "arguments": "{}" }
+                }
+            ]
+        })
+    } else {
+        json!({
+            "role": "assistant",
+            "content": format!("RESULT:{}", tool_results.join("|"))
+        })
     };
     let response = json!({
         "id": "chatcmpl-smoke",
@@ -196,11 +217,35 @@ async fn smoke_http_agent_tool_through_mock_llm() {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let data: serde_json::Value = response.json().await.expect("ответ не JSON");
 
-    assert_eq!(
-        data.get("body").and_then(|b| b.as_str()),
-        Some("RESULT:4"),
-        "агент должен вернуть результат calculator через tool-calling: {data}"
+    let body = data
+        .get("body")
+        .and_then(|b| b.as_str())
+        .unwrap_or_default();
+    let parts: Vec<&str> = body
+        .strip_prefix("RESULT:")
+        .unwrap_or_default()
+        .split('|')
+        .collect();
+    assert_eq!(parts.len(), 3, "expected three tool results, got: {body}");
+
+    // calculator(2+2)
+    assert_eq!(parts[0], "4", "calculator result: {body}");
+
+    // env:get("PATH") - readable only because the plugin holds the right, and
+    // the host must not answer with a permission error.
+    assert!(!parts[1].is_empty(), "env:get returned nothing: {body}");
+    assert!(
+        !parts[1].contains("запрещён") && !parts[1].contains("(ошибка"),
+        "env:get denied or failed: {body}"
     );
+
+    // env:time - ISO-8601 UTC computed inside the component.
+    let time = parts[2];
+    assert_eq!(time.len(), 20, "env:time is not ISO-8601: {time}");
+    assert_eq!(&time[0..2], "20", "env:time year looks wrong: {time}");
+    assert_eq!(&time[4..5], "-", "env:time date separator: {time}");
+    assert_eq!(&time[10..11], "T", "env:time date/time separator: {time}");
+    assert_eq!(&time[19..20], "Z", "env:time timezone suffix: {time}");
     assert_eq!(
         calls.load(Ordering::SeqCst),
         2,

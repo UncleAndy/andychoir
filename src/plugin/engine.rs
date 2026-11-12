@@ -795,7 +795,84 @@ pub(crate) fn can_plugin_fs(perms: &[PluginAccess], path: &str, want_write: bool
     })
 }
 
-/// Извлечь (host, port) из URL для проверки сетевых прав.
+/// Right to read a host environment variable (`host-control.env-get`).
+///
+/// Rules are an exact name (`"PATH"`) or a prefix ending with `'*'` (`"LC_*"`).
+/// A bare `'*'` (empty prefix) allows nothing - otherwise the right would be
+/// meaningless. Fail-closed: no matching rule or no right → `false`.
+pub(crate) fn can_plugin_env(perms: &[PluginAccess], name: &str) -> bool {
+    perms.iter().any(|p| match p {
+        PluginAccess::Environment(rules) => rules.iter().any(|rule| {
+            if let Some(prefix) = rule.strip_suffix('*') {
+                !prefix.is_empty() && name.starts_with(prefix)
+            } else {
+                rule == name
+            }
+        }),
+        _ => false,
+    })
+}
+
+/// Right to host information (`host-control.system-info`).
+pub(crate) fn can_plugin_system_info(perms: &[PluginAccess]) -> bool {
+    perms
+        .iter()
+        .any(|p| matches!(p, PluginAccess::SystemInfo(true)))
+}
+
+/// Right check + env read, extracted for tests (same idea as `fs_op_with_perm`).
+fn env_get_with_perm(perms: &[PluginAccess], name: &str) -> Result<Option<String>, String> {
+    if !can_plugin_env(perms, name) {
+        return Err(format!(
+            "env: доступ к '{}' запрещён (нет права environment)",
+            name
+        ));
+    }
+    Ok(std::env::var(name).ok())
+}
+
+/// Host information as JSON (for `system-info`).
+///
+/// os/arch/family come from `std::env::consts`, CPU count from
+/// `available_parallelism`. loadavg and memory are Linux-only (`/proc`),
+/// otherwise `null` (graceful degradation, not an error). The values are not
+/// secrets, but the right is still required: this identifies the host.
+fn system_info_json() -> String {
+    let mut info = serde_json::json!({
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "family": std::env::consts::FAMILY,
+        "cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+        "loadavg": serde_json::Value::Null,
+        "mem_total_kb": serde_json::Value::Null,
+    });
+
+    if let Ok(text) = std::fs::read_to_string("/proc/loadavg") {
+        if let Some(first) = text.split_whitespace().next() {
+            if let Ok(value) = first.parse::<f64>() {
+                info["loadavg"] = serde_json::json!(value);
+            }
+        }
+    }
+
+    if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                if let Some(kb) = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse::<u64>().ok())
+                {
+                    info["mem_total_kb"] = serde_json::json!(kb);
+                }
+                break;
+            }
+        }
+    }
+
+    info.to_string()
+}
+
 /// Поддерживает схемы http/https/ws/wss, IPv4 и IPv6 (`[..]:port`),
 /// а также дефолтные порты (http=80, https/ws=443, wss=443).
 /// Возвращает None, если URL невозможно разобрать.
@@ -1144,6 +1221,52 @@ impl crate::ai::host::host_control::HostWithStore<ChoirHostState> for ChoirHostS
             access.get().plugin_config.clone().unwrap_or_else(|| "{}".to_string())
         });
         cfg
+    }
+
+    async fn env_get(
+        accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        name: String,
+    ) -> Result<Option<String>, String> {
+        let perms = accessor.with(|mut access| {
+            access
+                .get()
+                .current_plugin_permissions
+                .clone()
+                .unwrap_or_default()
+        });
+        match env_get_with_perm(&perms, &name) {
+            Ok(value) => {
+                // B5: never log the value - only the name and whether it is set.
+                log::info!(
+                    "[Хост] env-get '{}': {}",
+                    name,
+                    if value.is_some() { "задана" } else { "не задана" }
+                );
+                Ok(value)
+            }
+            Err(e) => {
+                log::warn!("[Хост] {}", e);
+                Err(e)
+            }
+        }
+    }
+
+    async fn system_info(
+        accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+    ) -> Result<String, String> {
+        let allowed = accessor.with(|mut access| {
+            access
+                .get()
+                .current_plugin_permissions
+                .as_ref()
+                .map(|perms| can_plugin_system_info(perms))
+                .unwrap_or(false)
+        });
+        if !allowed {
+            log::warn!("[Хост] system-info: доступ запрещён (нет права system_info)");
+            return Err("system-info: доступ запрещён (нет права system_info)".to_string());
+        }
+        Ok(system_info_json())
     }
 
     async fn read_file(
@@ -2609,5 +2732,76 @@ mod tests {
         assert_eq!(b, 50, "sess-A3-B получила 50 событий");
         // Чтение одной сессии не смешивается с другой.
         assert!(history_get("sess-A3-A").await.iter().all(|e| e.session_id == "sess-A3-A"));
+    }
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::{can_plugin_env, can_plugin_system_info, env_get_with_perm, system_info_json};
+    use crate::plugin::config::PluginAccess;
+
+    fn env_right(rules: &[&str]) -> Vec<PluginAccess> {
+        vec![PluginAccess::Environment(
+            rules.iter().map(|s| s.to_string()).collect(),
+        )]
+    }
+
+    #[test]
+    fn can_plugin_env_exact_and_prefix() {
+        let perms = env_right(&["PATH", "LC_*"]);
+        assert!(can_plugin_env(&perms, "PATH"));
+        assert!(can_plugin_env(&perms, "LC_ALL"));
+        assert!(!can_plugin_env(&perms, "HOME"));
+        // A prefix must not match a longer unrelated name.
+        assert!(!can_plugin_env(&perms, "PATHOLOGICAL"));
+    }
+
+    #[test]
+    fn can_plugin_env_fail_closed() {
+        // No rights at all.
+        assert!(!can_plugin_env(&[], "PATH"));
+        // Empty rule list.
+        assert!(!can_plugin_env(&env_right(&[]), "PATH"));
+        // A bare '*' does not mean "everything".
+        assert!(!can_plugin_env(&env_right(&["*"]), "PATH"));
+        // Another right does not grant env.
+        assert!(!can_plugin_env(&[PluginAccess::ReadFile(vec![])], "PATH"));
+    }
+
+    #[test]
+    fn can_plugin_env_is_case_sensitive() {
+        let perms = env_right(&["PATH"]);
+        assert!(!can_plugin_env(&perms, "path"));
+    }
+
+    #[test]
+    fn can_plugin_system_info_requires_flag() {
+        assert!(!can_plugin_system_info(&[]));
+        assert!(!can_plugin_system_info(&[PluginAccess::SystemInfo(false)]));
+        assert!(can_plugin_system_info(&[PluginAccess::SystemInfo(true)]));
+    }
+
+    #[test]
+    fn env_get_with_perm_denies_without_right_and_reads_with_it() {
+        assert!(env_get_with_perm(&[], "PATH").is_err());
+        let perms = env_right(&["PATH"]);
+        let value = env_get_with_perm(&perms, "PATH").expect("право есть — ошибки быть не должно");
+        assert!(
+            value.is_some(),
+            "PATH должен быть задан в окружении теста: {value:?}"
+        );
+        // The granted right does not open other names.
+        assert!(env_get_with_perm(&perms, "NOT_A_REAL_VAR_FOR_TESTS").is_err());
+    }
+
+    #[test]
+    fn system_info_json_has_os_and_valid_json() {
+        let raw = system_info_json();
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("system-info должен быть JSON");
+        assert_eq!(
+            v.get("os").and_then(|o| o.as_str()),
+            Some(std::env::consts::OS)
+        );
+        assert!(v.get("cpus").is_some());
     }
 }

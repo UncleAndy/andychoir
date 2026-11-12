@@ -120,6 +120,16 @@ interface host-control {
   // фоновым, а конфиг должен быть одинаковым. Хост хранит конфиг плагина.
   get-plugin-config: async func() -> string;
 
+  // Read a HOST environment variable. The guest's own WASI environment is empty
+  // by design, so env is reachable only through this call and only with the
+  // `environment` right (exact names or prefixes like "LC_*"). Values are NOT
+  // logged. error - access denied (fail-closed); ok(none) - variable not set.
+  env-get: async func(name: string) -> result<option<string>, string>;
+
+  // Host information: JSON {os, arch, family, cpus, loadavg, mem_total_kb}.
+  // Requires the `system_info` right; without it - error (fail-closed).
+  system-info: async func() -> result<string, string>;
+
   // Прочитать файл. Доступны ТОЛЬКО пути под root права `filesystem`
   // (или из белого списка `read_file`). Path приводится к каноническому
   // абсолютному виду (защита от `..`). Лимит размера — как у console_print.

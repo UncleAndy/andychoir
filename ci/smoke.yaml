@@ -23,6 +23,16 @@ plugins:
     config: {}
     allow_background: false
 
+  - file: "plugins/tool_env_plugin/target/wasm32-wasip2/debug/tool_env_plugin.wasm"
+    name: "tool:env"
+    access:
+      # env-get: only PATH is readable (exact-name rule).
+      - !environment ["PATH"]
+      # system-info is behind its own right.
+      - !system_info true
+    config: {}
+    allow_background: false
+
   - file: "plugins/agent_plugin/target/wasm32-wasip2/debug/agent_plugin.wasm"
     name: "agent:smoke"
     access:
@@ -35,7 +45,7 @@ plugins:
         api_url: "http://127.0.0.1:18100/v1"
         api_key: null
       system_prompt: "Отвечай кратко."
-      tools: ["calculator"]
+      tools: ["calculator", "env:*"]
     allow_background: true
 
 startup:

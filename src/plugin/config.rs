@@ -10,6 +10,14 @@ pub enum PluginAccess {
     Filesystem(String, String, String), // path, dir_perms, file_perms ("ro", "rw")
     #[serde(rename = "network")]
     Network(Vec<(String, u16)>),
+    // Host environment variables allowed for host-control.env-get: exact names
+    // ("PATH") or prefixes ending with '*' ("LC_*"). A bare '*' and an empty
+    // list allow nothing (fail-closed).
+    #[serde(rename = "environment")]
+    Environment(Vec<String>),
+    // Right to host information (host-control.system-info).
+    #[serde(rename = "system_info")]
+    SystemInfo(bool),
     // Белый список путей, которые плагин может читать через host-control.read-file.
     // Каждый элемент — путь к файлу или префикс каталога (все файлы под ним).
     #[serde(rename = "read_file")]

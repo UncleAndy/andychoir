@@ -14,11 +14,13 @@ all behavior — agents, tools, front-ends, MCP bridges — is provided by
 Key properties:
 
 * **Sandboxed.** A plugin runs inside a WASM sandbox (wasmtime). It has **no
-  direct** filesystem, network, environment, or clock access. Every privileged
+  direct** filesystem, network, or environment access. Every privileged
   operation goes through the **host API** (see §4), where the host enforces
   access control and audit. Network egress is **only** `ai:host/http` (§4.4):
   WASI network interfaces (`wasi:http`, `wasi:sockets`) are not linked into the
   host, so a component importing them fails to instantiate. Never add them.
+  WASI clocks (`wasi:clocks/*`) *are* linked and backed by the host clock, so a
+  plugin may read the current time locally; that carries no privilege.
 * **Async by default.** The guest exports an async `plugin-lifecycle`
   interface; the host awaits it cooperatively (no WASM thread is blocked while
   the guest `await`s a host call).
@@ -112,6 +114,8 @@ Each plugin is registered in the host config (YAML/JSON/TOML) with a
 | `console_print`               | `u32` (max line bytes) | Right to call `console.print-line` / `print-markdown`.       |
 | `filesystem`                  | `(path, dir_perms, file_perms)` | Path sandbox; perms are `"ro"`/`"rw"`.              |
 | `network`                     | `Vec<(host, port)>`    | Allowed outbound destinations for `http.post-json`.         |
+| `environment`                 | `Vec<String>` (names, `PREFIX*`) | Host env vars readable via `host-control.env-get`; a bare `*` allows nothing. |
+| `system_info`                 | `bool`                 | Right to host information via `host-control.system-info` (os/arch/cpus/load/mem). |
 | `read_file`                   | `Vec<String>` (paths)  | Whitelist of files/dirs the plugin may read via `host-control.read-file`. |
 
 > **Fail-closed:** if a capability is not granted, the corresponding host call
@@ -181,6 +185,13 @@ return `Future`s and yield control to the host while waiting.
   tools, after the agent's whitelist filter).
 * `get_plugin_config() -> string` — this plugin's own `config` JSON (also
   available to the background `run()` instance).
+* `env_get(name) -> result<option<string>, string>` — read one **host** env
+  variable, allowed only by the `environment` right (exact names or `PREFIX*`).
+  Values are never logged. `ok(none)` = variable not set; `error` = the name is
+  not allowed (fail-closed).
+* `system_info() -> result<string, string>` — host information as JSON (`os`,
+  `arch`, `family`, `cpus`, `loadavg`, `mem_total_kb`). Requires the
+  `system_info` right. loadavg/memory are null on non-Linux hosts.
 * `read_file(path) -> result<string, string>` — read a file, constrained by the
   `read_file` whitelist and `filesystem` perms. Paths are canonicalized
   (absolute + resolved `..`) before the whitelist check.
