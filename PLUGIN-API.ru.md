@@ -113,7 +113,7 @@ export!(MyPlugin);
 | `console_input`    | `String` (prompt)           | Право вызывать `console.read-line` с заданным приглашением.   |
 | `console_print`    | `u32` (макс. байт строки)   | Право вызывать `console.print-line` / `print-markdown`.        |
 | `filesystem`       | `(path, dir_perms, file_perms)` | Песок путей; perms — `"ro"`/`"rw"`.                    |
-| `network`          | `Vec<(host, port)>`         | Разрешённые исходящие адреса для `http.post-json`.            |
+| `network`          | `Vec<(host, port)>`         | Исходящие адреса для `http.post-json` / `http.get-text`. host `"*"` или `"0.0.0.0"` = любой хост; порт `0` = любой порт. |
 | `environment`      | `Vec<String>` (имена, `PREFIX*`) | Переменные окружения хоста для `host-control.env-get`; одиночная `*` не даёт ничего. |
 | `system_info`      | `bool`                      | Право на сведения о хосте через `host-control.system-info` (os/arch/cpus/load/mem). |
 | `read_file`        | `Vec<String>` (пути)        | Белый список файлов/каталогов для `host-control.read-file`.   |
@@ -145,6 +145,8 @@ export!(MyPlugin);
 ### 4.4 `http` (прокси в песочнице)
 * `post_json(url, json_body) -> (u16, string)` — хост выполняет реальный запрос
   и возвращает `(статус, тело)`. Подчиняется списку доступа `network`.
+* `get_text(url) -> (u16, string)` — GET; возвращает `(статус, текст)`. Та же
+  политика `network`. Тело ограничено хостом (1 МиБ), усечение помечается в тексте.
 * Сетевого интерфейса WASI и HTTP-клиента внутри гостя **нет намеренно**.
   Клиенту вроде `openai-api-rs` (его транспорт для `wasm32-wasip2` —
   `golem-wasi-http` поверх `wasi:http`) нужен интерфейс, которого хост не даёт;

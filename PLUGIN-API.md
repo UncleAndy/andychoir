@@ -113,7 +113,7 @@ Each plugin is registered in the host config (YAML/JSON/TOML) with a
 | `console_input`               | `String` (prompt)      | Right to call `console.read-line` with the given prompt.    |
 | `console_print`               | `u32` (max line bytes) | Right to call `console.print-line` / `print-markdown`.       |
 | `filesystem`                  | `(path, dir_perms, file_perms)` | Path sandbox; perms are `"ro"`/`"rw"`.              |
-| `network`                     | `Vec<(host, port)>`    | Allowed outbound destinations for `http.post-json`.         |
+| `network`                     | `Vec<(host, port)>`    | Outbound destinations for `http.post-json` / `http.get-text`. Host `"*"` or `"0.0.0.0"` = any host; port `0` = any port. |
 | `environment`                 | `Vec<String>` (names, `PREFIX*`) | Host env vars readable via `host-control.env-get`; a bare `*` allows nothing. |
 | `system_info`                 | `bool`                 | Right to host information via `host-control.system-info` (os/arch/cpus/load/mem). |
 | `read_file`                   | `Vec<String>` (paths)  | Whitelist of files/dirs the plugin may read via `host-control.read-file`. |
@@ -160,6 +160,9 @@ return `Future`s and yield control to the host while waiting.
 ### 4.4 `http` (sandboxed proxy)
 * `post_json(url, json_body) -> (u16, string)` — the host performs the real
   request and returns `(status, body)`. Subject to the `network` access list.
+* `get_text(url) -> (u16, string)` — GET; returns `(status, text)`. Same
+  `network` policy. The body is capped by the host (1 MiB) and the truncation
+  is marked in the text.
 * There is deliberately **no** WASI HTTP/socket interface and no HTTP client
   library inside the guest. A client such as `openai-api-rs` (whose
   `wasm32-wasip2` transport is `golem-wasi-http` over `wasi:http`) would need an

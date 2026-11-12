@@ -930,16 +930,30 @@ fn default_port_for_scheme(url: &str) -> Option<u16> {
 /// (host, port) запрошенного url входит в список разрешённых.
 /// Fail-closed: без права Network ИЛИ при пустом списке — запрещено всё
 /// (любой url, который не удалось разобрать, тоже запрещён).
+/// Does one allowlist rule match the requested (host, port)?
+///
+/// Rule semantics:
+/// - host `"*"` or `"0.0.0.0"` matches ANY host (explicit "allow everything");
+/// - port `0` matches ANY port;
+/// - otherwise the host is compared case-insensitively (DNS names are
+///   case-insensitive) and the port must be equal.
+fn network_rule_matches(rule_host: &str, rule_port: u16, host: &str, port: u16) -> bool {
+    let host_ok = rule_host == "*" || rule_host == "0.0.0.0" || rule_host.eq_ignore_ascii_case(host);
+    let port_ok = rule_port == 0 || rule_port == port;
+    host_ok && port_ok
+}
+
+/// Right to reach `url` (`PluginAccess::Network`). Fail-closed: no right, an
+/// empty list or an unparsable URL denies.
 pub(crate) fn can_plugin_network(perms: &[PluginAccess], url: &str) -> bool {
     let Some((host, port)) = parse_host_port(url) else {
         return false;
     };
-    perms.iter().any(|p| {
-        if let PluginAccess::Network(allowed) = p {
-            allowed.iter().any(|(ah, ap)| *ah == host && *ap == port)
-        } else {
-            false
-        }
+    perms.iter().any(|p| match p {
+        PluginAccess::Network(allowed) => allowed
+            .iter()
+            .any(|(ah, ap)| network_rule_matches(ah, *ap, &host, port)),
+        _ => false,
     })
 }
 
@@ -1059,6 +1073,57 @@ impl crate::ai::host::http::HostWithStore<ChoirHostState> for ChoirHostState {
             }
             Err(e) => {
                 error!("[Хост] HTTP-прокси ошибка запроса к {}: {}", url, e);
+                (0, format!("{{\"error\": \"{}\"}}", e))
+            }
+        }
+    }
+
+    async fn get_text(
+        accessor: &wasmtime::component::Accessor<ChoirHostState, Self>,
+        url: String,
+    ) -> (u16, String) {
+        // Same fail-closed policy as post_json: the `network` right covers
+        // every egress from a plugin, whatever the HTTP method is.
+        let allowed = accessor.with(|mut access| {
+            access
+                .get()
+                .current_plugin_permissions
+                .as_ref()
+                .map(|perms| can_plugin_network(perms, &url))
+                .unwrap_or(false)
+        });
+        if !allowed {
+            error!(
+                "[Хост] Плагин не имеет права Network на доступ к {} (get-text).",
+                url
+            );
+            return (403, "{\"error\":\"network access denied\"}".to_string());
+        }
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap_or_default();
+        match client.get(&url).send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                // A page can be arbitrarily large while the guest has a fixed
+                // memory budget: cap the body and mark the truncation.
+                const MAX_BODY_BYTES: usize = 1_048_576;
+                let bytes = match resp.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => return (status, format!("{{\"error\": \"{}\"}}", e)),
+                };
+                let total = bytes.len();
+                let slice = &bytes[..total.min(MAX_BODY_BYTES)];
+                let text = String::from_utf8_lossy(slice).to_string();
+                if total > MAX_BODY_BYTES {
+                    (status, format!("{text}\n...[truncated: {total} bytes]"))
+                } else {
+                    (status, text)
+                }
+            }
+            Err(e) => {
+                error!("[Хост] HTTP-прокси (GET) ошибка запроса к {}: {}", url, e);
                 (0, format!("{{\"error\": \"{}\"}}", e))
             }
         }
@@ -2803,5 +2868,69 @@ mod env_tests {
             Some(std::env::consts::OS)
         );
         assert!(v.get("cpus").is_some());
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::can_plugin_network;
+    use crate::plugin::config::PluginAccess;
+
+    fn net(rules: &[(&str, u16)]) -> Vec<PluginAccess> {
+        vec![PluginAccess::Network(
+            rules.iter().map(|(h, p)| (h.to_string(), *p)).collect(),
+        )]
+    }
+
+    #[test]
+    fn exact_host_and_port_only() {
+        let perms = net(&[("api.example.com", 443)]);
+        assert!(can_plugin_network(&perms, "https://api.example.com/v1/x"));
+        assert!(!can_plugin_network(&perms, "https://api.example.com:444/x"));
+        assert!(!can_plugin_network(&perms, "https://evil.example.com/x"));
+    }
+
+    #[test]
+    fn wildcard_host_allows_any_host_on_that_port() {
+        let perms = net(&[("*", 443)]);
+        assert!(can_plugin_network(&perms, "https://anything.test/x"));
+        assert!(!can_plugin_network(&perms, "https://anything.test:8443/x"));
+    }
+
+    #[test]
+    fn bind_address_zero_means_any_host() {
+        let perms = net(&[("0.0.0.0", 8080)]);
+        assert!(can_plugin_network(&perms, "http://10.0.0.5:8080/x"));
+        assert!(!can_plugin_network(&perms, "http://10.0.0.5:8081/x"));
+    }
+
+    #[test]
+    fn port_zero_allows_any_port() {
+        let perms = net(&[("api.example.com", 0)]);
+        assert!(can_plugin_network(&perms, "https://api.example.com:8443/x"));
+        assert!(!can_plugin_network(&perms, "https://other.test:8443/x"));
+    }
+
+    #[test]
+    fn allow_everything_is_explicit() {
+        let perms = net(&[("*", 0)]);
+        assert!(can_plugin_network(&perms, "http://127.0.0.1:1/x"));
+        assert!(can_plugin_network(&perms, "https://example.com/x"));
+    }
+
+    #[test]
+    fn host_comparison_is_case_insensitive() {
+        let perms = net(&[("API.Example.COM", 443)]);
+        assert!(can_plugin_network(&perms, "https://api.example.com/x"));
+    }
+
+    #[test]
+    fn fail_closed_without_right_or_with_empty_list() {
+        assert!(!can_plugin_network(&[], "https://api.example.com/x"));
+        assert!(!can_plugin_network(&net(&[]), "https://api.example.com/x"));
+        assert!(!can_plugin_network(
+            &[PluginAccess::ReadFile(vec![])],
+            "https://api.example.com/x"
+        ));
     }
 }

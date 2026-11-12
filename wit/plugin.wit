@@ -66,6 +66,11 @@ interface log {
 interface http {
   // Выполнить POST с JSON-телом. Возвращает HTTP-статус и тело ответа (как строку).
   post-json: async func(url: string, json-body: string) -> tuple<u16, string>;
+
+  // Выполнить GET. Возвращает HTTP-статус и тело как текст (не JSON).
+  // Подчиняется тому же праву `network` (host/port), что и post-json; тело
+  // ограничено размером на стороне хоста (усечение помечается в тексте).
+  get-text: async func(url: string) -> tuple<u16, string>;
 }
 
 // Управление хостом: блокирующие async-ожидания, которые отдают управление

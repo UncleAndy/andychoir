@@ -33,6 +33,18 @@ plugins:
     config: {}
     allow_background: false
 
+  - file: "plugins/tool_web_plugin/target/wasm32-wasip2/debug/tool_web_plugin.wasm"
+    name: "tool:web"
+    access:
+      # Only the mock server port is reachable; port 18101 stays denied and is
+      # asserted as denied by the smoke.
+      - !network [["127.0.0.1", 18100]]
+    config:
+      endpoint: "http://127.0.0.1:18100/search"
+      max_results: 3
+      max_bytes: 4096
+    allow_background: false
+
   - file: "plugins/agent_plugin/target/wasm32-wasip2/debug/agent_plugin.wasm"
     name: "agent:smoke"
     access:
@@ -45,7 +57,7 @@ plugins:
         api_url: "http://127.0.0.1:18100/v1"
         api_key: null
       system_prompt: "Отвечай кратко."
-      tools: ["calculator", "env:*"]
+      tools: ["calculator", "env:*", "web:*"]
     allow_background: true
 
 startup:
