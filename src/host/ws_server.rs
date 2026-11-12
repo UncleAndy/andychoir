@@ -74,7 +74,7 @@ fn spawn_server(
             )
             .with_state(inner.clone());
 
-        let addr: std::net::SocketAddr = match bind_addr.parse() {
+        let addr: std::net::SocketAddr = match super::resolve_bind_addr(&bind_addr, port) {
             Ok(a) => a,
             Err(e) => {
                 error!("[Хост] WS: невалидный bind-адрес '{}': {}", bind_addr, e);

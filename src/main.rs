@@ -127,11 +127,19 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     // Раньше здесь был std::process::exit(1) ВНУТРИ tokio-задачи: он убивал
     // процесс мгновенно, не давая плагинам/шине/истории корректно завершиться
     // (терялись логи и несохранённые сессии). Теперь только сигнал.
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    // B9: сигнал об ошибке старта — Notify + флаг, а НЕ watch-канал.
+    // У watch `changed()` возвращает Err после уничтожения отправителя, а задача
+    // таймера завершается и при успешной готовности. `select!` с шаблоном `_`
+    // принимал закрытие канала за «стартовый таймаут», и хост завершался сразу
+    // после старта (регрессия B9, найдена смоук-тестом).
+    let startup_failed_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let startup_failed_notify = std::sync::Arc::new(tokio::sync::Notify::new());
     {
         let readiness = event_bus.readiness.clone();
         let all_names = all_plugin_names.clone();
         let timeout = std::time::Duration::from_secs(config.startup.timeout_secs);
+        let flag = startup_failed_flag.clone();
+        let notify = startup_failed_notify.clone();
         tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + timeout;
             loop {
@@ -160,7 +168,8 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
             );
             // B9: НЕ exit(1). Сигналим основному циклу — он выполнит shutdown
             // (сохранение историй, остановка плагинов и шины) и вернёт ошибку.
-            let _ = shutdown_tx.send(true);
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            notify.notify_one();
         });
     }
 
@@ -192,9 +201,9 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
             false
         }
         () = host::console::wait_for_interrupt() => false,
-        _ = shutdown_rx.changed() => {
+        _ = startup_failed_notify.notified() => {
             // Стартовый таймаут: плагины не инициализировались.
-            true
+            startup_failed_flag.load(std::sync::atomic::Ordering::SeqCst)
         }
     };
     info!("[Хост] Завершение работы...");

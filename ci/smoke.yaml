@@ -1,0 +1,56 @@
+# ci/smoke.yaml — минимальный сквозной прогон для CI и локальной проверки.
+#
+# Поток: HTTP POST /query -> front:http -> agent:smoke -> host http-прокси
+#        -> mock LLM (127.0.0.1:18100) -> tool:calculator -> agent -> HTTP-ответ.
+#
+# Без ollama, без внешней сети, без TTY. Мок-LLM поднимается внутри
+# tests/smoke.rs; порты 18090/18100 выбраны вне диапазона dev-прогонов.
+plugins:
+  - file: "plugins/front_http_plugin/target/wasm32-wasip2/debug/front_http_plugin.wasm"
+    name: "front:http"
+    access: []
+    config:
+      listeners:
+        - port: 18090
+          path: "/query"
+          target: "agent:smoke"
+          bind: "127.0.0.1"
+    allow_background: true
+
+  - file: "plugins/tool_calculator_plugin/target/wasm32-wasip2/debug/tool_calculator_plugin.wasm"
+    name: "tool:calculator"
+    access: []
+    config: {}
+    allow_background: false
+
+  - file: "plugins/agent_plugin/target/wasm32-wasip2/debug/agent_plugin.wasm"
+    name: "agent:smoke"
+    access:
+      # B2: без права network http::post_json возвращает 403 (fail-closed).
+      - !network [["127.0.0.1", 18100]]
+    config:
+      name: "smoke"
+      model:
+        model_name: "mock"
+        api_url: "http://127.0.0.1:18100/v1"
+        api_key: null
+      system_prompt: "Отвечай кратко."
+      tools: ["calculator"]
+    allow_background: true
+
+startup:
+  timeout_secs: 25
+
+logger:
+  log_level: "debug"
+  logs_directory: "./logs"
+  file_base_name: "smoke"
+  max_file_size_bytes: 1048576
+  days_to_keep: 1
+
+history:
+  max_events_per_session: 50
+  dir: "./tmp/smoke-sessions"
+  current_session_file: "./tmp/smoke-current-session.json"
+  session_ttl_secs: 3600
+  save_period_secs: 5

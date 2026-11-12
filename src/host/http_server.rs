@@ -247,7 +247,7 @@ fn spawn_server(inner: Arc<HttpServerInner>, port: u16, bind_addr: String) -> to
             .with_state(inner)
             .into_make_service_with_connect_info::<std::net::SocketAddr>();
 
-        let addr: std::net::SocketAddr = match bind_addr.parse() {
+        let addr: std::net::SocketAddr = match super::resolve_bind_addr(&bind_addr, port) {
             Ok(a) => a,
             Err(e) => {
                 error!("[Хост] HTTP: невалидный bind-адрес '{}': {}", bind_addr, e);

@@ -4,7 +4,8 @@ plugins:
   # (доступен через сетевой мост, привязывается к сессии динамически).
   - file: "plugins/agent_plugin/target/wasm32-wasip2/debug/agent_plugin.wasm"
     name: "agent:demo"
-    access: []
+    access:
+      - !network [["localhost", 11434]]
     config:
       name: "demo"
       model:
