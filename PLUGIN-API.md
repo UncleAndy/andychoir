@@ -16,7 +16,9 @@ Key properties:
 * **Sandboxed.** A plugin runs inside a WASM sandbox (wasmtime). It has **no
   direct** filesystem, network, environment, or clock access. Every privileged
   operation goes through the **host API** (see §4), where the host enforces
-  access control and audit.
+  access control and audit. Network egress is **only** `ai:host/http` (§4.4):
+  WASI network interfaces (`wasi:http`, `wasi:sockets`) are not linked into the
+  host, so a component importing them fails to instantiate. Never add them.
 * **Async by default.** The guest exports an async `plugin-lifecycle`
   interface; the host awaits it cooperatively (no WASM thread is blocked while
   the guest `await`s a host call).
@@ -154,6 +156,10 @@ return `Future`s and yield control to the host while waiting.
 ### 4.4 `http` (sandboxed proxy)
 * `post_json(url, json_body) -> (u16, string)` — the host performs the real
   request and returns `(status, body)`. Subject to the `network` access list.
+* There is deliberately **no** WASI HTTP/socket interface and no HTTP client
+  library inside the guest. A client such as `openai-api-rs` (whose
+  `wasm32-wasip2` transport is `golem-wasi-http` over `wasi:http`) would need an
+  interface the host does not provide; LLM requests are plain JSON here.
 
 ### 4.5 `host-control` (async)
 * `wait_for_ready()` — await until **all** plugins signal readiness.

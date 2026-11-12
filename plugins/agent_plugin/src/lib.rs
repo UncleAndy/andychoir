@@ -27,9 +27,6 @@ const PLUGIN_CLASS: &str = "agent";
 
 static CONFIG: Mutex<Option<AgentPluginConfig>> = Mutex::new(None);
 
-#[allow(unused)]
-static CLIENT: RwLock<Option<openai_api_rs::v1::api::OpenAIClient>> = RwLock::new(None);
-
 static STATUS: RwLock<PluginInitStatus> = RwLock::new(PluginInitStatus::NotInitialized);
 
 static TOOLS: OnceLock<DashMap<String, ToolDefinition>> = OnceLock::new();

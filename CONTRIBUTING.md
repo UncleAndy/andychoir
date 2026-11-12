@@ -51,9 +51,12 @@ tests are green.
 
 1. Fork the repository and create a branch.
 2. Make changes **additively**: don't break existing paths unnecessarily.
-3. Add tests for new logic.
-4. Run the build and tests.
-5. Open a Pull Request.
+3. Keep plugins network-free: egress goes only through `ai:host/http`. Never add
+   `wasi:http` / `wasi:sockets` imports and never link `wasmtime-wasi-http`
+   into the host — that would bypass the `network` access list.
+4. Add tests for new logic.
+5. Run `make ci` (unit tests + end-to-end smoke); it must be green.
+6. Open a Pull Request.
 
 ## Style
 

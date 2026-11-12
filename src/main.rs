@@ -1,8 +1,3 @@
-/*
-    TODO: Отказываемся от rig и пытаемся использовать модифицированный openai-api-rs для работы
-     агента из wasm-плагинов
-*/
-
 use std::error::Error;
 use std::path::PathBuf;
 
