@@ -59,7 +59,10 @@ tests are green.
 
 - `cargo fmt` and `cargo clippy` before submitting.
 - No compiler warnings.
-- Comments may be in Russian or English (consistent within a file).
+- **English only** in code comments and commit messages.
+- Existing Russian comments in older code are not mass-translated: translate a
+  comment only in the code you already touch (no drive-by churn).
+- User-facing documentation stays bilingual (`*.md` + `*.ru.md`).
 
 ## License
 
